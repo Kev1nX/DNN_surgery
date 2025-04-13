@@ -2,8 +2,7 @@ import numpy as np
 import torch.nn as nn
 from torch.nn import Module
 
-def calculate_parameter_size(model : Module):
-
+def nn_layer_parameter_sizes(model : Module):
     mods = list(model.modules())
     for i in range(1,len(mods)):
         m = mods[i]
@@ -11,7 +10,12 @@ def calculate_parameter_size(model : Module):
         sizes = []
         for j in range(len(p)):
             sizes.append(np.array(p[j].size()))
+            
+    print(sizes)
+    return sizes
 
+def calculate_total_parameter_size(model : Module):
+    sizes = nn_layer_parameter_sizes(model=model)
     total_bits = 0
     for i in range(len(sizes)):
         s = sizes[i]
@@ -19,3 +23,4 @@ def calculate_parameter_size(model : Module):
         total_bits += bits
 
     print(total_bits)
+    
