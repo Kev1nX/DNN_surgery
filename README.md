@@ -1,0 +1,2 @@
+# DNN surgery
+With the physical hardware limitations of edge devices. Performing DNN inference on the network edge can be expensive. Meanwhile, the high network requirement for DNN inference using a cloud endpoint can induce large latency into the DNN inference process. DNN surgery aim to compute and determine how much of the inference can be computed by edge devices to reduce the amount of data to send to a more powerful server or cloud endpoint.
