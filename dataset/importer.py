@@ -18,22 +18,12 @@ class CIFAR10_dataset:
         self.trainset = torchvision.datasets.CIFAR10(
             root="./data", train=True, download=True, transform=self.transform
         )
-        self.trainloader = torch.utils.data.DataLoader(
-            self.trainset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-        )
+
 
         self.testset = torchvision.datasets.CIFAR10(
             root="./data", train=False, download=True, transform=self.transform
         )
-        self.testloader = torch.utils.data.DataLoader(
-            self.testset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-        )
+
 
         self.classes = (
             "plane",
@@ -47,3 +37,21 @@ class CIFAR10_dataset:
             "ship",
             "truck",
         )
+        
+    def test_loader(self):
+        self.testloader = torch.utils.data.DataLoader(
+            self.testset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+        )
+        return self.testloader
+
+    def train_loader(self):
+        self.trainloader = torch.utils.data.DataLoader(
+            self.trainset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+        )
+        return self.trainloader

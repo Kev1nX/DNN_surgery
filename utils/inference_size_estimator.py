@@ -13,6 +13,15 @@ def nn_layer_parameter_sizes(model: Module):
             sizes.append(np.array(p[j].size()))
     return sizes
 
+def get_layer_parameter_size(model: Module, bits=32):
+    sizes = nn_layer_parameter_sizes(model=model)
+    layers = []
+    for i in range(len(sizes)):
+        s = sizes[i]
+        bits = np.prod(np.array(s)) * bits
+        layers.append(bits)
+    print(layers)
+    return layers
 
 def calculate_total_parameter_size(model: Module, bits=32):
     sizes = nn_layer_parameter_sizes(model=model)
