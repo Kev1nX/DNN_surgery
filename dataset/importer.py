@@ -1,8 +1,6 @@
 import torch
 import torchvision
 import torchvision.transforms as transforms
-
-
 class CIFAR10_dataset:
     def __init__(self, batch_size=4, num_workers=2):
         self.transform = transforms.Compose(
