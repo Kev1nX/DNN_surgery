@@ -1,133 +1,199 @@
-import json
-import time
-import math
 import grpc
 import logging
-import gRPC.protobuf.route_guide_pb2 as route_guide_pb2
-import gRPC.protobuf.route_guide_pb2_grpc as route_guide_pb2_grpc
 from concurrent import futures
+import torch
+import torch.nn as nn
+import io
+from typing import Dict, Optional
+import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
+import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('dnn_server.log')
+    ]
+)
 
-
-
-def read_route_guide_database():
-    """Reads the route guide database.
-
-    Returns:
-      The full contents of the route guide database as a sequence of
-        route_guide_pb2.Features.
-    """
-    feature_list = []
-    with open("route_guide_db.json") as route_guide_db_file:
-        for item in json.load(route_guide_db_file):
-            feature = route_guide_pb2.Feature(
-                name=item["name"],
-                location=route_guide_pb2.Point(
-                    latitude=item["location"]["latitude"],
-                    longitude=item["location"]["longitude"],
-                ),
-            )
-            feature_list.append(feature)
-    return feature_list
-
-def get_feature(feature_db, point):
-    """Returns Feature at given location or None."""
-    for feature in feature_db:
-        if feature.location == point:
-            return feature
-    return None
-
-def get_distance(start, end):
-    """Distance between two points."""
-    coord_factor = 10000000.0
-    lat_1 = start.latitude / coord_factor
-    lat_2 = end.latitude / coord_factor
-    lon_1 = start.longitude / coord_factor
-    lon_2 = end.longitude / coord_factor
-    lat_rad_1 = math.radians(lat_1)
-    lat_rad_2 = math.radians(lat_2)
-    delta_lat_rad = math.radians(lat_2 - lat_1)
-    delta_lon_rad = math.radians(lon_2 - lon_1)
-
-    # Formula is based on http://mathforum.org/library/drmath/view/51879.html
-    a = pow(math.sin(delta_lat_rad / 2), 2) + (
-        math.cos(lat_rad_1)
-        * math.cos(lat_rad_2)
-        * pow(math.sin(delta_lon_rad / 2), 2)
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    R = 6371000
-    # metres
-    return R * c
-
-class RouteGuideServicer(route_guide_pb2_grpc.RouteGuideServicer):
-    """Provides methods that implement functionality of route guide server."""
-
+class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
+    """Implements the DNNInference gRPC service for distributed DNN computation."""
+    
     def __init__(self):
-        self.db = read_route_guide_database()
-
-    def GetFeature(self, request, context):
-        feature = get_feature(self.db, request)
-        if feature is None:
-            return route_guide_pb2.Feature(name="", location=request)
-        else:
-            return feature
-
-    def ListFeatures(self, request, context):
-        left = min(request.lo.longitude, request.hi.longitude)
-        right = max(request.lo.longitude, request.hi.longitude)
-        top = max(request.lo.latitude, request.hi.latitude)
-        bottom = min(request.lo.latitude, request.hi.latitude)
-        for feature in self.db:
-            if (
-                feature.location.longitude >= left
-                and feature.location.longitude <= right
-                and feature.location.latitude >= bottom
-                and feature.location.latitude <= top
-            ):
-                yield feature
-
-    def RecordRoute(self, request_iterator, context):
-        point_count = 0
-        feature_count = 0
-        distance = 0.0
-        prev_point = None
-
-        start_time = time.time()
-        for point in request_iterator:
-            point_count += 1
-            if get_feature(self.db, point):
-                feature_count += 1
-            if prev_point:
-                distance += get_distance(prev_point, point)
-            prev_point = point
-
-        elapsed_time = time.time() - start_time
-        return route_guide_pb2.RouteSummary(
-            point_count=point_count,
-            feature_count=feature_count,
-            distance=int(distance),
-            elapsed_time=int(elapsed_time),
-        )
-
-    def RouteChat(self, request_iterator, context):
-        prev_notes = []
-        for new_note in request_iterator:
-            for prev_note in prev_notes:
-                if prev_note.location == new_note.location:
-                    yield prev_note
-            prev_notes.append(new_note)
+        self.models: Dict[str, torch.nn.Module] = {}
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logging.info(f"Initializing DNNInferenceServicer with device: {self.device}")
+        
+    def register_model(self, model_id: str, model: torch.nn.Module) -> None:
+        """Register a model for inference
+        
+        Args:
+            model_id: Unique identifier for the model
+            model: PyTorch model to register
+        """
+        try:
+            model = model.to(self.device).eval()  # Ensure model is in eval mode
+            self.models[model_id] = model
             
-def serve():
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    route_guide_pb2_grpc.add_RouteGuideServicer_to_server(
-        RouteGuideServicer(), server
-    )
-    server.add_insecure_port("[::]:50051")
+            # Log model details
+            num_parameters = sum(p.numel() for p in model.parameters())
+            requires_grad = any(p.requires_grad for p in model.parameters())
+            
+            logging.info(f"Registered model: {model_id}")
+            logging.info(f"Model details - Parameters: {num_parameters:,}, Device: {self.device}, Requires Grad: {requires_grad}")
+            logging.debug(f"Model architecture:\n{model}")
+            
+        except Exception as e:
+            logging.error(f"Failed to register model {model_id}: {str(e)}")
+            raise
+
+    def tensor_to_proto(self, tensor: torch.Tensor) -> dnn_inference_pb2.Tensor:
+        """Convert PyTorch tensor to protobuf message
+        
+        Args:
+            tensor: PyTorch tensor to convert
+            
+        Returns:
+            Protobuf tensor message
+        """
+        try:
+            logging.debug(f"Converting tensor to proto - Shape: {tensor.shape}, Device: {tensor.device}, Dtype: {tensor.dtype}")
+            
+            # Move tensor to CPU for serialization
+            tensor = tensor.cpu()
+            
+            # Serialize tensor to bytes
+            buffer = io.BytesIO()
+            torch.save(tensor, buffer)
+            tensor_bytes = buffer.getvalue()
+            
+            # Create shape message
+            shape = dnn_inference_pb2.TensorShape(
+                dimensions=list(tensor.shape)
+            )
+            
+            # Create tensor message
+            proto = dnn_inference_pb2.Tensor(
+                data=tensor_bytes,
+                shape=shape,
+                dtype=str(tensor.dtype),
+                requires_grad=tensor.requires_grad
+            )
+            
+            logging.debug(f"Successfully converted tensor to proto message of size {len(tensor_bytes)} bytes")
+            return proto
+            
+        except Exception as e:
+            logging.error(f"Failed to convert tensor to proto: {str(e)}")
+            raise
+        
+    def proto_to_tensor(self, proto: dnn_inference_pb2.Tensor) -> torch.Tensor:
+        """Convert protobuf message back to PyTorch tensor
+        
+        Args:
+            proto: Protobuf tensor message
+            
+        Returns:
+            PyTorch tensor
+        """
+        # Deserialize tensor
+        buffer = io.BytesIO(proto.data)
+        tensor = torch.load(buffer)
+        
+        # Move to correct device
+        return tensor.to(self.device)
+        
+    def ProcessTensor(self, request: dnn_inference_pb2.InferenceRequest, 
+                     context: grpc.ServicerContext) -> dnn_inference_pb2.InferenceResponse:
+        """Process a tensor using the specified model
+        
+        Args:
+            request: Inference request containing tensor and model ID
+            context: gRPC context
+            
+        Returns:
+            Inference response with processed tensor
+        """
+        try:
+            # Get the model
+            model = self.models.get(request.model_id)
+            if model is None:
+                error_msg = f'Model {request.model_id} not found'
+                logging.error(error_msg)
+                context.set_code(grpc.StatusCode.NOT_FOUND)
+                context.set_details(error_msg)
+                return dnn_inference_pb2.InferenceResponse(
+                    success=False,
+                    error_message=error_msg
+                )
+                
+            # Convert proto to tensor
+            input_tensor = self.proto_to_tensor(request.tensor)
+            
+            # Run inference
+            with torch.no_grad():
+                try:
+                    output_tensor = model(input_tensor)
+                except Exception as e:
+                    error_msg = f"Model inference failed: {str(e)}"
+                    logging.error(error_msg)
+                    context.set_code(grpc.StatusCode.INTERNAL)
+                    context.set_details(error_msg)
+                    return dnn_inference_pb2.InferenceResponse(
+                        success=False,
+                        error_message=error_msg
+                    )
+                
+            # Convert result back to proto
+            response_tensor = self.tensor_to_proto(output_tensor)
+            
+            return dnn_inference_pb2.InferenceResponse(
+                tensor=response_tensor,
+                success=True
+            )
+            
+        except Exception as e:
+            error_msg = f"Error processing tensor: {str(e)}"
+            logging.error(error_msg)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(error_msg)
+            return dnn_inference_pb2.InferenceResponse(
+                success=False,
+                error_message=error_msg
+            )
+            
+def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInferenceServicer]:
+    """Start the gRPC server
+    
+    Args:
+        port: Port number to listen on
+        max_workers: Maximum number of worker threads
+        
+    Returns:
+        Tuple of (server, servicer)
+    """
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
+    servicer = DNNInferenceServicer()
+    dnn_inference_pb2_grpc.add_DNNInferenceServicer_to_server(servicer, server)
+    
+    server_addr = f'[::]:{port}'
+    server.add_insecure_port(server_addr)
     server.start()
-    server.wait_for_termination()
+    
+    logging.info(f"DNN Inference Server started on port {port}")
+    return server, servicer
 
 
 if __name__ == "__main__":
-    logging.basicConfig()
-    serve()
+    try:
+        # Start server
+        server, servicer = serve()
+        logging.info("Server started successfully. Press Ctrl+C to exit.")
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        logging.info("Server shutting down...")
+    except Exception as e:
+        logging.error(f"Server error: {str(e)}")
+        raise
