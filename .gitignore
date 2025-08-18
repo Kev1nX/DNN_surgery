@@ -1,2 +1,5 @@
 .venv
+data
+*.log
+performance_logs
 __pycache__
