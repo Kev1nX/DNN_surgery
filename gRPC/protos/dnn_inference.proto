@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package dnn_surgery;
+
+// Represents a tensor shape
+message TensorShape {
+    repeated int32 dimensions = 1;
+}
+
+// Represents a tensor
+message Tensor {
+    bytes data = 1;  // Serialized tensor data
+    TensorShape shape = 2;
+    string dtype = 3;  // Data type (float32, float64, etc.)
+    bool requires_grad = 4;
+}
+
+// Request from edge device with intermediate tensor
+message InferenceRequest {
+    Tensor tensor = 1;
+    string model_id = 2;  // Identifier for which model/layer to start from
+}
+
+// Response from cloud with final output
+message InferenceResponse {
+    Tensor tensor = 1;
+    bool success = 2;
+    string error_message = 3;
+}
+
+// Service definition for DNN inference
+service DNNInference {
+    // Send intermediate tensor to cloud for further processing
+    rpc ProcessTensor (InferenceRequest) returns (InferenceResponse) {}
+}
