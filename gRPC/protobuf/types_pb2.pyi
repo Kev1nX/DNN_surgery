@@ -1,0 +1,102 @@
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
+from google.protobuf import descriptor as _descriptor
+from typing import ClassVar as _ClassVar
+
+DESCRIPTOR: _descriptor.FileDescriptor
+
+class DataType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    DT_INVALID: _ClassVar[DataType]
+    DT_FLOAT: _ClassVar[DataType]
+    DT_DOUBLE: _ClassVar[DataType]
+    DT_INT32: _ClassVar[DataType]
+    DT_UINT8: _ClassVar[DataType]
+    DT_INT16: _ClassVar[DataType]
+    DT_INT8: _ClassVar[DataType]
+    DT_STRING: _ClassVar[DataType]
+    DT_COMPLEX64: _ClassVar[DataType]
+    DT_INT64: _ClassVar[DataType]
+    DT_BOOL: _ClassVar[DataType]
+    DT_QINT8: _ClassVar[DataType]
+    DT_QUINT8: _ClassVar[DataType]
+    DT_QINT32: _ClassVar[DataType]
+    DT_BFLOAT16: _ClassVar[DataType]
+    DT_QINT16: _ClassVar[DataType]
+    DT_QUINT16: _ClassVar[DataType]
+    DT_UINT16: _ClassVar[DataType]
+    DT_COMPLEX128: _ClassVar[DataType]
+    DT_HALF: _ClassVar[DataType]
+    DT_RESOURCE: _ClassVar[DataType]
+    DT_VARIANT: _ClassVar[DataType]
+    DT_UINT32: _ClassVar[DataType]
+    DT_UINT64: _ClassVar[DataType]
+    DT_FLOAT_REF: _ClassVar[DataType]
+    DT_DOUBLE_REF: _ClassVar[DataType]
+    DT_INT32_REF: _ClassVar[DataType]
+    DT_UINT8_REF: _ClassVar[DataType]
+    DT_INT16_REF: _ClassVar[DataType]
+    DT_INT8_REF: _ClassVar[DataType]
+    DT_STRING_REF: _ClassVar[DataType]
+    DT_COMPLEX64_REF: _ClassVar[DataType]
+    DT_INT64_REF: _ClassVar[DataType]
+    DT_BOOL_REF: _ClassVar[DataType]
+    DT_QINT8_REF: _ClassVar[DataType]
+    DT_QUINT8_REF: _ClassVar[DataType]
+    DT_QINT32_REF: _ClassVar[DataType]
+    DT_BFLOAT16_REF: _ClassVar[DataType]
+    DT_QINT16_REF: _ClassVar[DataType]
+    DT_QUINT16_REF: _ClassVar[DataType]
+    DT_UINT16_REF: _ClassVar[DataType]
+    DT_COMPLEX128_REF: _ClassVar[DataType]
+    DT_HALF_REF: _ClassVar[DataType]
+    DT_RESOURCE_REF: _ClassVar[DataType]
+    DT_VARIANT_REF: _ClassVar[DataType]
+    DT_UINT32_REF: _ClassVar[DataType]
+    DT_UINT64_REF: _ClassVar[DataType]
+DT_INVALID: DataType
+DT_FLOAT: DataType
+DT_DOUBLE: DataType
+DT_INT32: DataType
+DT_UINT8: DataType
+DT_INT16: DataType
+DT_INT8: DataType
+DT_STRING: DataType
+DT_COMPLEX64: DataType
+DT_INT64: DataType
+DT_BOOL: DataType
+DT_QINT8: DataType
+DT_QUINT8: DataType
+DT_QINT32: DataType
+DT_BFLOAT16: DataType
+DT_QINT16: DataType
+DT_QUINT16: DataType
+DT_UINT16: DataType
+DT_COMPLEX128: DataType
+DT_HALF: DataType
+DT_RESOURCE: DataType
+DT_VARIANT: DataType
+DT_UINT32: DataType
+DT_UINT64: DataType
+DT_FLOAT_REF: DataType
+DT_DOUBLE_REF: DataType
+DT_INT32_REF: DataType
+DT_UINT8_REF: DataType
+DT_INT16_REF: DataType
+DT_INT8_REF: DataType
+DT_STRING_REF: DataType
+DT_COMPLEX64_REF: DataType
+DT_INT64_REF: DataType
+DT_BOOL_REF: DataType
+DT_QINT8_REF: DataType
+DT_QUINT8_REF: DataType
+DT_QINT32_REF: DataType
+DT_BFLOAT16_REF: DataType
+DT_QINT16_REF: DataType
+DT_QUINT16_REF: DataType
+DT_UINT16_REF: DataType
+DT_COMPLEX128_REF: DataType
+DT_HALF_REF: DataType
+DT_RESOURCE_REF: DataType
+DT_VARIANT_REF: DataType
+DT_UINT32_REF: DataType
+DT_UINT64_REF: DataType
