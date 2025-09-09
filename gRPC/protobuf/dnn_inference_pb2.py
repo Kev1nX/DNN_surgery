@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13\x64nn_inference.proto\x12\x0b\x64nn_surgery\"!\n\x0bTensorShape\x12\x12\n\ndimensions\x18\x01 \x03(\x05\"e\n\x06Tensor\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\'\n\x05shape\x18\x02 \x01(\x0b\x32\x18.dnn_surgery.TensorShape\x12\r\n\x05\x64type\x18\x03 \x01(\t\x12\x15\n\rrequires_grad\x18\x04 \x01(\x08\"I\n\x10InferenceRequest\x12#\n\x06tensor\x18\x01 \x01(\x0b\x32\x13.dnn_surgery.Tensor\x12\x10\n\x08model_id\x18\x02 \x01(\t\"`\n\x11InferenceResponse\x12#\n\x06tensor\x18\x01 \x01(\x0b\x32\x13.dnn_surgery.Tensor\x12\x0f\n\x07success\x18\x02 \x01(\x08\x12\x15\n\rerror_message\x18\x03 \x01(\t2`\n\x0c\x44NNInference\x12P\n\rProcessTensor\x12\x1d.dnn_surgery.InferenceRequest\x1a\x1e.dnn_surgery.InferenceResponse\"\x00\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13\x64nn_inference.proto\x12\x0b\x64nn_surgery\"!\n\x0bTensorShape\x12\x12\n\ndimensions\x18\x01 \x03(\x05\"e\n\x06Tensor\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\'\n\x05shape\x18\x02 \x01(\x0b\x32\x18.dnn_surgery.TensorShape\x12\r\n\x05\x64type\x18\x03 \x01(\t\x12\x15\n\rrequires_grad\x18\x04 \x01(\x08\"I\n\x10InferenceRequest\x12#\n\x06tensor\x18\x01 \x01(\x0b\x32\x13.dnn_surgery.Tensor\x12\x10\n\x08model_id\x18\x02 \x01(\t\"`\n\x11InferenceResponse\x12#\n\x06tensor\x18\x01 \x01(\x0b\x32\x13.dnn_surgery.Tensor\x12\x0f\n\x07success\x18\x02 \x01(\x08\x12\x15\n\rerror_message\x18\x03 \x01(\t\"\x9c\x02\n\x0cLayerProfile\x12\x11\n\tlayer_idx\x18\x01 \x01(\x05\x12\x12\n\nlayer_name\x18\x02 \x01(\t\x12\x16\n\x0e\x65xecution_time\x18\x03 \x01(\x01\x12\x14\n\x0cmemory_usage\x18\x04 \x01(\x03\x12\x12\n\ninput_size\x18\x05 \x03(\x05\x12\x13\n\x0boutput_size\x18\x06 \x03(\x05\x12\x1a\n\x12\x64\x61ta_transfer_size\x18\x07 \x01(\x03\x12\x1e\n\x16\x63omputation_complexity\x18\x08 \x01(\x01\x12\x1a\n\x12\x65xecution_time_std\x18\t \x01(\x01\x12\x1a\n\x12min_execution_time\x18\n \x01(\x01\x12\x1a\n\x12max_execution_time\x18\x0b \x01(\x01\"\xc5\x01\n\nSystemInfo\x12\r\n\x05model\x18\x01 \x01(\t\x12\x11\n\tcpu_model\x18\x02 \x01(\t\x12\x11\n\tcpu_cores\x18\x03 \x01(\x05\x12\x17\n\x0fmemory_total_mb\x18\x04 \x01(\x05\x12\x14\n\x0c\x61rchitecture\x18\x05 \x01(\t\x12\x0f\n\x07os_info\x18\x06 \x01(\t\x12\x16\n\x0epython_version\x18\x07 \x01(\t\x12\x17\n\x0fpytorch_version\x18\x08 \x01(\t\x12\x11\n\ttimestamp\x18\t \x01(\t\"\xf4\x01\n\rClientProfile\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12,\n\x0bsystem_info\x18\x02 \x01(\x0b\x32\x17.dnn_surgery.SystemInfo\x12\x30\n\rlayer_metrics\x18\x03 \x03(\x0b\x32\x19.dnn_surgery.LayerProfile\x12\x13\n\x0bnum_samples\x18\x04 \x01(\x05\x12\x12\n\ninput_size\x18\x05 \x03(\x05\x12\x18\n\x10total_model_time\x18\x06 \x01(\x01\x12\x16\n\x0e\x61vg_layer_time\x18\x07 \x01(\x01\x12\x14\n\x0ctotal_layers\x18\x08 \x01(\x05\"R\n\x10ProfilingRequest\x12+\n\x07profile\x18\x01 \x01(\x0b\x32\x1a.dnn_surgery.ClientProfile\x12\x11\n\tclient_id\x18\x02 \x01(\t\"S\n\x11ProfilingResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1c\n\x14updated_split_config\x18\x03 \x01(\t2\xb6\x01\n\x0c\x44NNInference\x12P\n\rProcessTensor\x12\x1d.dnn_surgery.InferenceRequest\x1a\x1e.dnn_surgery.InferenceResponse\"\x00\x12T\n\x11SendProfilingData\x12\x1d.dnn_surgery.ProfilingRequest\x1a\x1e.dnn_surgery.ProfilingResponse\"\x00\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -39,6 +39,16 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_INFERENCEREQUEST']._serialized_end=247
   _globals['_INFERENCERESPONSE']._serialized_start=249
   _globals['_INFERENCERESPONSE']._serialized_end=345
-  _globals['_DNNINFERENCE']._serialized_start=347
-  _globals['_DNNINFERENCE']._serialized_end=443
+  _globals['_LAYERPROFILE']._serialized_start=348
+  _globals['_LAYERPROFILE']._serialized_end=632
+  _globals['_SYSTEMINFO']._serialized_start=635
+  _globals['_SYSTEMINFO']._serialized_end=832
+  _globals['_CLIENTPROFILE']._serialized_start=835
+  _globals['_CLIENTPROFILE']._serialized_end=1079
+  _globals['_PROFILINGREQUEST']._serialized_start=1081
+  _globals['_PROFILINGREQUEST']._serialized_end=1163
+  _globals['_PROFILINGRESPONSE']._serialized_start=1165
+  _globals['_PROFILINGRESPONSE']._serialized_end=1248
+  _globals['_DNNINFERENCE']._serialized_start=1251
+  _globals['_DNNINFERENCE']._serialized_end=1433
 # @@protoc_insertion_point(module_scope)

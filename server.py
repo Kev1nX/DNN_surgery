@@ -132,10 +132,25 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             # Convert proto to tensor
             input_tensor = self.proto_to_tensor(request.tensor)
             
+            # Log input tensor stats
+            logging.info("=== Cloud Model Processing ===")
+            logging.info(f"Input tensor shape: {input_tensor.shape}")
+            logging.info(f"Input tensor stats - Min: {input_tensor.min().item():.3f}, Max: {input_tensor.max().item():.3f}, Mean: {input_tensor.mean().item():.3f}")
+            
             # Run inference
             with torch.no_grad():
                 try:
+                    logging.info(f"Cloud model structure:\n{model}")
                     output_tensor = model(input_tensor)
+                    logging.info(f"Output tensor shape: {output_tensor.shape}")
+                    logging.info(f"Output tensor stats - Min: {output_tensor.min().item():.3f}, Max: {output_tensor.max().item():.3f}, Mean: {output_tensor.mean().item():.3f}")
+                    
+                    # For classification outputs
+                    if output_tensor.dim() == 2:
+                        probs = torch.softmax(output_tensor, dim=1)
+                        max_prob, pred = probs.max(1)
+                        logging.info(f"Prediction confidence: {max_prob.item():.3f}, Predicted class: {pred.item()}")
+                        
                 except Exception as e:
                     error_msg = f"Model inference failed: {str(e)}"
                     logging.error(error_msg)

@@ -1,591 +1,926 @@
-import sys
-import logging
-import time
+"""
+Usage:
+    # Standalone analysis
+    python dnn_surgery.py --mode analyze --model resnet18
+    
+    # Distributed server
+    python dnn_surgery.py --mode server --model resnet18 --port 50051
+    
+    # Distributed client
+    python dnn_surgery.py --mode client --server-address <ip>:50051
+"""
+
 import torch
-from torch import nn
-import torch.fx as fx
-from networkx import DiGraph
-import maxflow
-import numpy as np
-from collections import defaultdict
-import zlib
-from typing import Optional, Tuple, Union
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-from torchvision.datasets import ImageFolder
-from models.pretrained_loader import load_pretrained_model
-from utils.inference_size_estimator import (
-    get_layer_parameter_size,
-    calculate_total_parameter_size,
-)
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('dnn_surgery.log')
-    ]
-)
-
-logger = logging.getLogger(__name__)
-
-def create_data_loader(
-    data_path: str,
-    input_size: Tuple[int, ...],
-    batch_size: int = 32,
-    num_workers: int = 4
-) -> DataLoader:
-    """Create a DataLoader for model validation
-    
-    Args:
-        data_path: Path to dataset directory
-        input_size: Expected input size (C, H, W)
-        batch_size: Batch size for loading
-        num_workers: Number of worker processes
-        
-    Returns:
-        DataLoader for the dataset
-    """
-    # Standard transforms for pretrained models
-    transform = transforms.Compose([
-        transforms.Resize((input_size[1], input_size[2])),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                          std=[0.229, 0.224, 0.225])
-    ])
-    
-    # Load dataset
-    dataset = ImageFolder(data_path, transform=transform)
-    
-    # Create loader
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers
-    )
-    
-    return loader
-def get_tensor_size(inputs):
-    return inputs.element_size() * inputs.nelement()
+import torch.nn as nn
+import torchvision.models as models
+import time
+import json
+import argparse
+import logging
+import io
+import grpc
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+import pickle
+import psutil
+import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
+import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
+from server import serve as start_server
+from dnn_inference_client import DNNInferenceClient
+from dataset.imagenet_loader import ImageNetMiniLoader
+from networks.resnet18 import ResNet18
+from networks.alexnet import AlexNet
+from networks.cnn import CNN
 
 
-class ModelProfiler:
-    def __init__(self, model, example_input, edge_device, cloud_device):
-        """
-        Args:
-            model: PyTorch model
-            example_input: Sample input tensor
-            edge_device: Device object for edge (e.g., torch.device("cpu"))
-            cloud_device: Device object for cloud (e.g., torch.device("cuda"))
-        """
-        self.model = model
-        self.example_input = example_input
-        self.edge_device = edge_device
-        self.cloud_device = cloud_device
-        self.hooks = []
-        
-        # For SimpleLinear, set up known structure
-        self.is_simple_linear = isinstance(model, SimpleLinear)
-        if self.is_simple_linear:
-            self.layer_metrics = {
-                'fc1': {
-                    'edge_times': [0.2],
-                    'cloud_times': [0.1],
-                    'output_size': 20 * 4  # 20 floats * 4 bytes
-                },
-                'fc2': {
-                    'edge_times': [0.2],
-                    'cloud_times': [0.1],
-                    'output_size': 5 * 4  # 5 floats * 4 bytes
-                }
-            }
-        else:
-            # Warmup devices for other models
-            self._warmup_devices()
+@dataclass
+class LayerMetrics:
+    """Metrics for individual layer execution"""
+    layer_idx: int
+    layer_name: str
+    execution_time: float  # milliseconds
+    memory_usage: int  # bytes
+    input_size: Tuple[int, ...]  # tensor shape
+    output_size: Tuple[int, ...]  # tensor shape
+    data_transfer_size: int  # bytes for intermediate transfer
+    computation_complexity: float  # estimated FLOPs
     
-    def _warmup_devices(self):
-        """Run initial passes to stabilize timing measurements"""
-        for device in [self.edge_device, self.cloud_device]:
-            self.model.to(device)
-            warmup_input = self.example_input.to(device)
-            for _ in range(5):
-                _ = self.model(warmup_input)
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-    
-    def _attach_hooks(self):
-        """Attach forward hooks to all modules"""
-        # First trace the model to get FX graph nodes
-        graph = trace_model(self.model, self.example_input)
-        
-        # Initialize layer metrics for all nodes
-        self.layer_metrics = defaultdict(lambda: {
-            'edge_times': [], 
-            'cloud_times': [],
-            'output_size': 0
-        })
-        
-        # Initialize metrics for every node in the graph
-        for node in graph.nodes:
-            # Add default metrics for every operation
-            self.layer_metrics[node.name] = {
-                'edge_times': [0.1],  # Default edge time
-                'cloud_times': [0.05],  # Default cloud time (faster)
-                'output_size': 0
-            }
-            
-            # For placeholder nodes (inputs), set minimal metrics
-            if node.op == 'placeholder':
-                self.layer_metrics[node.name]['edge_times'] = [0.01]
-                self.layer_metrics[node.name]['cloud_times'] = [0.01]
-            
-            # For output nodes, set larger transmission cost
-            if node.op == 'output':
-                self.layer_metrics[node.name]['output_size'] = 1024  # 1KB default size
-        
-        def hook_wrapper(device_type, layer_name):
-            def forward_hook(module, inputs, output):
-                try:
-                    # Record output size for any tensor output
-                    size = self._calculate_output_size(output)
-                    self.layer_metrics[layer_name]['output_size'] = size
-                    
-                    # Set compute times based on operation type
-                    duration = 0.1  # Default duration
-                    if isinstance(module, nn.Linear):
-                        duration = 0.2
-                    elif isinstance(module, nn.ReLU):
-                        duration = 0.05
-                        
-                    if device_type == 'edge':
-                        self.layer_metrics[layer_name]['edge_times'] = [duration * 1.5]  # Edge is slower
-                    else:
-                        self.layer_metrics[layer_name]['cloud_times'] = [duration]
-                    
-                except Exception as e:
-                    logger.error(f"Error in hook for {layer_name}: {str(e)}")
-                    logger.error(f"Module: {module.__class__.__name__}")
-                    
-                return output
-            return forward_hook
-        
-        # Attach hooks to modules for size calculation
-        for node in graph.nodes:
-            if node.op == 'call_module':
-                target = node.target
-                if hasattr(self.model, target):
-                    module = getattr(self.model, target)
-                    # Attach hooks for both edge and cloud
-                    edge_hook = module.register_forward_hook(hook_wrapper('edge', node.name))
-                    cloud_hook = module.register_forward_hook(hook_wrapper('cloud', node.name))
-                    self.hooks.extend([edge_hook, cloud_hook])
-                # Edge hook
-                edge_hook = module.register_forward_hook(
-                    hook_wrapper('edge', name))
-                # Cloud hook
-                cloud_hook = module.register_forward_hook(
-                    hook_wrapper('cloud', name))
-                self.hooks.extend([edge_hook, cloud_hook])
-    
-    def _calculate_output_size(self, output):
-        """Calculate tensor size in bytes with compression simulation"""
-        if isinstance(output, tuple):
-            sizes = [self._get_tensor_size(t) for t in output if t is not None]
-            return sum(sizes)
-        return self._get_tensor_size(output)
-    
-    def _get_tensor_size(self, tensor):
-        """Get size in bytes with compression simulation"""
-        if tensor is None:
-            return 0
-        
-        # Actual size
-        nbytes = tensor.nelement() * tensor.element_size()
-        
-        # Simulate compression for transmission
-        if tensor.device.type == 'cpu':
-            np_tensor = tensor.detach().numpy()
-        else:
-            np_tensor = tensor.cpu().detach().numpy()
-        
-        compressed = zlib.compress(np_tensor.tobytes())
-        return len(compressed)
-    
-    def profile(self, num_iterations=100):
-        """Run profiling across both devices"""
-        if self.is_simple_linear:
-            # For SimpleLinear, return pre-defined metrics
-            return {
-                name: {
-                    'F_e': np.mean(metrics['edge_times']),
-                    'F_c': np.mean(metrics['cloud_times']),
-                    'D_t': metrics['output_size']
-                }
-                for name, metrics in self.layer_metrics.items()
-            }
-        
-        # For other models, do normal profiling
-        self._attach_hooks()
-        results = {}
-        
-        # Profile edge device
-        self.model.to(self.edge_device)
-        edge_input = self.example_input.to(self.edge_device)
-        for _ in range(num_iterations):
-            _ = self.model(edge_input)
-        
-        # Profile cloud device
-        self.model.to(self.cloud_device)
-        cloud_input = self.example_input.to(self.cloud_device)
-        for _ in range(num_iterations):
-            _ = self.model(cloud_input)
-        
-        # Process results
-        for name, metrics in self.layer_metrics.items():
-            results[name] = {
-                'F_e': np.mean(metrics['edge_times']),  # Edge compute (ms)
-                'F_c': np.mean(metrics['cloud_times']),  # Cloud compute (ms)
-                'D_t': metrics['output_size']            # Output size (bytes)
-            }
-        
-        # Remove hooks
-        for hook in self.hooks:
-            hook.remove()
-            
-        return results
 
-    @staticmethod
-    def export_to_dads_format(profile_data, bandwidth_mbps):
-        """Convert to DADS parameters: F_e, F_c, F_t"""
-        F_e, F_c, D_t = {}, {}, {}
-        
-        for layer_name, metrics in profile_data.items():
-            F_e[layer_name] = metrics['F_e']
-            F_c[layer_name] = metrics['F_c']
-            D_t[layer_name] = metrics['D_t']
-        
-        # Calculate transmission time: size (bytes) / bandwidth (Mbps)
-        # Convert Mbps to bytes/ms: 1 Mbps = 125,000 bytes/s = 125 bytes/ms
-        conversion = bandwidth_mbps * 125
-        F_t = {k: v / conversion for k, v in D_t.items()}
-        
-        return F_e, F_c, F_t, D_t
+@dataclass
+class SplitConfiguration:
+    """Configuration for a specific split point"""
+    split_layer: int
+    client_layers: List[int]
+    server_layers: List[int]
+    total_latency: float  # milliseconds
+    transfer_latency: float  # milliseconds
+    client_execution_time: float  # milliseconds
+    server_execution_time: float  # milliseconds
+    network_bandwidth: float  # Mbps
+    accuracy_preserved: bool
 
 
-def trace_model(model: nn.Module, sample_input: torch.Tensor) -> fx.Graph:
-    """Convert DNN to DAG representation"""
-    traced = fx.symbolic_trace(model)
-    graph = traced.graph
-    return graph
+@dataclass
+class SplitConfig:
+    """Configuration for model splitting (simplified version)"""
+    split_point: int
+    model_id: str
+    total_latency: float
+    client_execution_time: float
+    server_execution_time: float
+    transfer_latency: float
 
 
-def build_augmented_graph(
-    graph: fx.Graph,
-    F_e: dict,  # Edge compute times
-    F_c: dict,  # Cloud compute times
-    D_t: dict,  # Output sizes
-    B: float    # Bandwidth
-) -> DiGraph:
-    """Construct min-cut graph per DADS paper"""
-    G_aug = DiGraph()
-    
-    # Add virtual nodes
-    G_aug.add_node("s")  # Source node
-    G_aug.add_node("t")  # Sink node
-    
-    # Track node dependencies for proper ordering
-    dependencies = defaultdict(set)
-    node_list = list(graph.nodes)
-    
-    # First pass: add nodes and collect dependencies
-    for i, node in enumerate(node_list):
-        G_aug.add_node(node.name)
-        
-        # Add edges to following nodes to maintain order
-        for next_node in node_list[i+1:]:
-            if next_node.op != 'output':  # Skip output nodes
-                dependencies[next_node.name].add(node.name)
-    
-    # Second pass: add computation and communication edges
-    for node in graph.nodes:
-        if node.op in ['call_module', 'call_method', 'call_function']:
-            # Get compute costs
-            edge_cost = F_e.get(node.name, 0.1)
-            cloud_cost = F_c.get(node.name, 0.05)
-            transfer_size = D_t.get(node.name, 0)
-            
-            # Calculate communication cost based on data size and bandwidth
-            comm_cost = max(transfer_size / (B * 125000), 0.001)  # Convert Mbps to bytes/ms
-            
-            # Add edges for computation choices
-            G_aug.add_edge("s", node.name, capacity=edge_cost)  # Edge execution
-            G_aug.add_edge(node.name, "t", capacity=cloud_cost)  # Cloud execution
-            
-            # Add communication cost for crossing the boundary
-            aux_name = f"{node.name}_aux"
-            G_aug.add_node(aux_name)
-            G_aug.add_edge(node.name, aux_name, capacity=comm_cost)
-            G_aug.add_edge(aux_name, "t", capacity=float('inf'))  # Force cut after aux node
-            
-            # Add dependency constraints
-            for dep in dependencies[node.name]:
-                G_aug.add_edge(dep, node.name, capacity=float('inf'))
-                
-            # Special handling for input/output related nodes
-            if 'input' in node.name or node.op == 'placeholder':
-                # Input nodes should prefer edge execution
-                G_aug.add_edge("s", node.name, capacity=0.001)
-            elif 'output' in node.name or node.op == 'output':
-                # Output nodes should prefer cloud execution
-                G_aug.add_edge(node.name, "t", capacity=0.001)
-    
-    return G_aug
+@dataclass
+class ModelConfig:
+    """Model configuration for different architectures"""
+    custom_class: type
+    pretrained_factory: callable = None
+    pretrained_weights: object = None
+    default_classes: int = 1000
 
 
+@dataclass
+class NetworkCondition:
+    """Network condition parameters"""
+    bandwidth_mbps: float
+    latency_ms: float
+    packet_loss_rate: float
+    jitter_ms: float
+    
 
-def find_optimal_cut(G_aug: DiGraph) -> dict:
-    """Solve min-cut problem"""
-    graph = maxflow.GraphFloat()
-    num_nodes = len(G_aug.nodes)
+class ExecutionProfiler:
+    """Profiles layer-wise execution times and resource usage"""
     
-    # Add all nodes at once
-    graph.add_nodes(num_nodes)
-    
-    # Map graph nodes to maxflow node indices
-    node_ids = {node: i for i, node in enumerate(G_aug.nodes)}
-    
-    # Add edges with capacities
-    for u, v, data in G_aug.edges(data=True):
-        src_idx = node_ids[u]
-        dst_idx = node_ids[v]
-        graph.add_edge(src_idx, dst_idx, data['weight'], 0)
-    
-    # Solve min-cut
-    graph.maxflow()
-    
-    # Get partition
-    partition = {}
-    for node, idx in node_ids.items():
-        partition[node] = graph.get_segment(idx)
-    
-    return partition
-
-def dnn_surgery_pipeline(model, input_data, bandwidth_mbps):
-    """
-    Split a DNN model for distributed inference between edge and cloud.
-    
-    Args:
-        model: PyTorch model to split
-        input_data: Sample input tensor for profiling
-        bandwidth_mbps: Available bandwidth in Mbps
-    
-    Returns:
-        tuple: (edge_model, cloud_model, validation_accuracy)
-    """
-    try:
-        # Setup devices
-        edge_device = torch.device("cpu")
-        cloud_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(self, device: str = "cpu"):
+        self.device = torch.device(device)
+        self.layer_profiles = {}
+        self.execution_history = []
         
-        # 1. Profile model
-        print("Profiling model...")
-        profiler = ModelProfiler(model, input_data, edge_device, cloud_device)
-        profile_data = profiler.profile()
-        F_e, F_c, F_t, D_t = profiler.export_to_dads_format(profile_data, bandwidth_mbps)
+    def profile_layer_execution(self, layer, input_tensor: torch.Tensor, 
+                              layer_name: str, layer_idx: int) -> Tuple[LayerMetrics, torch.Tensor]:
+        """Profile individual layer execution"""
+        # Handle both module-based and function-based layers
+        if hasattr(layer, 'to'):
+            layer = layer.to(self.device)
         
-        # 2. Trace model to DAG
-        print("Converting model to graph representation...")
-        graph = trace_model(model, input_data)
+        input_tensor = input_tensor.to(self.device)
         
-        # 3. Build augmented graph
-        print("Building augmented graph for min-cut...")
-        G_aug = build_augmented_graph(graph, F_e, F_c, D_t, bandwidth_mbps)
-        
-        # 4. Solve min-cut
-        print("Finding optimal split point...")
-        partition = find_optimal_cut(G_aug)
-        
-        # 5. Split model
-        print("Splitting model into edge and cloud components...")
-        from utils.model_splitter import split_model
-        edge_model, cloud_model = split_model(model, partition)
-        
-        # 6. Validate split model with sample input
-        print("Validating split model with sample input...")
-        
-        # First verify original model output
-        with torch.no_grad():
-            original_output = model(input_data)
-        
-        # Then validate split model
-        validation_acc = validate_split_model(edge_model, cloud_model, input_data)
-        
-        # Compare outputs if validation succeeds
-        if validation_acc > 0.0:
+        # Warm-up runs
+        for _ in range(3):
             with torch.no_grad():
-                edge_output = edge_model(input_data)
-                split_output = cloud_model(edge_output)
-                
-                # Verify outputs are close enough
-                if not torch.allclose(original_output, split_output, rtol=1e-3, atol=1e-3):
-                    logger.error("Split model outputs don't match original model")
-                    validation_acc = 0.0
+                _ = layer(input_tensor)
         
-        # Only return models if validation passes
-        if validation_acc == 0.0:
-            logger.error("Split model validation failed. Debug info:")
-            logger.error(f"Partition map: {partition}")
-            logger.error(f"Number of edge model parameters: {sum(p.numel() for p in edge_model.parameters())}")
-            logger.error(f"Number of cloud model parameters: {sum(p.numel() for p in cloud_model.parameters())}")
-            raise ValueError("Split model validation failed - model cannot process input correctly")
+        # Memory usage before
+        process = psutil.Process()
+        mem_before = process.memory_info().rss
+        
+        # Actual timing
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        
+        with torch.no_grad():
+            output = layer(input_tensor)
             
-        return edge_model, cloud_model, validation_acc
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            torch.cuda.synchronize()
+        end_time = time.perf_counter()
         
-    except Exception as e:
-        print(f"Error in DNN surgery pipeline: {str(e)}")
-        raise
+        # Memory usage after
+        mem_after = process.memory_info().rss
+        
+        # Calculate metrics
+        execution_time = (end_time - start_time) * 1000  # Convert to milliseconds
+        memory_usage = max(0, mem_after - mem_before)  # Ensure non-negative
+        input_size = tuple(input_tensor.shape)
+        output_size = tuple(output.shape)
+        data_transfer_size = output.numel() * output.element_size()
+        
+        # Estimate computational complexity (simplified)
+        computation_complexity = self._estimate_flops(layer, input_tensor)
+        
+        metrics = LayerMetrics(
+            layer_idx=layer_idx,
+            layer_name=layer_name,
+            execution_time=execution_time,
+            memory_usage=memory_usage,
+            input_size=input_size,
+            output_size=output_size,
+            data_transfer_size=data_transfer_size,
+            computation_complexity=computation_complexity
+        )
+        
+        self.layer_profiles[layer_idx] = metrics
+        return metrics, output
+    
+    def _estimate_flops(self, layer, input_tensor: torch.Tensor) -> float:
+        """Estimate FLOPs for different layer types"""
+        # Handle function-based layers by checking if it's a PyTorch module
+        if hasattr(layer, '__class__') and issubclass(layer.__class__, nn.Module):
+            if isinstance(layer, nn.Conv2d):
+                # For convolution: output_elements * (kernel_size * input_channels + bias)
+                output_size = self._get_conv_output_size(layer, input_tensor)
+                kernel_flops = layer.kernel_size[0] * layer.kernel_size[1] * layer.in_channels
+                if layer.bias is not None:
+                    kernel_flops += 1
+                return output_size * kernel_flops
+            
+            elif isinstance(layer, nn.Linear):
+                # For linear layer: output_size * (input_size + bias)
+                output_size = layer.out_features
+                input_size = layer.in_features
+                return output_size * (input_size + (1 if layer.bias is not None else 0))
+            
+            elif isinstance(layer, (nn.BatchNorm2d, nn.ReLU, nn.MaxPool2d, nn.AdaptiveAvgPool2d)):
+                # For activation/normalization layers: roughly proportional to input size
+                return input_tensor.numel()
+        
+        # For function-based layers or unknown types, use input size as approximation
+        return input_tensor.numel()
+    
+    def _get_conv_output_size(self, layer: nn.Conv2d, input_tensor: torch.Tensor) -> int:
+        """Calculate convolution output size"""
+        batch_size, in_channels, height, width = input_tensor.shape
+        out_height = (height + 2 * layer.padding[0] - layer.kernel_size[0]) // layer.stride[0] + 1
+        out_width = (width + 2 * layer.padding[1] - layer.kernel_size[1]) // layer.stride[1] + 1
+        return batch_size * layer.out_channels * out_height * out_width
 
 
-class SimpleLinear(nn.Module):
-    def __init__(self):
+class NetworkLatencySimulator:
+    """Measures actual network transfer time using gRPC client-server communication"""
+    
+    def __init__(self, server_address: str = None):
+        self.latency_cache = {}
+        self.server_address = server_address
+        self._client = None
+        
+    def _get_client(self):
+        """Get or create gRPC client"""
+        if self._client is None and self.server_address:
+            channel = grpc.insecure_channel(self.server_address)
+            self._client = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
+        return self._client
+    
+    def calculate_transfer_time(self, data_size_bytes: int, bandwidth_mbps: float = None,
+                              base_latency_ms: float = 10.0) -> float:
+        """Measure actual network transfer time or simulate if no server available"""
+        client = self._get_client()
+        
+        if client and self.server_address:
+            return self._measure_actual_transfer_time(data_size_bytes)
+        else:
+            return self._simulate_transfer_time(data_size_bytes, bandwidth_mbps, base_latency_ms)
+    
+    def _measure_actual_transfer_time(self, data_size_bytes: int) -> float:
+        """Measure actual network transfer time using dummy data"""
+        try:
+            dummy_tensor = torch.randn(1, max(1, data_size_bytes // 4))
+            
+            buffer = io.BytesIO()
+            torch.save(dummy_tensor, buffer)
+            tensor_bytes = buffer.getvalue()
+            
+            shape = dnn_inference_pb2.TensorShape(dimensions=list(dummy_tensor.shape))
+            proto_tensor = dnn_inference_pb2.Tensor(
+                data=tensor_bytes,
+                shape=shape,
+                dtype=str(dummy_tensor.dtype),
+                requires_grad=False
+            )
+            
+            request = dnn_inference_pb2.InferenceRequest(
+                tensor=proto_tensor,
+                model_id="timing_test"
+            )
+            
+            start_time = time.perf_counter()
+            try:
+                response = self._client.ProcessTensor(request)
+            except Exception:
+                pass
+            end_time = time.perf_counter()
+            
+            transfer_time_ms = (end_time - start_time) * 1000
+            return max(transfer_time_ms, 1.0)
+            
+        except Exception as e:
+            logging.debug(f"Network timing measurement failed: {e}")
+            return self._simulate_transfer_time(data_size_bytes, 10.0, 10.0)
+    
+    def _simulate_transfer_time(self, data_size_bytes: int, bandwidth_mbps: float,
+                              base_latency_ms: float) -> float:
+        """Fallback simulation when real measurement not available"""
+        if bandwidth_mbps is None:
+            bandwidth_mbps = 10.0
+            
+        bandwidth_bps = bandwidth_mbps * 1_000_000 / 8
+        transfer_time_ms = (data_size_bytes / bandwidth_bps) * 1000
+        total_time_ms = transfer_time_ms + base_latency_ms
+        
+        return total_time_ms
+    
+    def simulate_network_conditions(self, condition: NetworkCondition) -> Dict[str, float]:
+        """Simulate various network impairments"""
+        jitter_penalty = condition.jitter_ms * 0.5
+        loss_penalty = condition.packet_loss_rate * 100
+        
+        return {
+            'base_latency': condition.latency_ms,
+            'jitter_penalty': jitter_penalty,
+            'loss_penalty': loss_penalty,
+            'total_penalty': jitter_penalty + loss_penalty
+        }
+
+
+class DNNSurgeon:
+    """Main class for DNN Surgery - optimal network splitting"""
+    
+    def __init__(self, model: nn.Module, model_name: str = "model", device: str = "cpu", server_address: str = None):
+        self.model = model
+        self.model_name = model_name
+        self.device = torch.device(device)
+        self.profiler = ExecutionProfiler(device)
+        self.network_simulator = NetworkLatencySimulator(server_address)
+        self.split_configurations = []
+        self.optimal_splits = {}
+    
+    def profile_entire_network(self, input_tensor: torch.Tensor) -> List[LayerMetrics]:
+        """Profile the entire network layer by layer"""
+        self.model.eval()
+        layers = self.model.gen_network()
+        layer_metrics = []
+        current_input = input_tensor
+        
+        for idx, layer in enumerate(layers):
+            # Generate layer name more robustly
+            if hasattr(layer, '__class__') and hasattr(layer.__class__, '__name__'):
+                layer_name = f"{layer.__class__.__name__}_{idx}"
+            elif hasattr(layer, '__name__'):
+                layer_name = f"{layer.__name__}_{idx}"
+            else:
+                layer_name = f"Layer_{idx}"
+            
+            metrics, output = self.profiler.profile_layer_execution(
+                layer, current_input, layer_name, idx
+            )
+            layer_metrics.append(metrics)
+            current_input = output
+        
+        return layer_metrics
+    
+    def find_optimal_split(self, layer_metrics: List[LayerMetrics], 
+                          network_conditions: List[NetworkCondition]) -> Dict[float, SplitConfiguration]:
+        """Find optimal split points for different network conditions"""
+        optimal_splits = {}
+        
+        for condition in network_conditions:
+            best_split = None
+            best_latency = float('inf')
+            
+            # Try all possible split points
+            for split_layer in range(1, len(layer_metrics)):
+                split_config = self._evaluate_split(
+                    split_layer, layer_metrics, condition
+                )
+                
+                if split_config.total_latency < best_latency:
+                    best_latency = split_config.total_latency
+                    best_split = split_config
+            
+            optimal_splits[condition.bandwidth_mbps] = best_split
+        
+        return optimal_splits
+    
+    def _evaluate_split(self, split_layer: int, layer_metrics: List[LayerMetrics], 
+                       condition: NetworkCondition) -> SplitConfiguration:
+        """Evaluate a specific split configuration"""
+        
+        # Separate layers into client and server
+        client_layers = list(range(split_layer))
+        server_layers = list(range(split_layer, len(layer_metrics)))
+        
+        # Calculate execution times
+        client_exec_time = sum(layer_metrics[i].execution_time for i in client_layers)
+        server_exec_time = sum(layer_metrics[i].execution_time for i in server_layers)
+        
+        # Calculate transfer time for intermediate data
+        transfer_size = layer_metrics[split_layer - 1].data_transfer_size
+        transfer_latency = self.network_simulator.calculate_transfer_time(
+            transfer_size, condition.bandwidth_mbps, condition.latency_ms
+        )
+        
+        # Add network condition penalties
+        network_penalties = self.network_simulator.simulate_network_conditions(condition)
+        total_network_penalty = network_penalties['total_penalty']
+        
+        # Total latency calculation
+        total_latency = client_exec_time + transfer_latency + server_exec_time + total_network_penalty
+        
+        return SplitConfiguration(
+            split_layer=split_layer,
+            client_layers=client_layers,
+            server_layers=server_layers,
+            total_latency=total_latency,
+            transfer_latency=transfer_latency,
+            client_execution_time=client_exec_time,
+            server_execution_time=server_exec_time,
+            network_bandwidth=condition.bandwidth_mbps,
+            accuracy_preserved=True,  # Assuming no accuracy loss for now
+        )
+    
+    def execute_split_inference(self, input_tensor: torch.Tensor, 
+                              split_config: SplitConfiguration) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Execute inference with the specified split configuration"""
+        timing_info = {}
+        
+        # Client-side execution
+        start_time = time.perf_counter()
+        layers = self.model.gen_network()
+        current_output = input_tensor
+        
+        for layer_idx in split_config.client_layers:
+            current_output = layers[layer_idx](current_output)
+        
+        client_time = (time.perf_counter() - start_time) * 1000
+        timing_info['client_execution'] = client_time
+        
+        # Simulate data transfer
+        start_time = time.perf_counter()
+        # In real implementation, this would be network transfer
+        # Here we simulate by serializing/deserializing the tensor
+        serialized_data = pickle.dumps(current_output.cpu())
+        intermediate_data = pickle.loads(serialized_data)
+        current_output = intermediate_data.to(self.device)
+        
+        transfer_time = (time.perf_counter() - start_time) * 1000
+        timing_info['transfer_time'] = transfer_time
+        
+        # Server-side execution
+        start_time = time.perf_counter()
+        for layer_idx in split_config.server_layers:
+            current_output = layers[layer_idx](current_output)
+        
+        server_time = (time.perf_counter() - start_time) * 1000
+        timing_info['server_execution'] = server_time
+        timing_info['total_time'] = client_time + transfer_time + server_time
+        
+        return current_output, timing_info
+
+
+def create_network_conditions(bandwidths: List[float] = None) -> List[NetworkCondition]:
+    """Create network conditions for given bandwidth range"""
+    if bandwidths is None:
+        bandwidths = [4, 6, 8, 10, 12, 14, 16, 18]  # Default Mbps range
+    
+    conditions = []
+    
+    for bw in bandwidths:
+        # Model realistic network conditions
+        # Higher bandwidth typically has lower latency but may vary
+        base_latency = max(20, 100 - bw * 3)  # ms
+        jitter = max(1, 10 - bw * 0.5)  # ms
+        packet_loss = max(0.001, 0.05 - bw * 0.002)  # percentage
+        
+        condition = NetworkCondition(
+            bandwidth_mbps=bw,
+            latency_ms=base_latency,
+            packet_loss_rate=packet_loss,
+            jitter_ms=jitter
+        )
+        conditions.append(condition)
+    
+    return conditions
+
+
+class ModelManager:
+    """Manages different network architectures"""
+    
+    MODELS = {
+        'resnet18': ModelConfig(None, models.resnet18, models.ResNet18_Weights.DEFAULT),
+        'alexnet': ModelConfig(None, models.alexnet, models.AlexNet_Weights.DEFAULT),
+        'cnn': ModelConfig(None, default_classes=10)
+    }
+    
+    @classmethod
+    def create_model(cls, name: str, use_pretrained: bool = True, num_classes: int = None) -> nn.Module:
+        """Create model instance"""
+        if name not in cls.MODELS:
+            raise ValueError(f"Unknown model: {name}. Available: {list(cls.MODELS.keys())}")
+        
+        config = cls.MODELS[name]
+        num_classes = num_classes or config.default_classes
+        
+        if use_pretrained and config.pretrained_factory and num_classes == 1000:
+            base_model = config.pretrained_factory(weights=config.pretrained_weights)
+            return PretrainedWrapper(base_model)
+        
+        if name == 'resnet18':
+            return ResNet18(num_classes=num_classes)
+        elif name == 'alexnet':
+            return AlexNet(num_classes=num_classes)
+        elif name == 'cnn':
+            return CNN(num_classes=num_classes)
+        
+        raise ValueError(f"Model {name} not implemented")
+
+
+class PretrainedWrapper(nn.Module):
+    """Wraps pretrained models for DNN Surgery compatibility"""
+    
+    def __init__(self, model):
         super().__init__()
-        self.fc1 = nn.Linear(10, 20)
-        self.fc2 = nn.Linear(20, 5)
+        self.model = model
+        self.layers = self._extract_layers()
+    
+    def _extract_layers(self) -> List[nn.Module]:
+        """Extract layers based on model architecture"""
+        if hasattr(self.model, 'features'):  # AlexNet-style
+            return list(self.model.features) + [
+                nn.AdaptiveAvgPool2d((6, 6)), nn.Flatten()
+            ] + list(self.model.classifier)
+        else:  # ResNet-style
+            return [
+                self.model.conv1, self.model.bn1, self.model.relu, self.model.maxpool,
+                self.model.layer1, self.model.layer2, self.model.layer3, self.model.layer4,
+                self.model.avgpool, nn.Flatten(), self.model.fc
+            ]
+    
+    def gen_network(self): 
+        return self.layers
+    
+    def forward(self, x): 
+        return self.model(x)
+
+
+class SplitModel(nn.Module):
+    """Base class for split models"""
+    
+    def __init__(self, layers: List[nn.Module], start_idx: int, end_idx: int):
+        super().__init__()
+        self.layers = nn.ModuleList(layers[start_idx:end_idx])
     
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        return self.fc2(x)
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
-def validate_split_model(edge_model: nn.Module, cloud_model: nn.Module, 
-                     data: Union[DataLoader, torch.Tensor], num_samples: int = 100) -> float:
-    """
-    Validate the split model using either a validation dataset or a single input tensor.
+
+class ModelSplitter:
+    """Handles model splitting operations"""
     
-    Args:
-        edge_model: The model component to run on edge
-        cloud_model: The model component to run on cloud
-        data: Either a DataLoader for validation data or a single input tensor
-        num_samples: Number of batches to validate (only used with DataLoader)
+    def __init__(self, model: nn.Module, model_name: str, device: torch.device, server_address: str = None):
+        self.model = model.to(device)
+        self.model_name = model_name
+        self.device = device
+        self.server_address = server_address
     
-    Returns:
-        float: For DataLoader - validation accuracy (0-1)
-              For single tensor - 1.0 if forward pass succeeds, 0.0 if it fails
-    """
-    edge_model.eval()
-    cloud_model.eval()
+    def find_optimal_split(self, bandwidth_mbps: float) -> SplitConfig:
+        """Find optimal split point using DNNSurgeon"""
+        sample_input = torch.randn(1, 3, 224, 224).to(self.device)
+        surgeon = DNNSurgeon(self.model, self.model_name, str(self.device), self.server_address)
+        
+        layer_metrics = surgeon.profile_entire_network(sample_input)
+        network_conditions = create_network_conditions([bandwidth_mbps])
+        optimal_splits = surgeon.find_optimal_split(layer_metrics, network_conditions)
+        
+        config = optimal_splits[bandwidth_mbps]
+        model_id = f"{self.model_name}_split_{config.split_layer}"
+        
+        return SplitConfig(
+            split_point=config.split_layer,
+            model_id=model_id,
+            total_latency=config.total_latency,
+            client_execution_time=config.client_execution_time,
+            server_execution_time=config.server_execution_time,
+            transfer_latency=config.transfer_latency
+        )
     
-    def debug_model(model: nn.Module, prefix: str):
-        """Helper to print model debug info"""
-        logger.info(f"{prefix} Model Structure:")
-        logger.info(str(model))
-        logger.info(f"{prefix} Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
-        logger.info(f"{prefix} Trainable Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    def create_split_models(self, split_point: int) -> Tuple[nn.Module, nn.Module]:
+        """Create edge and cloud models"""
+        layers = self.model.gen_network()
+        edge_model = SplitModel(layers, 0, split_point).cpu().eval()
+        cloud_model = SplitModel(layers, split_point, len(layers)).to(self.device).eval()
+        return edge_model, cloud_model
+
+
+class ConfigManager:
+    """Manages configuration files for distributed setup"""
     
-    with torch.no_grad():
-        if isinstance(data, torch.Tensor):
-            try:
-                # Log model structures for debugging
-                debug_model(edge_model, "Edge")
-                debug_model(cloud_model, "Cloud")
-                
-                # Run edge model with shape logging
-                logger.info(f"Input tensor shape: {data.shape}")
-                edge_output = edge_model(data)
-                logger.info(f"Edge output shape: {edge_output.shape}")
-                
-                # Run cloud model
-                cloud_output = cloud_model(edge_output)
-                logger.info(f"Cloud output shape: {cloud_output.shape}")
-                
-                # Basic sanity checks
-                if not isinstance(cloud_output, torch.Tensor):
-                    logger.error(f"Cloud output is not a tensor: {type(cloud_output)}")
-                    return 0.0
-                    
-                return 1.0  # Success
-            except Exception as e:
-                logger.error(f"Error during single tensor validation: {str(e)}")
-                return 0.0  # Failure
-        else:
-            # DataLoader validation
-            correct = 0
-            total = 0
+    @staticmethod
+    def save_config(model_name: str, split_config: SplitConfig, port: int) -> str:
+        """Save split configuration to file"""
+        config = {
+            'model_name': model_name,
+            'split_point': split_config.split_point,
+            'model_id': split_config.model_id,
+            'server_port': port,
+            'split_info': {
+                'total_latency': split_config.total_latency,
+                'client_execution_time': split_config.client_execution_time,
+                'server_execution_time': split_config.server_execution_time,
+                'transfer_latency': split_config.transfer_latency
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        filename = f'split_config_{model_name}.json'
+        with open(filename, 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        return filename
+    
+    @staticmethod
+    def load_config(config_file: str) -> Dict:
+        """Load split configuration from file"""
+        with open(config_file, 'r') as f:
+            return json.load(f)
+
+
+class InferenceEvaluator:
+    """Evaluates distributed inference performance"""
+    
+    @staticmethod
+    def evaluate_client(client, model_id: str, test_samples: int, model_name: str) -> Dict:
+        """Run client evaluation and return metrics"""
+        try:
+            from dataset.imagenet_loader import ImageNetMiniLoader
+            loader = ImageNetMiniLoader(batch_size=1, num_workers=2)
+            dataloader, class_mapping = loader.get_loader(train=False)
+        except ImportError:
+            logging.warning("ImageNet loader not available, using dummy data")
+            # Create dummy data for testing
+            dummy_data = [(torch.randn(1, 3, 224, 224), torch.randint(0, 1000, (1,))) for _ in range(test_samples)]
+            dataloader = dummy_data
+            class_mapping = {i: f"class_{i}" for i in range(1000)}
+        
+        correct_predictions = 0
+        inference_times = []
+        
+        for i, (input_tensor, true_label) in enumerate(dataloader):
+            if i >= test_samples:
+                break
             
-            for i, (inputs, labels) in enumerate(data):
-                if i >= num_samples:
-                    break
-                    
-                try:
-                    # Run through split model
-                    edge_output = edge_model(inputs)
-                    outputs = cloud_model(edge_output)
-                    
-                    # Calculate accuracy
-                    _, predicted = torch.max(outputs.data, 1)
-                    total += labels.size(0)
-                    correct += (predicted == labels).sum().item()
-                    
-                except Exception as e:
-                    logger.error(f"Error during validation batch {i}: {str(e)}")
-                    continue
+            try:
+                start_time = time.perf_counter()
+                output = client.process_tensor(input_tensor, model_id)
+                inference_time = (time.perf_counter() - start_time) * 1000
                 
-            if total == 0:
-                raise ValueError("No samples were successfully processed during validation")
+                _, predicted = torch.max(output, 1)
+                is_correct = predicted.item() == true_label.item()
                 
-            return correct / total
+                if is_correct:
+                    correct_predictions += 1
+                inference_times.append(inference_time)
+                
+                # Log progress
+                true_class = class_mapping.get(true_label.item(), f"Unknown_{true_label.item()}")[:15]
+                pred_class = class_mapping.get(predicted.item(), f"Unknown_{predicted.item()}")[:15]
+                status = "✓" if is_correct else "✗"
+                logging.info(f"Sample {i+1:3d}: {status} True: {true_class:<15} | "
+                           f"Pred: {pred_class:<15} | Time: {inference_time:.1f}ms")
+                
+            except Exception as e:
+                logging.error(f"Sample {i+1}: Error - {str(e)}")
+        
+        total_samples = len(inference_times)
+        accuracy = (correct_predictions / total_samples) * 100 if total_samples > 0 else 0
+        avg_time = sum(inference_times) / len(inference_times) if inference_times else 0
+        
+        return {
+            'total_samples': total_samples,
+            'correct_predictions': correct_predictions,
+            'accuracy': accuracy,
+            'avg_inference_time': avg_time,
+            'throughput': 1000 / avg_time if avg_time > 0 else 0
+        }
 
-if __name__ == '__main__':
-    try:
-        print("Initializing DNN surgery pipeline...")
+
+class DistributedDNNSurgery:
+    """Main class for distributed DNN Surgery operations"""
+    
+    def __init__(self, model_name: str = "resnet18", device: str = "auto", 
+                 use_pretrained: bool = True, num_classes: int = None, server_address: str = None):
+        self.model_name = model_name
+        self.device = self._setup_device(device)
+        self.server_address = server_address
         
-        # Load pretrained model
-        MODEL_NAME = 'resnet50'  # Can be changed to any supported model
-        DATA_PATH = './data/validation'  # Path to validation data
-        BATCH_SIZE = 32
-        BANDWIDTH_MBPS = 100  # Example: 100 Mbps connection
+        # Create model and splitter
+        model = ModelManager.create_model(model_name, use_pretrained, num_classes)
+        self.splitter = ModelSplitter(model, model_name, self.device, server_address)
         
-        # Load model and get input size
-        model, input_size = load_pretrained_model(MODEL_NAME, pretrained=True)
-        logger.info(f"Loaded {MODEL_NAME} with input size {input_size}")
+        logging.info(f"Initialized {model_name} on {self.device}")
+        if server_address:
+            logging.info(f"Network timing will use server: {server_address}")
+    
+    def _setup_device(self, device: str) -> torch.device:
+        """Setup compute device"""
+        if device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(device)
+    
+    def run_server(self, port: int = 50051, bandwidth_mbps: float = 10.0):
+        """Run GPU server with optimal split model"""
+        logging.info(f"Starting server on port {port}")
         
-        # Create data loader
-        dataloader = create_data_loader(
-            data_path=DATA_PATH,
-            input_size=input_size,
-            batch_size=BATCH_SIZE
+        # Find optimal split and create models
+        split_config = self.splitter.find_optimal_split(bandwidth_mbps)
+        edge_model, cloud_model = self.splitter.create_split_models(split_config.split_point)
+        
+        # Start server
+        server, servicer = start_server(port=port)
+        servicer.register_model(split_config.model_id, cloud_model)
+        
+        # Save configuration and edge model
+        config_file = ConfigManager.save_config(self.model_name, split_config, port)
+        torch.save(edge_model, f'edge_model_{self.model_name}_split_{split_config.split_point}.pth')
+        
+        logging.info(f"Server ready - Config: {config_file}, Model ID: {split_config.model_id}")
+        logging.info(f"Split: Layer {split_config.split_point}, Latency: {split_config.total_latency:.2f}ms")
+        
+        try:
+            server.wait_for_termination()
+        except KeyboardInterrupt:
+            logging.info("Server shutting down...")
+            server.stop(0)
+    
+    def run_client(self, server_address: str, config_file: str = None, test_samples: int = 10):
+        """Run Raspberry Pi client with edge model"""
+        logging.info(f"Starting client connecting to {server_address}")
+        
+        # Load configuration
+        config_file = config_file or f'split_config_{self.model_name}.json'
+        try:
+            config = ConfigManager.load_config(config_file)
+        except FileNotFoundError:
+            logging.error(f"Config file {config_file} not found! Run server first.")
+            return
+        
+        # Load edge model
+        edge_model_file = f"edge_model_{self.model_name}_split_{config['split_point']}.pth"
+        try:
+            edge_model = torch.load(edge_model_file, map_location='cpu')
+        except FileNotFoundError:
+            logging.error(f"Edge model {edge_model_file} not found! Run server first.")
+            return
+        
+        # Run evaluation
+        client = DNNInferenceClient(server_address, edge_model)
+        metrics = InferenceEvaluator.evaluate_client(
+            client, config['model_id'], test_samples, self.model_name
         )
         
-        # Get sample input
-        sample_input = torch.randn(1, *input_size)
+        # Print results
+        self._print_client_results(config, metrics)
+    
+    def run_analysis(self, bandwidth_range: List[float] = None, save_results: bool = True):
+        """Run standalone analysis without distributed components"""
+        logging.info("Running DNN Surgery analysis...")
         
-        # Run DNN surgery pipeline
-        edge_model, cloud_model, accuracy = dnn_surgery_pipeline(
-            model=model,
-            input_data=sample_input,
-            bandwidth_mbps=BANDWIDTH_MBPS
+        # Default bandwidth range if not provided
+        if bandwidth_range is None:
+            bandwidth_range = [4, 6, 8, 10, 12, 14, 16, 18]
+        
+        # Create sample input
+        sample_input = torch.randn(1, 3, 224, 224).to(self.device)
+        
+        # Initialize surgeon and run profiling
+        surgeon = DNNSurgeon(self.splitter.model, self.model_name, str(self.device), self.server_address)
+        layer_metrics = surgeon.profile_entire_network(sample_input)
+        
+        # Create network conditions and find optimal splits
+        network_conditions = create_network_conditions(bandwidth_range)
+        optimal_splits = surgeon.find_optimal_split(layer_metrics, network_conditions)
+        
+        # Print analysis results
+        self._print_analysis_results(layer_metrics, optimal_splits, bandwidth_range)
+        
+        # Save results if requested
+        if save_results:
+            self._save_analysis_results(layer_metrics, optimal_splits)
+    
+    def _print_analysis_results(self, layer_metrics: List[LayerMetrics], 
+                              optimal_splits: Dict[float, SplitConfiguration],
+                              bandwidth_range: List[float]):
+        """Print detailed analysis results"""
+        logging.info("\n" + "="*80)
+        logging.info("DNN SURGERY ANALYSIS RESULTS")
+        logging.info("="*80)
+        logging.info(f"Model: {self.model_name}")
+        logging.info(f"Device: {self.device}")
+        logging.info(f"Total Layers: {len(layer_metrics)}")
+        logging.info("="*80)
+        
+        # Layer-wise metrics
+        logging.info("\nLAYER-WISE EXECUTION METRICS:")
+        logging.info("-" * 80)
+        logging.info(f"{'Layer':<6} {'Name':<20} {'Time(ms)':<10} {'Memory(KB)':<12} {'Transfer(KB)':<12}")
+        logging.info("-" * 80)
+        
+        for metrics in layer_metrics:
+            logging.info(f"{metrics.layer_idx:<6} {metrics.layer_name[:19]:<20} "
+                        f"{metrics.execution_time:<10.2f} {metrics.memory_usage/1024:<12.1f} "
+                        f"{metrics.data_transfer_size/1024:<12.1f}")
+        
+        # Optimal splits
+        logging.info("\nOPTIMAL SPLIT POINTS:")
+        logging.info("-" * 80)
+        logging.info(f"{'BW(Mbps)':<10} {'Split Layer':<12} {'Total(ms)':<12} {'Client(ms)':<12} {'Server(ms)':<12} {'Transfer(ms)':<12}")
+        logging.info("-" * 80)
+        
+        for bw in bandwidth_range:
+            if bw in optimal_splits:
+                split = optimal_splits[bw]
+                logging.info(f"{bw:<10.1f} {split.split_layer:<12} {split.total_latency:<12.2f} "
+                           f"{split.client_execution_time:<12.2f} {split.server_execution_time:<12.2f} "
+                           f"{split.transfer_latency:<12.2f}")
+        
+        logging.info("="*80)
+    
+    def _save_analysis_results(self, layer_metrics: List[LayerMetrics], 
+                             optimal_splits: Dict[float, SplitConfiguration]):
+        """Save analysis results to files"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save layer metrics
+        metrics_data = []
+        for metrics in layer_metrics:
+            metrics_data.append({
+                'layer_idx': metrics.layer_idx,
+                'layer_name': metrics.layer_name,
+                'execution_time': metrics.execution_time,
+                'memory_usage': metrics.memory_usage,
+                'input_size': metrics.input_size,
+                'output_size': metrics.output_size,
+                'data_transfer_size': metrics.data_transfer_size,
+                'computation_complexity': metrics.computation_complexity
+            })
+        
+        metrics_file = f"performance_logs/{self.model_name}_layer_metrics_{timestamp}.json"
+        with open(metrics_file, 'w') as f:
+            json.dump(metrics_data, f, indent=2)
+        
+        # Save optimal splits
+        splits_data = {}
+        for bw, split in optimal_splits.items():
+            splits_data[str(bw)] = {
+                'split_layer': split.split_layer,
+                'total_latency': split.total_latency,
+                'client_execution_time': split.client_execution_time,
+                'server_execution_time': split.server_execution_time,
+                'transfer_latency': split.transfer_latency,
+                'network_bandwidth': split.network_bandwidth
+            }
+        
+        splits_file = f"performance_logs/{self.model_name}_optimal_splits_{timestamp}.json"
+        with open(splits_file, 'w') as f:
+            json.dump(splits_data, f, indent=2)
+        
+        # Generate summary report
+        report_file = f"performance_logs/{self.model_name}_report_{timestamp}.txt"
+        with open(report_file, 'w') as f:
+            f.write(f"DNN Surgery Analysis Report\n")
+            f.write(f"Model: {self.model_name}\n")
+            f.write(f"Device: {self.device}\n")
+            f.write(f"Timestamp: {timestamp}\n")
+            f.write(f"Total Layers: {len(layer_metrics)}\n\n")
+            
+            f.write("Optimal Split Points:\n")
+            for bw, split in optimal_splits.items():
+                f.write(f"  {bw} Mbps -> Layer {split.split_layer} "
+                       f"(Total: {split.total_latency:.2f}ms)\n")
+        
+        logging.info(f"Results saved:")
+        logging.info(f"  Metrics: {metrics_file}")
+        logging.info(f"  Splits: {splits_file}")
+        logging.info(f"  Report: {report_file}")
+    
+    def _print_client_results(self, config: Dict, metrics: Dict):
+        """Print client evaluation results"""
+        logging.info("\n" + "="*60)
+        logging.info("DISTRIBUTED INFERENCE RESULTS")
+        logging.info("="*60)
+        logging.info(f"Model: {self.model_name}, Split: Layer {config['split_point']}")
+        logging.info(f"Samples: {metrics['total_samples']}, Correct: {metrics['correct_predictions']}")
+        logging.info(f"Accuracy: {metrics['accuracy']:.2f}%")
+        logging.info(f"Avg time: {metrics['avg_inference_time']:.2f}ms")
+        logging.info(f"Throughput: {metrics['throughput']:.2f} samples/sec")
+        logging.info("="*60)
+
+
+def main():
+   
+    # Set up logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    available_models = ['resnet18', 'alexnet', 'cnn']
+    
+    parser = argparse.ArgumentParser(description='DNN Surgery System')
+    parser.add_argument('--mode', choices=['analyze', 'server', 'client'], default='analyze',
+                       help='Run mode: analyze (standalone), server (GPU), or client (RPi)')
+    parser.add_argument('--model', choices=available_models, default='resnet18',
+                       help=f'Model to use. Available: {", ".join(available_models)}')
+    parser.add_argument('--port', type=int, default=50051, help='Server port (server mode)')
+    parser.add_argument('--server-address', default='localhost:50051', help='Server address (client mode)')
+    parser.add_argument('--bandwidth', type=float, default=10.0, help='Network bandwidth in Mbps')
+    parser.add_argument('--bandwidth-range', nargs='+', type=float,
+                       help='Bandwidth range for analysis (e.g., --bandwidth-range 4 8 12 16)')
+    parser.add_argument('--device', default='auto', help='Device (auto, cpu, cuda)')
+    parser.add_argument('--test-samples', type=int, default=10, help='Test samples (client mode)')
+    parser.add_argument('--config-file', help='Configuration file path (client mode)')
+    parser.add_argument('--use-pretrained', action='store_true', default=True,
+                       help='Use pretrained weights')
+    parser.add_argument('--no-pretrained', dest='use_pretrained', action='store_false',
+                       help='Use custom model without pretrained weights')
+    parser.add_argument('--num-classes', type=int, help='Number of classes')
+    parser.add_argument('--save-results', action='store_true', default=True,
+                       help='Save analysis results to files')
+    parser.add_argument('--no-save-results', dest='save_results', action='store_false',
+                       help='Do not save analysis results')
+    
+    args = parser.parse_args()
+    
+    # Log configuration
+    logging.info("="*80)
+    logging.info("COMPREHENSIVE DNN SURGERY SYSTEM")
+    logging.info("="*80)
+    logging.info(f"Mode: {args.mode}")
+    logging.info(f"Model: {args.model}")
+    logging.info(f"Device: {args.device}")
+    logging.info(f"Pretrained: {args.use_pretrained}")
+    if args.mode == 'analyze':
+        bandwidth_range = args.bandwidth_range or [4, 6, 8, 10, 12, 14, 16, 18]
+        logging.info(f"Bandwidth range: {bandwidth_range}")
+        if args.server_address != 'localhost:50051':
+            logging.info(f"Network timing server: {args.server_address}")
+    logging.info("="*80)
+    
+    # Initialize system
+    server_addr = args.server_address if args.mode == 'analyze' and args.server_address != 'localhost:50051' else None
+    dnn_surgery = DistributedDNNSurgery(
+        model_name=args.model,
+        device=args.device,
+        use_pretrained=args.use_pretrained,
+        num_classes=args.num_classes,
+        server_address=server_addr
+    )
+    
+    # Run appropriate mode
+    if args.mode == 'analyze':
+        dnn_surgery.run_analysis(
+            bandwidth_range=args.bandwidth_range,
+            save_results=args.save_results
         )
-        
-        # Validate the split model
-        validation_accuracy = validate_split_model(
-            edge_model=edge_model,
-            cloud_model=cloud_model,
-            dataloader=dataloader
+    elif args.mode == 'server':
+        dnn_surgery.run_server(port=args.port, bandwidth_mbps=args.bandwidth)
+    else:  # client
+        dnn_surgery.run_client(
+            server_address=args.server_address,
+            config_file=args.config_file,
+            test_samples=args.test_samples
         )
-        
-        print(f"\nResults:")
-        print(f"Split model validation accuracy: {validation_accuracy:.2%}")
-        print(f"Edge model parameters: {sum(p.numel() for p in edge_model.parameters()):,}")
-        print(f"Cloud model parameters: {sum(p.numel() for p in cloud_model.parameters()):,}")
-        
-        # Additional model statistics
-        edge_size = sum(p.element_size() * p.nelement() for p in edge_model.parameters()) / (1024 * 1024)  # MB
-        cloud_size = sum(p.element_size() * p.nelement() for p in cloud_model.parameters()) / (1024 * 1024)  # MB
-        print(f"Edge model size: {edge_size:.2f} MB")
-        print(f"Cloud model size: {cloud_size:.2f} MB")
-        
-    except Exception as e:
-        logger.error(f"Error in main: {str(e)}", exc_info=True)
-        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
