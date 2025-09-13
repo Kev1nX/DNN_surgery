@@ -4,9 +4,11 @@ from concurrent import futures
 import torch
 import torch.nn as nn
 import io
+import time
 from typing import Dict, Optional
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
+from dnn_surgery import DNNSurgery, LayerProfiler
 
 # Configure logging
 logging.basicConfig(
@@ -24,6 +26,8 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
     def __init__(self):
         self.models: Dict[str, torch.nn.Module] = {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.profiler = LayerProfiler()
+        self.client_profiles: Dict[str, dnn_inference_pb2.ClientProfile] = {}
         logging.info(f"Initializing DNNInferenceServicer with device: {self.device}")
         
     def register_model(self, model_id: str, model: torch.nn.Module) -> None:
@@ -107,7 +111,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
         
     def ProcessTensor(self, request: dnn_inference_pb2.InferenceRequest, 
                      context: grpc.ServicerContext) -> dnn_inference_pb2.InferenceResponse:
-        """Process a tensor using the specified model
+        """Process a tensor using the specified model with timing
         
         Args:
             request: Inference request containing tensor and model ID
@@ -137,20 +141,13 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             logging.info(f"Input tensor shape: {input_tensor.shape}")
             logging.info(f"Input tensor stats - Min: {input_tensor.min().item():.3f}, Max: {input_tensor.max().item():.3f}, Mean: {input_tensor.mean().item():.3f}")
             
-            # Run inference
+            # Run inference with timing
+            start_time = time.perf_counter()
             with torch.no_grad():
                 try:
                     logging.info(f"Cloud model structure:\n{model}")
                     output_tensor = model(input_tensor)
-                    logging.info(f"Output tensor shape: {output_tensor.shape}")
-                    logging.info(f"Output tensor stats - Min: {output_tensor.min().item():.3f}, Max: {output_tensor.max().item():.3f}, Mean: {output_tensor.mean().item():.3f}")
                     
-                    # For classification outputs
-                    if output_tensor.dim() == 2:
-                        probs = torch.softmax(output_tensor, dim=1)
-                        max_prob, pred = probs.max(1)
-                        logging.info(f"Prediction confidence: {max_prob.item():.3f}, Predicted class: {pred.item()}")
-                        
                 except Exception as e:
                     error_msg = f"Model inference failed: {str(e)}"
                     logging.error(error_msg)
@@ -160,6 +157,19 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                         success=False,
                         error_message=error_msg
                     )
+            
+            end_time = time.perf_counter()
+            execution_time = (end_time - start_time) * 1000  # ms
+            
+            logging.info(f"Cloud execution time: {execution_time:.2f}ms")
+            logging.info(f"Output tensor shape: {output_tensor.shape}")
+            logging.info(f"Output tensor stats - Min: {output_tensor.min().item():.3f}, Max: {output_tensor.max().item():.3f}, Mean: {output_tensor.mean().item():.3f}")
+            
+            # For classification outputs
+            if output_tensor.dim() == 2:
+                probs = torch.softmax(output_tensor, dim=1)
+                max_prob, pred = probs.max(1)
+                logging.info(f"Prediction confidence: {max_prob.item():.3f}, Predicted class: {pred.item()}")
                 
             # Convert result back to proto
             response_tensor = self.tensor_to_proto(output_tensor)
@@ -177,6 +187,50 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             return dnn_inference_pb2.InferenceResponse(
                 success=False,
                 error_message=error_msg
+            )
+    
+    def SendProfilingData(self, request: dnn_inference_pb2.ProfilingRequest,
+                         context: grpc.ServicerContext) -> dnn_inference_pb2.ProfilingResponse:
+        """Receive and store profiling data from client
+        
+        Args:
+            request: Profiling request containing client profile data
+            context: gRPC context
+            
+        Returns:
+            Profiling response with success status
+        """
+        try:
+            client_id = request.client_id
+            profile = request.profile
+            
+            # Store the profile
+            self.client_profiles[client_id] = profile
+            
+            logging.info(f"Received profiling data from client: {client_id}")
+            logging.info(f"Model: {profile.model_name}, Total layers: {profile.total_layers}")
+            
+            # Log layer details
+            for layer_metric in profile.layer_metrics:
+                logging.info(f"Layer {layer_metric.layer_idx} ({layer_metric.layer_name}): "
+                           f"{layer_metric.execution_time:.2f}ms, "
+                           f"Transfer size: {layer_metric.data_transfer_size} bytes")
+            
+            return dnn_inference_pb2.ProfilingResponse(
+                success=True,
+                message=f"Profiling data received for client {client_id}",
+                updated_split_config=""  # Not implemented in minimal version
+            )
+            
+        except Exception as e:
+            error_msg = f"Error processing profiling data: {str(e)}"
+            logging.error(error_msg)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(error_msg)
+            return dnn_inference_pb2.ProfilingResponse(
+                success=False,
+                message=error_msg,
+                updated_split_config=""
             )
             
 def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInferenceServicer]:
