@@ -191,24 +191,25 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
     
     def SendProfilingData(self, request: dnn_inference_pb2.ProfilingRequest,
                          context: grpc.ServicerContext) -> dnn_inference_pb2.ProfilingResponse:
-        """Receive and store profiling data from client
+        """Receive profiling data and determine optimal split point
         
         Args:
             request: Profiling request containing client profile data
             context: gRPC context
             
         Returns:
-            Profiling response with success status
+            Profiling response with optimal split configuration
         """
         try:
             client_id = request.client_id
             profile = request.profile
+            model_name = profile.model_name
             
             # Store the profile
             self.client_profiles[client_id] = profile
             
             logging.info(f"Received profiling data from client: {client_id}")
-            logging.info(f"Model: {profile.model_name}, Total layers: {profile.total_layers}")
+            logging.info(f"Model: {model_name}, Total layers: {profile.total_layers}")
             
             # Log layer details
             for layer_metric in profile.layer_metrics:
@@ -216,10 +217,25 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                            f"{layer_metric.execution_time:.2f}ms, "
                            f"Transfer size: {layer_metric.data_transfer_size} bytes")
             
+            # Find optimal split point using NeuroSurgeon approach
+            optimal_split = self._find_optimal_split_from_profile(profile)
+            
+            # Create cloud model for this client
+            client_model_key = f"{client_id}_{model_name}"
+            if model_name in self.dnn_surgery_instances:
+                cloud_model = self.create_cloud_model(model_name, optimal_split)
+                if cloud_model is not None:
+                    self.cloud_models[client_model_key] = cloud_model
+                    self.client_split_points[client_model_key] = optimal_split
+                    
+                    logging.info(f"Created cloud model for client {client_id} with optimal split point: {optimal_split}")
+                else:
+                    logging.warning(f"Failed to create cloud model for split point {optimal_split}")
+            
             return dnn_inference_pb2.ProfilingResponse(
                 success=True,
-                message=f"Profiling data received for client {client_id}",
-                updated_split_config=""  # Not implemented in minimal version
+                message=f"Profiling data processed. Optimal split point: {optimal_split}",
+                updated_split_config=f"split_point:{optimal_split}"
             )
             
         except Exception as e:
@@ -232,6 +248,48 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 message=error_msg,
                 updated_split_config=""
             )
+    
+    def _find_optimal_split_from_profile(self, profile: dnn_inference_pb2.ClientProfile) -> int:
+        """Find optimal split point from client profiling data using simplified NeuroSurgeon approach
+        
+        Args:
+            profile: Client profile with layer metrics
+            
+        Returns:
+            Optimal split point
+        """
+        # For server-side optimization, we use a simplified approach since we don't have
+        # the actual network measurements here. The client should ideally send this.
+        # We'll optimize based on computation time distribution.
+        
+        layer_times = [layer.execution_time for layer in profile.layer_metrics]
+        total_time = sum(layer_times)
+        
+        if total_time == 0:
+            return 0
+        
+        # Find the split point that balances computation
+        # This is a simplified heuristic - ideally the client would send network metrics too
+        min_imbalance = float('inf')
+        optimal_split = 0
+        
+        for split_point in range(len(layer_times) + 1):
+            client_time = sum(layer_times[:split_point])
+            server_time = sum(layer_times[split_point:])
+            
+            # Simple heuristic: minimize the difference between client and server times
+            # In a real implementation, this would include transfer times
+            imbalance = abs(client_time - server_time)
+            
+            if imbalance < min_imbalance:
+                min_imbalance = imbalance
+                optimal_split = split_point
+        
+        logging.info(f"Server-side optimal split calculation: split_point={optimal_split}, "
+                   f"client_time={sum(layer_times[:optimal_split]):.2f}ms, "
+                   f"server_time={sum(layer_times[optimal_split:]):.2f}ms")
+        
+        return optimal_split
             
 def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInferenceServicer]:
     """Start the gRPC server

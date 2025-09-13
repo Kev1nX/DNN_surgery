@@ -1,6 +1,5 @@
 import grpc
 import logging
-from concurrent import futures
 import torch
 import io
 import time
@@ -252,38 +251,53 @@ class DNNInferenceClient:
         return summary
 
 def run_distributed_inference_with_profiling(model_id: str, input_tensor: torch.Tensor, 
-                                            dnn_surgery: DNNSurgery, split_point: int = 0,
+                                            dnn_surgery: DNNSurgery, split_point: int = None,
                                             server_address: str = 'localhost:50051') -> Tuple[torch.Tensor, Dict]:
-    """Run distributed inference with profiling
+    """Run distributed inference with NeuroSurgeon optimization
     
     Args:
         model_id: Model identifier
         input_tensor: Input tensor
         dnn_surgery: DNNSurgery instance for model splitting
-        split_point: Where to split the model (0 = all cloud, max = all edge)
+        split_point: Optional manual split point (if None, will use NeuroSurgeon optimization)
         server_address: Server address
         
     Returns:
         Tuple of (result tensor, timing dictionary)
     """
-    # Set split point and get edge model
-    dnn_surgery.splitter.set_split_point(split_point)
-    edge_model = dnn_surgery.splitter.get_edge_model()
-    
-    # Create client with edge model
-    client = DNNInferenceClient(server_address, edge_model)
-    
-    # Run inference
-    result, timings = client.process_tensor(input_tensor, model_id)
-    
-    # Send profiling data
-    client.send_profiling_data(dnn_surgery, input_tensor)
-    
-    # Get timing summary
-    timing_summary = client.get_timing_summary()
-    timings.update(timing_summary)
-    
-    return result, timings
+    try:
+        # Use NeuroSurgeon approach if no manual split point provided
+        if split_point is None:
+            optimal_split, analysis = dnn_surgery.find_optimal_split_neurosurgeon(input_tensor, server_address)
+            split_point = optimal_split
+            logging.info(f"NeuroSurgeon optimal split point: {split_point}")
+            logging.info(f"Predicted total time: {analysis['min_total_time']:.2f}ms")
+        
+        # Set split point and get edge model
+        dnn_surgery.splitter.set_split_point(split_point)
+        edge_model = dnn_surgery.splitter.get_edge_model()
+        
+        # Create client with edge model
+        client = DNNInferenceClient(server_address, edge_model)
+        
+        # Run inference
+        result, timings = client.process_tensor(input_tensor, model_id)
+        
+        # Send profiling data to server for future optimizations
+        client.send_profiling_data(dnn_surgery, input_tensor)
+        
+        # Get timing summary
+        timing_summary = client.get_timing_summary()
+        timings.update(timing_summary)
+        
+        # Add split point info
+        timings['split_point'] = split_point
+        
+        return result, timings
+        
+    except Exception as e:
+        logging.error(f"Distributed inference failed: {str(e)}")
+        raise
 
 def run_edge_inference(model_id: str, input_tensor: torch.Tensor, server_address: str = 'localhost:50051') -> torch.Tensor:
     """Convenience function to run inference on edge device"""
