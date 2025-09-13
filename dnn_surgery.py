@@ -125,6 +125,8 @@ class ModelSplitter:
                 return x
                 
         return CloudModel(cloud_layers)
+
+
 class DNNSurgery:
     """Main class for distributed DNN inference with optimal splitting"""
     
