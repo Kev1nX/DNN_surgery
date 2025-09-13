@@ -33,39 +33,18 @@ message LayerProfile {
     int32 layer_idx = 1;
     string layer_name = 2;
     double execution_time = 3;  // milliseconds
-    int64 memory_usage = 4;     // bytes
-    repeated int32 input_size = 5;
-    repeated int32 output_size = 6;
-    int64 data_transfer_size = 7;
-    double computation_complexity = 8;
-    double execution_time_std = 9;
-    double min_execution_time = 10;
-    double max_execution_time = 11;
+    repeated int32 input_size = 4;
+    repeated int32 output_size = 5;
+    int64 data_transfer_size = 6;
 }
 
-// System information from client
-message SystemInfo {
-    string model = 1;
-    string cpu_model = 2;
-    int32 cpu_cores = 3;
-    int32 memory_total_mb = 4;
-    string architecture = 5;
-    string os_info = 6;
-    string python_version = 7;
-    string pytorch_version = 8;
-    string timestamp = 9;
-}
 
 // Complete client profiling data
 message ClientProfile {
     string model_name = 1;
-    SystemInfo system_info = 2;
-    repeated LayerProfile layer_metrics = 3;
-    int32 num_samples = 4;
-    repeated int32 input_size = 5;
-    double total_model_time = 6;
-    double avg_layer_time = 7;
-    int32 total_layers = 8;
+    repeated LayerProfile layer_metrics = 2;
+    repeated int32 input_size = 4;
+    int32 total_layers = 5;
 }
 
 // Request to send profiling data to server
