@@ -321,12 +321,22 @@ class DNNSurgery:
             if hasattr(layer, '_get_name'):
                 layer_name = layer._get_name()
                 
+            # Before profiling, handle tensor shape transitions
+            profile_input = current_tensor
+            if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
+                # For Linear layers, flatten the input for profiling
+                profile_input = torch.flatten(current_tensor, 1)
+                
             profile = self.profiler.profile_layer(
-                layer, current_tensor, idx, layer_name
+                layer, profile_input, idx, layer_name
             )
             
-            # Execute layer to get output for next layer
+            # Execute layer with the actual input (including potential flattening logic)
             with torch.no_grad():
+                if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
+                    # Apply flattening for the actual execution too
+                    current_tensor = torch.flatten(current_tensor, 1)
+                    
                 current_tensor = layer(current_tensor)
                 
         return self.profiler.get_profiles()
