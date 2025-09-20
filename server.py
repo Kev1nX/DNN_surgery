@@ -8,7 +8,7 @@ import time
 from typing import Dict, Optional
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
-from dnn_surgery import DNNSurgery, LayerProfiler
+from dnn_surgery import DNNSurgery, LayerProfiler, ModelSplitter
 
 # Configure logging
 logging.basicConfig(
@@ -28,6 +28,12 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.profiler = LayerProfiler()
         self.client_profiles: Dict[str, dnn_inference_pb2.ClientProfile] = {}
+        
+        # Additional attributes for handling split models
+        self.dnn_surgery_instances: Dict[str, DNNSurgery] = {}
+        self.cloud_models: Dict[str, torch.nn.Module] = {}
+        self.client_split_points: Dict[str, int] = {}
+        
         logging.info(f"Initializing DNNInferenceServicer with device: {self.device}")
         
     def register_model(self, model_id: str, model: torch.nn.Module) -> None:
@@ -290,6 +296,33 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                    f"server_time={sum(layer_times[optimal_split:]):.2f}ms")
         
         return optimal_split
+
+    def create_cloud_model(self, model_name: str, split_point: int):
+        """Create cloud-side model for distributed inference
+        
+        Args:
+            model_name: Name of the model to split
+            split_point: Layer index where to split
+            
+        Returns:
+            Cloud-side model or None if creation fails
+        """
+        if model_name not in self.models:
+            logging.error(f"Model {model_name} not registered")
+            return None
+        
+        try:
+            # Create a DNN Surgery instance for this model and split point
+            original_model = self.models[model_name]
+            splitter = ModelSplitter(original_model)
+            edge_model, cloud_model = splitter.split_model(split_point)
+            
+            logging.info(f"Created cloud model for {model_name} at split point {split_point}")
+            return cloud_model
+            
+        except Exception as e:
+            logging.error(f"Failed to create cloud model: {str(e)}")
+            return None
             
 def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInferenceServicer]:
     """Start the gRPC server

@@ -17,10 +17,8 @@ import logging
 import signal
 import sys
 import torch
+import torchvision.models as models
 from server import serve
-from networks.resnet18 import resnet18
-from networks.alexnet import alexnet  
-from networks.cnn import CNN
 
 # Configure logging
 logging.basicConfig(
@@ -46,7 +44,7 @@ def main():
     parser.add_argument('--max-workers', type=int, default=10,
                        help='Maximum number of worker threads (default: 10)')
     parser.add_argument('--models', nargs='+', 
-                       choices=['resnet18', 'alexnet', 'cnn', 'all'],
+                       choices=['resnet18', 'alexnet', 'all'],
                        default=['all'],
                        help='Models to register (default: all)')
     
@@ -66,7 +64,7 @@ def main():
         models_to_register = []
         
         if 'all' in args.models:
-            models_to_register = ['resnet18', 'alexnet', 'cnn']
+            models_to_register = ['resnet18', 'alexnet']
         else:
             models_to_register = args.models
             
@@ -75,19 +73,16 @@ def main():
         for model_name in models_to_register:
             try:
                 if model_name == 'resnet18':
-                    model = resnet18
+                    model = models.resnet18(pretrained=True)
+                    model.eval()
                     servicer.register_model('resnet18', model)
-                    logger.info("ResNet18 registered successfully")
+                    logger.info("ResNet18 (pretrained) registered successfully")
                     
                 elif model_name == 'alexnet':
-                    model = alexnet
+                    model = models.alexnet(pretrained=True)
+                    model.eval()
                     servicer.register_model('alexnet', model)
-                    logger.info("AlexNet registered successfully")
-                    
-                elif model_name == 'cnn':
-                    model = CNN(num_classes=1000)
-                    servicer.register_model('cnn', model)
-                    logger.info("CNN registered successfully")
+                    logger.info("AlexNet (pretrained) registered successfully")
                     
             except Exception as e:
                 logger.error(f"Failed to register {model_name}: {str(e)}")

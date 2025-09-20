@@ -100,12 +100,13 @@ class DNNInferenceClient:
             logging.error(f"Failed to convert proto back to tensor: {str(e)}")
             raise
         
-    def process_tensor(self, tensor: torch.Tensor, model_id: str) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def process_tensor(self, tensor: torch.Tensor, model_id: str, requires_cloud_processing: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Process tensor using edge model if available, then send to server for further processing
         
         Args:
             tensor: Input tensor to process
             model_id: Model identifier
+            requires_cloud_processing: Whether cloud processing is needed (False for all-edge inference)
             
         Returns:
             Tuple of (result tensor, timing dictionary)
@@ -139,6 +140,22 @@ class DNNInferenceClient:
                     logging.error("Edge model output contains NaN values!")
                 if torch.isinf(tensor).any():
                     logging.error("Edge model output contains Inf values!")
+            
+            # Check if cloud processing is required
+            if not requires_cloud_processing:
+                # All inference is done on client side - return edge model result
+                logging.info("All inference completed on client side - no server communication needed")
+                result = tensor
+                
+                # Log output tensor stats
+                logging.info(f"Output tensor stats - Shape: {result.shape}")
+                if result.dim() == 2:  # For classification outputs
+                    probs = torch.softmax(result, dim=1)
+                    max_prob, pred = probs.max(1)
+                    logging.info(f"Prediction confidence: {max_prob.item():.3f}, Predicted class: {pred.item()}")
+                    
+                logging.info(f"Successfully processed tensor with model {model_id} (client-only)")
+                return result, timings
             
             # Measure cloud processing with transfer time
             request = dnn_inference_pb2.InferenceRequest(
@@ -277,14 +294,22 @@ def run_distributed_inference_with_profiling(model_id: str, input_tensor: torch.
         dnn_surgery.splitter.set_split_point(split_point)
         edge_model = dnn_surgery.splitter.get_edge_model()
         
+        # Check if cloud processing is needed
+        cloud_model = dnn_surgery.splitter.get_cloud_model()
+        requires_cloud_processing = cloud_model is not None
+        
+        if not requires_cloud_processing:
+            logging.info(f"Split point {split_point} means all inference on client side - no server communication needed")
+        
         # Create client with edge model
         client = DNNInferenceClient(server_address, edge_model)
         
         # Run inference
-        result, timings = client.process_tensor(input_tensor, model_id)
+        result, timings = client.process_tensor(input_tensor, model_id, requires_cloud_processing)
         
-        # Send profiling data to server for future optimizations
-        client.send_profiling_data(dnn_surgery, input_tensor)
+        # Send profiling data to server for future optimizations (only if server communication is available)
+        if requires_cloud_processing:
+            client.send_profiling_data(dnn_surgery, input_tensor)
         
         # Get timing summary
         timing_summary = client.get_timing_summary()

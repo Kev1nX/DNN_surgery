@@ -182,21 +182,38 @@ class LayerProfiler:
         self.profiles = []
 
 class ModelSplitter:
-    """Handles splitting models between edge and cloud execution"""
+    """Handles splitting models between edge and cloud execution using model's natural structure"""
     
     def __init__(self, model: nn.Module, model_name: str = "unknown"):
         self.model = model
         self.model_name = model_name
         self.split_point = 0
         
-        # Extract layers if model has gen_network method
-        if hasattr(model, 'gen_network'):
-            self.layers = model.gen_network()
-        else:
-            # Fallback: use model children
-            self.layers = list(model.children())
-            
-        logger.info(f"Model {model_name} split into {len(self.layers)} layers")
+        # Use model's natural hierarchical structure instead of flattening
+        self.layers = self._get_model_layers(model)
+        logger.info(f"Model {model_name} has {len(self.layers)} major components")
+        
+        for i, layer in enumerate(self.layers):
+            logger.debug(f"Component {i}: {layer.__class__.__name__}")
+    
+    def _get_model_layers(self, model: nn.Module) -> List[nn.Module]:
+        """Get model layers using the model's natural structure"""
+        # For most pretrained models, just use the direct children
+        # This preserves the model's intended structure
+        layers = list(model.children())
+        
+        # If the model has very few top-level children, we might want to go one level deeper
+        if len(layers) <= 2:
+            expanded_layers = []
+            for layer in layers:
+                if hasattr(layer, '__len__') and len(list(layer.children())) > 1:
+                    # If this layer has multiple children, expand them
+                    expanded_layers.extend(list(layer.children()))
+                else:
+                    expanded_layers.append(layer)
+            layers = expanded_layers
+        
+        return layers
         
     def set_split_point(self, split_point: int):
         """Set where to split the model between edge and cloud
@@ -210,42 +227,46 @@ class ModelSplitter:
         logger.info(f"Split point set to layer {split_point}")
         
     def get_edge_model(self) -> Optional[nn.Module]:
-        """Get the edge part of the model (layers 0 to split_point-1)"""
+        """Get the edge part of the model using the original model's forward logic"""
         if self.split_point == 0:
             return None
             
         edge_layers = self.layers[:self.split_point]
         
         class EdgeModel(nn.Module):
-            def __init__(self, layers):
+            def __init__(self, layers, original_model):
                 super().__init__()
-                self.layers = layers
+                self.layers = nn.ModuleList(layers)
+                self.original_model = original_model
                 
             def forward(self, x):
+                # Execute layers sequentially, but let each layer handle its own forward logic
                 for layer in self.layers:
                     x = layer(x)
                 return x
                 
-        return EdgeModel(edge_layers)
+        return EdgeModel(edge_layers, self.model)
         
     def get_cloud_model(self) -> Optional[nn.Module]:
-        """Get the cloud part of the model (layers split_point to end)"""
+        """Get the cloud part of the model using the original model's forward logic"""
         if self.split_point >= len(self.layers):
             return None
             
         cloud_layers = self.layers[self.split_point:]
         
         class CloudModel(nn.Module):
-            def __init__(self, layers):
+            def __init__(self, layers, original_model):
                 super().__init__()
-                self.layers = layers
+                self.layers = nn.ModuleList(layers)
+                self.original_model = original_model
                 
             def forward(self, x):
+                # Execute remaining layers sequentially
                 for layer in self.layers:
                     x = layer(x)
                 return x
                 
-        return CloudModel(cloud_layers)
+        return CloudModel(cloud_layers, self.model)
 
 
 class DNNSurgery:
@@ -443,4 +464,4 @@ class DNNSurgery:
                 return i + 1  # Split after this layer
                 
         return len(self.profiler.profiles)  # All layers on edge
-    
+

@@ -11,9 +11,7 @@ import random
 
 from dnn_inference_client import DNNInferenceClient, run_distributed_inference_with_profiling
 from dnn_surgery import DNNSurgery
-from networks.resnet18 import resnet18
-from networks.alexnet import alexnet
-from networks.cnn import CNN
+import torchvision.models as models
 from dataset.imagenet_loader import ImageNetMiniLoader
 
 # Configure logging
@@ -62,14 +60,13 @@ def get_input_tensor(model_name: str, batch_size: int = 1) -> Tuple[torch.Tensor
         Tuple of (input_tensor, labels, class_names)
         
     Raises:
-        RuntimeError: If CNN model is used (not compatible with ImageNet) or dataset fails to load
+        RuntimeError: If unsupported model is used or dataset fails to load
     """
     global _dataset_iterator, _class_mapping
     
-    # CNN model is not compatible with ImageNet images (different input size)
-    if model_name == 'cnn':
-        raise RuntimeError("CNN model requires CIFAR-10 sized inputs (32x32) but ImageNet mini has 224x224 images. "
-                          "Please use 'resnet18' or 'alexnet' models for ImageNet mini dataset.")
+    # Only support pretrained ImageNet models
+    if model_name not in ['resnet18', 'alexnet']:
+        raise RuntimeError(f"Model '{model_name}' is not supported. Please use 'resnet18' or 'alexnet'.")
     
     # Initialize dataset loader if not already done
     if _dataset_loader is None:
@@ -128,13 +125,15 @@ def create_sample_input(model_name: str, batch_size: int = 1) -> torch.Tensor:
 def get_model(model_name: str):
     """Get model instance by name"""
     if model_name == 'resnet18':
-        return resnet18
+        model = models.resnet18(pretrained=True)
+        model.eval()
+        return model
     elif model_name == 'alexnet':
-        return alexnet
-    elif model_name == 'cnn':
-        return CNN(num_classes=1000)
+        model = models.alexnet(pretrained=True)
+        model.eval()
+        return model
     else:
-        raise ValueError(f"Unknown model: {model_name}")
+        raise ValueError(f"Unknown model: {model_name}. Only 'resnet18' and 'alexnet' are supported.")
 
 def test_connection(server_address: str) -> bool:
     """Test if server is reachable"""
@@ -201,10 +200,9 @@ def run_batch_processing(server_address: str, model_name: str, split_point: int 
                         batch_size: int = 1, num_batches: int = 1) -> List[Dict]:
     """Run multiple batches and collect timing statistics"""
     
-    # Ensure model supports ImageNet
-    if model_name == 'cnn':
-        raise RuntimeError("CNN model requires CIFAR-10 sized inputs (32x32) but only ImageNet mini is supported. "
-                          "Please use 'resnet18' or 'alexnet' models.")
+    # Ensure model is supported
+    if model_name not in ['resnet18', 'alexnet']:
+        raise RuntimeError(f"Model '{model_name}' is not supported. Please use 'resnet18' or 'alexnet'.")
     
     # Initialize dataset
     initialize_dataset_loader(batch_size)
@@ -284,10 +282,9 @@ def test_split_points(server_address: str, model_name: str, split_points: List[i
                      num_tests: int = 3) -> Dict[int, Dict]:
     """Test different split points and return performance comparison"""
     
-    # Ensure model supports ImageNet
-    if model_name == 'cnn':
-        raise RuntimeError("CNN model requires CIFAR-10 sized inputs (32x32) but only ImageNet mini is supported. "
-                          "Please use 'resnet18' or 'alexnet' models.")
+    # Ensure model is supported
+    if model_name not in ['resnet18', 'alexnet']:
+        raise RuntimeError(f"Model '{model_name}' is not supported. Please use 'resnet18' or 'alexnet'.")
     
     # Initialize dataset
     initialize_dataset_loader(1)  # Use batch size 1 for testing
@@ -428,10 +425,9 @@ def main():
         if args.model in ['resnet18', 'alexnet']:
             logger.info("Initializing ImageNet mini dataset for image inference...")
             initialize_dataset_loader(args.batch_size)
-        elif args.model == 'cnn':
-            logger.error("CNN model is not supported with ImageNet mini dataset (incompatible input sizes)")
-            logger.error("CNN requires 32x32 CIFAR-10 inputs, but ImageNet mini has 224x224 images")
-            logger.error("Please use 'resnet18' or 'alexnet' models instead")
+        else:
+            logger.error(f"Model '{args.model}' is not supported")
+            logger.error("Only 'resnet18' and 'alexnet' pretrained models are supported")
             sys.exit(1)
         
         # Test connection if requested
