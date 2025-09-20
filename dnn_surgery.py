@@ -234,10 +234,11 @@ class ModelSplitter:
         edge_layers = self.layers[:self.split_point]
         
         class EdgeModel(nn.Module):
-            def __init__(self, layers, original_model):
+            def __init__(self, layers, original_model, model_name):
                 super().__init__()
                 self.layers = nn.ModuleList(layers)
                 self.original_model = original_model
+                self.model_name = model_name
                 
             def forward(self, x):
                 # Execute layers sequentially, but let each layer handle its own forward logic
@@ -245,7 +246,7 @@ class ModelSplitter:
                     x = layer(x)
                 return x
                 
-        return EdgeModel(edge_layers, self.model)
+        return EdgeModel(edge_layers, self.model, self.model_name)
         
     def get_cloud_model(self) -> Optional[nn.Module]:
         """Get the cloud part of the model using the original model's forward logic"""
@@ -253,20 +254,40 @@ class ModelSplitter:
             return None
             
         cloud_layers = self.layers[self.split_point:]
+        split_point = self.split_point
         
         class CloudModel(nn.Module):
-            def __init__(self, layers, original_model):
+            def __init__(self, layers, original_model, model_name, split_point):
                 super().__init__()
                 self.layers = nn.ModuleList(layers)
                 self.original_model = original_model
+                self.model_name = model_name
+                self.split_point = split_point
                 
             def forward(self, x):
                 # Execute remaining layers sequentially
-                for layer in self.layers:
+                for i, layer in enumerate(self.layers):
+                    # Handle flattening for pretrained models
+                    if self._needs_flattening(layer, x):
+                        x = torch.flatten(x, 1)
                     x = layer(x)
                 return x
                 
-        return CloudModel(cloud_layers, self.model)
+            def _needs_flattening(self, layer, input_tensor):
+                """Check if we need to flatten the input before applying this layer"""
+                # Check if this is a Linear layer expecting 2D input but receiving 4D input
+                if isinstance(layer, nn.Linear) and input_tensor.dim() > 2:
+                    return True
+                    
+                # Check if this is a Sequential classifier that starts with Linear/Dropout
+                if isinstance(layer, nn.Sequential) and len(layer) > 0:
+                    first_layer = layer[0]
+                    if isinstance(first_layer, (nn.Linear, nn.Dropout)) and input_tensor.dim() > 2:
+                        return True
+                
+                return False
+                
+        return CloudModel(cloud_layers, self.model, self.model_name, split_point)
 
 
 class DNNSurgery:

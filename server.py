@@ -47,6 +47,9 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             model = model.to(self.device).eval()  # Ensure model is in eval mode
             self.models[model_id] = model
             
+            # Create DNN Surgery instance for this model
+            self.dnn_surgery_instances[model_id] = DNNSurgery(model, model_id)
+            
             # Log model details
             num_parameters = sum(p.numel() for p in model.parameters())
             requires_grad = any(p.requires_grad for p in model.parameters())
@@ -236,7 +239,10 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                     
                     logging.info(f"Created cloud model for client {client_id} with optimal split point: {optimal_split}")
                 else:
-                    logging.warning(f"Failed to create cloud model for split point {optimal_split}")
+                    logging.warning(f"Failed to create cloud model for split point {optimal_split} - may be all-edge configuration")
+            else:
+                logging.error(f"DNNSurgery instance not found for model {model_name}")
+                logging.info(f"Available models: {list(self.dnn_surgery_instances.keys())}")
             
             return dnn_inference_pb2.ProfilingResponse(
                 success=True,
@@ -314,8 +320,13 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
         try:
             # Create a DNN Surgery instance for this model and split point
             original_model = self.models[model_name]
-            splitter = ModelSplitter(original_model)
-            edge_model, cloud_model = splitter.split_model(split_point)
+            splitter = ModelSplitter(original_model, model_name)
+            splitter.set_split_point(split_point)
+            cloud_model = splitter.get_cloud_model()
+            
+            if cloud_model is None:
+                logging.warning(f"Cloud model is None for split point {split_point} - model runs entirely on edge")
+                return None
             
             logging.info(f"Created cloud model for {model_name} at split point {split_point}")
             return cloud_model
