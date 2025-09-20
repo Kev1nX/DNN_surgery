@@ -65,6 +65,8 @@ class NetworkProfiler:
             try:
                 start_time = time.perf_counter()
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # Set socket options to handle connection issues
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.settimeout(5.0)
                 sock.connect((host, port))
                 sock.close()
@@ -90,6 +92,8 @@ class NetworkProfiler:
                 
                 start_time = time.perf_counter()
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # Set socket options to handle connection issues
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.settimeout(10.0)
                 sock.connect((host, port))
                 sock.sendall(test_data)

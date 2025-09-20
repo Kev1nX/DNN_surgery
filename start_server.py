@@ -77,28 +77,28 @@ def main():
                 if model_name == 'resnet18':
                     model = resnet18
                     servicer.register_model('resnet18', model)
-                    logger.info("✓ ResNet18 registered successfully")
+                    logger.info("ResNet18 registered successfully")
                     
                 elif model_name == 'alexnet':
                     model = alexnet
                     servicer.register_model('alexnet', model)
-                    logger.info("✓ AlexNet registered successfully")
+                    logger.info("AlexNet registered successfully")
                     
                 elif model_name == 'cnn':
                     model = CNN(num_classes=1000)
                     servicer.register_model('cnn', model)
-                    logger.info("✓ CNN registered successfully")
+                    logger.info("CNN registered successfully")
                     
             except Exception as e:
                 logger.error(f"Failed to register {model_name}: {str(e)}")
                 continue
         
         logger.info("="*60)
-        logger.info(f"🚀 DNN Surgery Server started successfully!")
-        logger.info(f"📡 Listening on port: {args.port}")
-        logger.info(f"🔧 Max workers: {args.max_workers}")
-        logger.info(f"💾 Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
-        logger.info(f"📋 Available models: {models_to_register}")
+        logger.info(f"DNN Surgery Server started successfully!")
+        logger.info(f"Listening on port: {args.port}")
+        logger.info(f"Max workers: {args.max_workers}")
+        logger.info(f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+        logger.info(f"Available models: {models_to_register}")
         logger.info("="*60)
         logger.info("Server is ready to accept client connections...")
         logger.info("Press Ctrl+C to stop the server")

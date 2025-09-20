@@ -305,7 +305,7 @@ def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInf
     servicer = DNNInferenceServicer()
     dnn_inference_pb2_grpc.add_DNNInferenceServicer_to_server(servicer, server)
     
-    server_addr = f'[::]:{port}'
+    server_addr = f'0.0.0.0:{port}'
     server.add_insecure_port(server_addr)
     server.start()
     
