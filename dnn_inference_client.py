@@ -261,7 +261,7 @@ def run_distributed_inference(model_id: str, input_tensor: torch.Tensor,
     try:
         # Use NeuroSurgeon approach if no manual split point provided
         if split_point is None:
-            optimal_split, analysis = dnn_surgery.find_optimal_split_neurosurgeon(input_tensor, server_address)
+            optimal_split, analysis = dnn_surgery.find_optimal_split(input_tensor, server_address)
             split_point = optimal_split
             logging.info(f"NeuroSurgeon optimal split point: {split_point}")
             logging.info(f"Predicted total time: {analysis['min_total_time']:.2f}ms")
