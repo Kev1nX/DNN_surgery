@@ -147,8 +147,11 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             
             # Log input tensor stats
             logging.info("=== Cloud Model Processing ===")
+            logging.info(f"Model ID: {request.model_id}")
             logging.info(f"Input tensor shape: {input_tensor.shape}")
             logging.info(f"Input tensor stats - Min: {input_tensor.min().item():.3f}, Max: {input_tensor.max().item():.3f}, Mean: {input_tensor.mean().item():.3f}")
+            logging.info(f"Input tensor device: {input_tensor.device}")
+            logging.info(f"Input tensor dtype: {input_tensor.dtype}")
             
             # Run inference with timing
             start_time = time.perf_counter()
@@ -173,6 +176,8 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             logging.info(f"Cloud execution time: {execution_time:.2f}ms")
             logging.info(f"Output tensor shape: {output_tensor.shape}")
             logging.info(f"Output tensor stats - Min: {output_tensor.min().item():.3f}, Max: {output_tensor.max().item():.3f}, Mean: {output_tensor.mean().item():.3f}")
+            logging.info(f"Output tensor device: {output_tensor.device}")
+            logging.info(f"Output tensor dtype: {output_tensor.dtype}")
             
             # For classification outputs
             if output_tensor.dim() == 2:
@@ -180,8 +185,19 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 max_prob, pred = probs.max(1)
                 logging.info(f"Prediction confidence: {max_prob.item():.3f}, Predicted class: {pred.item()}")
                 
+            # Calculate output size for transfer estimation
+            output_size_bytes = output_tensor.numel() * output_tensor.element_size()
+            logging.info(f"Output tensor size for transfer: {output_size_bytes} bytes")
+                
             # Convert result back to proto
+            proto_start_time = time.perf_counter()
             response_tensor = self.tensor_to_proto(output_tensor)
+            proto_end_time = time.perf_counter()
+            proto_time = (proto_end_time - proto_start_time) * 1000
+            
+            logging.info(f"Tensor serialization time: {proto_time:.2f}ms")
+            logging.info(f"Proto message size: {len(response_tensor.data)} bytes")
+            logging.info("=== Cloud Processing Complete ===")
             
             return dnn_inference_pb2.InferenceResponse(
                 tensor=response_tensor,

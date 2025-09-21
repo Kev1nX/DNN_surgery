@@ -123,12 +123,20 @@ class NetworkProfiler:
         """
         if self.bandwidth_mbps is None or self.latency_ms is None:
             logger.warning("Network not profiled. Using conservative estimates.")
-            return (data_size_bytes * 8) / (10 * 1024 * 1024) * 1000 + 50  # 10 Mbps + 50ms latency
+            # Use more realistic estimates for local network
+            conservative_bandwidth_mbps = 100.0  # 100 Mbps
+            conservative_latency_ms = 10.0  # 10ms
+        else:
+            conservative_bandwidth_mbps = self.bandwidth_mbps
+            conservative_latency_ms = self.latency_ms
             
         # Transfer time = latency + (data_size_bits / bandwidth_bps)
         data_size_bits = data_size_bytes * 8
-        bandwidth_bps = self.bandwidth_mbps * 1024 * 1024
-        transfer_time_ms = self.latency_ms + (data_size_bits / bandwidth_bps) * 1000
+        bandwidth_bps = conservative_bandwidth_mbps * 1024 * 1024
+        transfer_time_ms = conservative_latency_ms + (data_size_bits / bandwidth_bps) * 1000
+        
+        logger.debug(f"Transfer time estimate: {data_size_bytes} bytes -> {transfer_time_ms:.2f}ms "
+                    f"(BW: {conservative_bandwidth_mbps:.1f} Mbps, Latency: {conservative_latency_ms:.1f}ms)")
         
         return transfer_time_ms
 
@@ -389,15 +397,42 @@ class DNNSurgery:
         min_total_time = float('inf')
         optimal_split = 0
         
+        logger.info("=== NeuroSurgeon Split Point Analysis ===")
+        logger.info(f"{'Split':<5} {'Client':<8} {'Server':<8} {'Transfer':<10} {'Total':<8} {'Description'}")
+        logger.info("-" * 70)
+        
         for split_point in range(len(self.splitter.layers) + 1):
             timing = self._calculate_split_timing(layer_profiles, split_point, input_tensor)
             split_analysis[split_point] = timing
+            
+            # Create description
+            if split_point == 0:
+                desc = "All cloud"
+            elif split_point >= len(self.splitter.layers):
+                desc = "All client"
+            else:
+                desc = f"Split after layer {split_point-1}"
+            
+            total_transfer = timing['input_transfer_time'] + timing['output_transfer_time']
+            
+            logger.info(f"{split_point:<5} {timing['client_time']:<8.1f} {timing['server_time']:<8.1f} "
+                       f"{total_transfer:<10.1f} {timing['total_time']:<8.1f} {desc}")
             
             if timing['total_time'] < min_total_time:
                 min_total_time = timing['total_time']
                 optimal_split = split_point
         
-        logger.info(f"Optimal split point found: {optimal_split} with total time: {min_total_time:.2f}ms")
+        logger.info("-" * 70)
+        logger.info(f"Optimal split point: {optimal_split} with total time: {min_total_time:.2f}ms")
+        
+        # Log detailed breakdown of optimal split
+        optimal_timing = split_analysis[optimal_split]
+        logger.info(f"Optimal split breakdown:")
+        logger.info(f"  Client time: {optimal_timing['client_time']:.2f}ms")
+        logger.info(f"  Server time: {optimal_timing['server_time']:.2f}ms")
+        logger.info(f"  Input transfer: {optimal_timing['input_transfer_time']:.2f}ms ({optimal_timing['input_transfer_size']} bytes)")
+        logger.info(f"  Output transfer: {optimal_timing['output_transfer_time']:.2f}ms ({optimal_timing['output_transfer_size']} bytes)")
+        logger.info("=" * 50)
         
         return optimal_split, {
             'optimal_split': optimal_split,
@@ -448,6 +483,16 @@ class DNNSurgery:
         
         # Total time = Client Execution + Input Transfer + Server Execution + Output Transfer
         total_time = client_time + input_transfer_time + server_time + output_transfer_time
+        
+        # Log detailed calculation for debugging
+        logger.debug(f"Split {split_point} timing calculation:")
+        logger.debug(f"  Client layers: 0 to {split_point-1 if split_point > 0 else 'none'}")
+        logger.debug(f"  Server layers: {split_point} to {len(layer_profiles)-1 if split_point < len(layer_profiles) else 'none'}")
+        logger.debug(f"  Client time: {client_time:.2f}ms")
+        logger.debug(f"  Server time: {server_time:.2f}ms")
+        logger.debug(f"  Input transfer: {input_transfer_size} bytes -> {input_transfer_time:.2f}ms")
+        logger.debug(f"  Output transfer: {output_transfer_size} bytes -> {output_transfer_time:.2f}ms")
+        logger.debug(f"  Total time: {total_time:.2f}ms")
         
         return {
             'split_point': split_point,
