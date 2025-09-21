@@ -439,6 +439,15 @@ class DNNSurgery:
             logger.info(f"Server recommended split point: {optimal_split} (* marked above)")
             logger.info(f"Recommended split total time: {split_analysis[optimal_split]['total_time']:.2f}ms")
             
+            # Find the actual optimal split from client analysis
+            client_optimal_split = min(split_analysis.keys(), key=lambda k: split_analysis[k]['total_time'])
+            client_min_time = split_analysis[client_optimal_split]['total_time']
+            
+            if client_optimal_split != optimal_split:
+                logger.info(f"NOTE: Client analysis suggests split {client_optimal_split} is better ({client_min_time:.2f}ms)")
+                logger.info("Using client-calculated optimal split instead of server recommendation")
+                optimal_split = client_optimal_split
+            
             return optimal_split, {
                 'optimal_split': optimal_split,
                 'min_total_time': split_analysis[optimal_split]['total_time'],

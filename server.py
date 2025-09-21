@@ -423,8 +423,9 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             # Server execution time (layers split_point to end)
             server_time = sum(server_times[split_point:])
             
-            # Simplified total time (ignoring transfer for server-side calculation)
-            total_time = max(client_time, server_time)  # Assuming parallel execution
+            # Sequential execution time (like client calculation but without actual network measurement)
+            # This is a simplified version - the client will do the full calculation with network metrics
+            total_time = client_time + server_time  # Sequential execution without transfer overhead
             
             # Create description
             if split_point == 0:
