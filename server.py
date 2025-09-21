@@ -134,8 +134,26 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             Inference response with processed tensor
         """
         try:
-            # Get the model
-            model = self.models.get(request.model_id)
+            # For inference, use the model_id to find the appropriate cloud model
+            # Since there's typically one client per model, we can use just the model_id
+            cloud_model_found = False
+            model = None
+            split_point = None
+            
+            # Look for a cloud model that matches this model_id
+            for client_model_key in self.cloud_models:
+                if client_model_key.endswith(f"_{request.model_id}"):
+                    model = self.cloud_models[client_model_key]
+                    split_point = self.client_split_points[client_model_key]
+                    cloud_model_found = True
+                    logging.info(f"Using cloud model from key {client_model_key} with split point {split_point}")
+                    break
+            
+            if not cloud_model_found:
+                # Fallback: use full model (this shouldn't happen in distributed inference)
+                model = self.models.get(request.model_id)
+                logging.warning(f"No cloud model found for {request.model_id}, using full model")
+                
             if model is None:
                 error_msg = f'Model {request.model_id} not found'
                 logging.error(error_msg)

@@ -397,29 +397,55 @@ class DNNSurgery:
             server_layer_profiles = server_data.get('server_profiles', client_layer_profiles)
             
             logger.info(f"Server recommended optimal split point: {optimal_split}")
-            logger.info("Using server's NeuroSurgeon analysis as authoritative")
+            logger.info("Performing detailed NeuroSurgeon analysis with server data...")
             
             # Still measure network metrics for timing breakdown
             network_metrics = self.network_profiler.measure_network(server_address)
             
-            # Calculate timing for the recommended split for reporting
-            timing = self._calculate_split_timing(
-                client_layer_profiles, server_layer_profiles, optimal_split, input_tensor
-            )
+            # Perform full analysis to show the complete table, even with server recommendation
+            split_analysis = {}
+            min_total_time = float('inf')
             
-            logger.info(f"Server-recommended split ({optimal_split}) timing breakdown:")
-            logger.info(f"  Client time: {timing['client_time']:.2f}ms")
-            logger.info(f"  Server time: {timing['server_time']:.2f}ms") 
-            logger.info(f"  Input transfer: {timing['input_transfer_time']:.2f}ms")
-            logger.info(f"  Output transfer: {timing['output_transfer_time']:.2f}ms")
-            logger.info(f"  Total time: {timing['total_time']:.2f}ms")
+            logger.info("=== NeuroSurgeon Split Point Analysis (with Server Data) ===")
+            logger.info(f"{'Split':<5} {'Client':<8} {'Server':<8} {'Transfer':<10} {'Total':<8} {'Description'}")
+            logger.info("-" * 70)
+            
+            for split_point in range(len(self.splitter.layers) + 1):
+                timing = self._calculate_split_timing(
+                    client_layer_profiles, server_layer_profiles, split_point, input_tensor
+                )
+                split_analysis[split_point] = timing
+                
+                # Create description
+                if split_point == 0:
+                    desc = "All cloud"
+                elif split_point >= len(self.splitter.layers):
+                    desc = "All client"
+                else:
+                    desc = f"Split after layer {split_point-1}"
+                
+                total_transfer = timing['input_transfer_time'] + timing['output_transfer_time']
+                
+                # Mark the server-recommended split with an asterisk
+                marker = " *" if split_point == optimal_split else ""
+                
+                logger.info(f"{split_point:<5} {timing['client_time']:<8.1f} {timing['server_time']:<8.1f} "
+                           f"{total_transfer:<10.1f} {timing['total_time']:<8.1f} {desc}{marker}")
+                
+                if timing['total_time'] < min_total_time:
+                    min_total_time = timing['total_time']
+            
+            logger.info("-" * 70)
+            logger.info(f"Server recommended split point: {optimal_split} (* marked above)")
+            logger.info(f"Recommended split total time: {split_analysis[optimal_split]['total_time']:.2f}ms")
             
             return optimal_split, {
                 'optimal_split': optimal_split,
-                'min_total_time': timing['total_time'],
+                'min_total_time': split_analysis[optimal_split]['total_time'],
                 'network_metrics': network_metrics,
                 'client_profiles': client_layer_profiles,
                 'server_profiles': server_layer_profiles,
+                'all_splits': split_analysis,
                 'recommended_by_server': True
             }
         else:
