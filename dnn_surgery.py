@@ -241,10 +241,27 @@ class ModelSplitter:
                 self.model_name = model_name
                 
             def forward(self, x):
-                # Execute layers sequentially, but let each layer handle its own forward logic
-                for layer in self.layers:
+                # Execute layers sequentially with proper shape handling
+                for i, layer in enumerate(self.layers):
+                    # Handle flattening before Linear layers if needed
+                    if self._needs_flattening(layer, x):
+                        x = torch.flatten(x, 1)
                     x = layer(x)
                 return x
+                
+            def _needs_flattening(self, layer, input_tensor):
+                """Check if we need to flatten the input before applying this layer"""
+                # Check if this is a Linear layer expecting 2D input but receiving >2D input
+                if isinstance(layer, nn.Linear) and input_tensor.dim() > 2:
+                    return True
+                    
+                # Check if this is a Sequential that starts with Linear/Dropout
+                if isinstance(layer, nn.Sequential) and len(layer) > 0:
+                    first_layer = layer[0]
+                    if isinstance(first_layer, (nn.Linear, nn.Dropout)) and input_tensor.dim() > 2:
+                        return True
+                
+                return False
                 
         return EdgeModel(edge_layers, self.model, self.model_name)
         
@@ -265,17 +282,19 @@ class ModelSplitter:
                 self.split_point = split_point
                 
             def forward(self, x):
-                # Execute remaining layers sequentially
+                # Execute remaining layers sequentially with proper shape handling
                 for i, layer in enumerate(self.layers):
                     # Handle flattening for pretrained models
                     if self._needs_flattening(layer, x):
+                        original_shape = x.shape
                         x = torch.flatten(x, 1)
+                        logger.debug(f"Flattened tensor from {original_shape} to {x.shape} before {layer.__class__.__name__}")
                     x = layer(x)
                 return x
                 
             def _needs_flattening(self, layer, input_tensor):
                 """Check if we need to flatten the input before applying this layer"""
-                # Check if this is a Linear layer expecting 2D input but receiving 4D input
+                # Check if this is a Linear layer expecting 2D input but receiving >2D input
                 if isinstance(layer, nn.Linear) and input_tensor.dim() > 2:
                     return True
                     
@@ -283,6 +302,12 @@ class ModelSplitter:
                 if isinstance(layer, nn.Sequential) and len(layer) > 0:
                     first_layer = layer[0]
                     if isinstance(first_layer, (nn.Linear, nn.Dropout)) and input_tensor.dim() > 2:
+                        return True
+                
+                # Check for adaptive pooling followed by flatten
+                # Some models have this pattern: AdaptiveAvgPool2d -> flatten -> Linear
+                if hasattr(layer, '__class__') and 'Linear' in str(layer.__class__):
+                    if input_tensor.dim() > 2:
                         return True
                 
                 return False
