@@ -123,20 +123,12 @@ class NetworkProfiler:
         """
         if self.bandwidth_mbps is None or self.latency_ms is None:
             logger.warning("Network not profiled. Using conservative estimates.")
-            # Use more realistic estimates for local network
-            conservative_bandwidth_mbps = 100.0  # 100 Mbps
-            conservative_latency_ms = 10.0  # 10ms
-        else:
-            conservative_bandwidth_mbps = self.bandwidth_mbps
-            conservative_latency_ms = self.latency_ms
+            return (data_size_bytes * 8) / (10 * 1024 * 1024) * 1000 + 50  # 10 Mbps + 50ms latency
             
         # Transfer time = latency + (data_size_bits / bandwidth_bps)
         data_size_bits = data_size_bytes * 8
-        bandwidth_bps = conservative_bandwidth_mbps * 1024 * 1024
-        transfer_time_ms = conservative_latency_ms + (data_size_bits / bandwidth_bps) * 1000
-        
-        logger.debug(f"Transfer time estimate: {data_size_bytes} bytes -> {transfer_time_ms:.2f}ms "
-                    f"(BW: {conservative_bandwidth_mbps:.1f} Mbps, Latency: {conservative_latency_ms:.1f}ms)")
+        bandwidth_bps = self.bandwidth_mbps * 1024 * 1024
+        transfer_time_ms = self.latency_ms + (data_size_bits / bandwidth_bps) * 1000
         
         return transfer_time_ms
 
