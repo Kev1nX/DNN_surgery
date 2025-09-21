@@ -33,30 +33,6 @@ class DNNInferenceClient:
         
         logging.info(f"Client ID: {self.client_id}")
         
-    def measure_transfer_time(self, tensor: torch.Tensor, model_id: str) -> float:
-        """Measure round-trip transfer time for a tensor
-        
-        Args:
-            tensor: Tensor to measure transfer time for
-            model_id: Model ID for the request
-            
-        Returns:
-            Transfer time in milliseconds
-        """
-        request = dnn_inference_pb2.InferenceRequest(
-            tensor=self.tensor_to_proto(tensor),
-            model_id=model_id
-        )
-        
-        start_time = time.perf_counter()
-        response = self.stub.ProcessTensor(request)
-        end_time = time.perf_counter()
-        
-        if not response.success:
-            raise RuntimeError(f"Transfer measurement failed: {response.error_message}")
-        
-        transfer_time = (end_time - start_time) * 1000  # ms
-        return transfer_time
     def tensor_to_proto(self, tensor: torch.Tensor) -> dnn_inference_pb2.Tensor:
         """Convert PyTorch tensor to protobuf message"""
         try:
@@ -267,7 +243,7 @@ class DNNInferenceClient:
             
         return summary
 
-def run_distributed_inference_with_profiling(model_id: str, input_tensor: torch.Tensor, 
+def run_distributed_inference(model_id: str, input_tensor: torch.Tensor, 
                                             dnn_surgery: DNNSurgery, split_point: int = None,
                                             server_address: str = 'localhost:50051') -> Tuple[torch.Tensor, Dict]:
     """Run distributed inference with NeuroSurgeon optimization
@@ -323,9 +299,3 @@ def run_distributed_inference_with_profiling(model_id: str, input_tensor: torch.
     except Exception as e:
         logging.error(f"Distributed inference failed: {str(e)}")
         raise
-
-def run_edge_inference(model_id: str, input_tensor: torch.Tensor, server_address: str = 'localhost:50051') -> torch.Tensor:
-    """Convenience function to run inference on edge device"""
-    client = DNNInferenceClient(server_address)
-    result, _ = client.process_tensor(input_tensor, model_id)
-    return result

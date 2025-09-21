@@ -5,10 +5,15 @@ import torch
 import torch.nn as nn
 import io
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
-from dnn_surgery import DNNSurgery, LayerProfiler, ModelSplitter
+from dnn_surgery import DNNSurgery, ModelSplitter
+
+def cuda_sync():
+    """Helper function to synchronize CUDA operations if available"""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 # Configure logging
 logging.basicConfig(
@@ -26,7 +31,6 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
     def __init__(self):
         self.models: Dict[str, torch.nn.Module] = {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.profiler = LayerProfiler()
         self.client_profiles: Dict[str, dnn_inference_pb2.ClientProfile] = {}
         
         # Additional attributes for handling split models
@@ -200,34 +204,56 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
     
     def SendProfilingData(self, request: dnn_inference_pb2.ProfilingRequest,
                          context: grpc.ServicerContext) -> dnn_inference_pb2.ProfilingResponse:
-        """Receive profiling data and determine optimal split point
+        """Receive profiling data, run server-side profiling, and return optimal split configuration
         
         Args:
             request: Profiling request containing client profile data
             context: gRPC context
             
         Returns:
-            Profiling response with optimal split configuration
+            Profiling response with optimal split configuration and server profiling data
         """
         try:
             client_id = request.client_id
-            profile = request.profile
-            model_name = profile.model_name
+            client_profile = request.profile
+            model_name = client_profile.model_name
             
-            # Store the profile
-            self.client_profiles[client_id] = profile
+            # Store the client profile
+            self.client_profiles[client_id] = client_profile
             
             logging.info(f"Received profiling data from client: {client_id}")
-            logging.info(f"Model: {model_name}, Total layers: {profile.total_layers}")
+            logging.info(f"Model: {model_name}, Total layers: {client_profile.total_layers}")
             
-            # Log layer details
-            for layer_metric in profile.layer_metrics:
-                logging.info(f"Layer {layer_metric.layer_idx} ({layer_metric.layer_name}): "
-                           f"{layer_metric.execution_time:.2f}ms, "
+            # Log client-side layer details
+            logging.info("Client-side layer profiling:")
+            for layer_metric in client_profile.layer_metrics:
+                logging.info(f"  Layer {layer_metric.layer_idx} ({layer_metric.layer_name}): "
+                           f"{layer_metric.execution_time:.2f}ms (client), "
                            f"Transfer size: {layer_metric.data_transfer_size} bytes")
             
-            # Find optimal split point using NeuroSurgeon approach
-            optimal_split = self._find_optimal_split_from_profile(profile)
+            # Run SERVER-SIDE profiling
+            logging.info("Running server-side model profiling...")
+            server_times = self._profile_server_model(model_name, client_profile)
+            
+            if server_times is None:
+                logging.error("Failed to profile model on server")
+                return dnn_inference_pb2.ProfilingResponse(
+                    success=False,
+                    message="Failed to profile model on server",
+                    updated_split_config=""
+                )
+            
+            # Compare client vs server performance
+            logging.info("=== Client vs Server Performance Comparison ===")
+            for i, (client_layer, server_time) in enumerate(zip(client_profile.layer_metrics, server_times)):
+                speedup = client_layer.execution_time / server_time if server_time > 0 else float('inf')
+                logging.info(f"Layer {i} ({client_layer.layer_name}): "
+                           f"Client={client_layer.execution_time:.2f}ms, "
+                           f"Server={server_time:.2f}ms, "
+                           f"Speedup={speedup:.2f}x")
+            
+            # Find optimal split point using both client and server timings
+            optimal_split = self._find_optimal_split_server(client_profile, server_times)
             
             # Create cloud model for this client
             client_model_key = f"{client_id}_{model_name}"
@@ -239,20 +265,25 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                     
                     logging.info(f"Created cloud model for client {client_id} with optimal split point: {optimal_split}")
                 else:
-                    logging.warning(f"Failed to create cloud model for split point {optimal_split} - may be all-edge configuration")
+                    logging.warning(f"No cloud model needed for split point {optimal_split} - all computation on edge")
             else:
                 logging.error(f"DNNSurgery instance not found for model {model_name}")
                 logging.info(f"Available models: {list(self.dnn_surgery_instances.keys())}")
             
+            # Create response with server profiling data
+            server_profile_data = self._create_server_response(server_times)
+            
             return dnn_inference_pb2.ProfilingResponse(
                 success=True,
-                message=f"Profiling data processed. Optimal split point: {optimal_split}",
-                updated_split_config=f"split_point:{optimal_split}"
+                message=f"Profiling completed. Optimal split point: {optimal_split}. Server profiling included.",
+                updated_split_config=f"split_point:{optimal_split};server_profile:{server_profile_data}"
             )
             
         except Exception as e:
             error_msg = f"Error processing profiling data: {str(e)}"
             logging.error(error_msg)
+            import traceback
+            logging.error(traceback.format_exc())
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(error_msg)
             return dnn_inference_pb2.ProfilingResponse(
@@ -261,47 +292,143 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 updated_split_config=""
             )
     
-    def _find_optimal_split_from_profile(self, profile: dnn_inference_pb2.ClientProfile) -> int:
-        """Find optimal split point from client profiling data using simplified NeuroSurgeon approach
+    def _profile_server_model(self, model_name: str, client_profile: dnn_inference_pb2.ClientProfile) -> Optional[List[float]]:
+        """Profile the model on server hardware and return execution times
         
         Args:
-            profile: Client profile with layer metrics
+            model_name: Name of the model to profile
+            client_profile: Client profile containing input size information
+            
+        Returns:
+            List of server-side execution times (in ms) for each layer, or None if failed
+        """
+        try:
+            if model_name not in self.models:
+                logging.error(f"Model {model_name} not found on server")
+                return None
+            
+            model = self.models[model_name]
+            
+            # Create dummy input tensor with same shape as client used
+            input_shape = client_profile.input_size
+            dummy_input = torch.randn(input_shape).to(self.device)
+            
+            logging.info(f"Profiling {model_name} on server (device: {self.device})")
+            logging.info(f"Input shape: {input_shape}")
+            
+            # Get model layers using the same approach as client
+            dnn_surgery = self.dnn_surgery_instances[model_name]
+            layers = dnn_surgery.splitter.layers
+            
+            server_execution_times = []
+            current_tensor = dummy_input
+            
+            # Profile each layer on server
+            for idx, layer in enumerate(layers):
+                layer_name = layer.__class__.__name__
+                
+                # Handle tensor shape transitions (same as client)
+                profile_input = current_tensor
+                if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
+                    profile_input = torch.flatten(current_tensor, 1)
+                
+                # Profile execution time on server
+                cuda_sync()
+                start_time = time.perf_counter()
+                
+                with torch.no_grad():
+                    output = layer(profile_input)
+                
+                cuda_sync()
+                end_time = time.perf_counter()
+                
+                execution_time = (end_time - start_time) * 1000  # Convert to ms
+                server_execution_times.append(execution_time)
+                
+                logging.info(f"Server Layer {idx} ({layer_name}): {execution_time:.2f}ms, "
+                           f"Output shape: {output.shape}")
+                
+                # Update current tensor for next layer (same logic as client)
+                with torch.no_grad():
+                    if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
+                        current_tensor = torch.flatten(current_tensor, 1)
+                    current_tensor = layer(current_tensor)
+            
+            logging.info(f"Server profiling completed for {model_name}")
+            return server_execution_times
+            
+        except Exception as e:
+            logging.error(f"Failed to profile model {model_name} on server: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
+            return None
+    
+    def _find_optimal_split_server(self, client_profile: dnn_inference_pb2.ClientProfile, 
+                                           server_times: List[float]) -> int:
+        """Find optimal split point using both client and server timing data
+        
+        Args:
+            client_profile: Client profile with layer metrics
+            server_times: List of server execution times
             
         Returns:
             Optimal split point
         """
-        # For server-side optimization, we use a simplified approach since we don't have
-        # the actual network measurements here. The client should ideally send this.
-        # We'll optimize based on computation time distribution.
+        client_times = [layer.execution_time for layer in client_profile.layer_metrics]
         
-        layer_times = [layer.execution_time for layer in profile.layer_metrics]
-        total_time = sum(layer_times)
+        if len(client_times) != len(server_times):
+            logging.warning(f"Client and server layer counts don't match: {len(client_times)} vs {len(server_times)}")
+            # Fall back to simple split
+            return len(client_times) // 2
         
-        if total_time == 0:
-            return 0
+        best_split = 0
+        min_total_time = float('inf')
         
-        # Find the split point that balances computation
-        # This is a simplified heuristic - ideally the client would send network metrics too
-        min_imbalance = float('inf')
-        optimal_split = 0
+        logging.info("=== Server-side Split Analysis ===")
+        logging.info(f"{'Split':<5} {'Client':<8} {'Server':<8} {'Total':<8} {'Description'}")
+        logging.info("-" * 50)
         
-        for split_point in range(len(layer_times) + 1):
-            client_time = sum(layer_times[:split_point])
-            server_time = sum(layer_times[split_point:])
+        for split_point in range(len(client_times) + 1):
+            # Client execution time (layers 0 to split_point-1)
+            client_time = sum(client_times[:split_point])
             
-            # Simple heuristic: minimize the difference between client and server times
-            # In a real implementation, this would include transfer times
-            imbalance = abs(client_time - server_time)
+            # Server execution time (layers split_point to end)
+            server_time = sum(server_times[split_point:])
             
-            if imbalance < min_imbalance:
-                min_imbalance = imbalance
-                optimal_split = split_point
+            # Simplified total time (ignoring transfer for server-side calculation)
+            total_time = max(client_time, server_time)  # Assuming parallel execution
+            
+            # Create description
+            if split_point == 0:
+                desc = "All server"
+            elif split_point >= len(client_times):
+                desc = "All client"
+            else:
+                desc = f"Split at {split_point}"
+            
+            logging.info(f"{split_point:<5} {client_time:<8.1f} {server_time:<8.1f} "
+                       f"{total_time:<8.1f} {desc}")
+            
+            if total_time < min_total_time:
+                min_total_time = total_time
+                best_split = split_point
         
-        logging.info(f"Server-side optimal split calculation: split_point={optimal_split}, "
-                   f"client_time={sum(layer_times[:optimal_split]):.2f}ms, "
-                   f"server_time={sum(layer_times[optimal_split:]):.2f}ms")
+        logging.info("-" * 50)
+        logging.info(f"Server recommends split point: {best_split}")
         
-        return optimal_split
+        return best_split
+    
+    def _create_server_response(self, server_times: List[float]) -> str:
+        """Create a compact representation of server profiling data
+        
+        Args:
+            server_times: List of server execution times
+            
+        Returns:
+            Compact string representation of server profile
+        """
+        # Create a simple comma-separated string of execution times
+        return ','.join(f"{t:.2f}" for t in server_times)
 
     def create_cloud_model(self, model_name: str, split_point: int):
         """Create cloud-side model for distributed inference

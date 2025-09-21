@@ -9,7 +9,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 import random
 
-from dnn_inference_client import DNNInferenceClient, run_distributed_inference_with_profiling
+from dnn_inference_client import DNNInferenceClient, run_distributed_inference
 from dnn_surgery import DNNSurgery
 import torchvision.models as models
 from dataset.imagenet_loader import ImageNetMiniLoader
@@ -186,7 +186,7 @@ def run_single_inference(server_address: str, model_name: str, split_point: int 
     logger.info(f"True classes: {class_names}")
     
     # Run distributed inference
-    result, timings = run_distributed_inference_with_profiling(
+    result, timings = run_distributed_inference(
         model_name, input_tensor, dnn_surgery, split_point, server_address
     )
     
@@ -237,12 +237,12 @@ def run_batch_processing(server_address: str, model_name: str, split_point: int 
             # Use NeuroSurgeon (either find optimal or reuse)
             if optimal_split_found is not None:
                 # Reuse previously found optimal split
-                result, timings = run_distributed_inference_with_profiling(
+                result, timings = run_distributed_inference(
                     model_name, input_tensor, dnn_surgery, optimal_split_found, server_address
                 )
             else:
                 # Find optimal split for first batch
-                result, timings = run_distributed_inference_with_profiling(
+                result, timings = run_distributed_inference(
                     model_name, input_tensor, dnn_surgery, None, server_address
                 )
                 optimal_split_found = timings.get('split_point', 2)

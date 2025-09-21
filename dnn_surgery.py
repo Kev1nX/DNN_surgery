@@ -6,7 +6,14 @@ import io
 import socket
 from typing import List, Dict, Tuple, Optional, Union
 from datetime import datetime
+import grpc
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
+import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
+
+def cuda_sync():
+    """Helper function to synchronize CUDA operations if available"""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,7 +26,7 @@ class NetworkProfiler:
         self.bandwidth_mbps = None
         self.latency_ms = None
         
-    def measure_network_performance(self, server_address: str, test_data_sizes: List[int] = None) -> Dict[str, float]:
+    def measure_network(self, server_address: str, test_data_sizes: List[int] = None) -> Dict[str, float]:
         """Measure network bandwidth and latency
         
         Args:
@@ -140,13 +147,13 @@ class LayerProfiler:
     def profile_layer(self, layer: nn.Module, input_tensor: torch.Tensor, 
                      layer_idx: int, layer_name: str) -> Dict:
         # Profile execution time
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        cuda_sync()
         start_time = time.perf_counter()
         
         with torch.no_grad():
             output = layer(input_tensor)
 
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        cuda_sync()
         end_time = time.perf_counter()
         
         execution_time = (end_time - start_time) * 1000  # Convert to ms
@@ -366,8 +373,8 @@ class DNNSurgery:
                 
         return self.profiler.get_profiles()
     
-    def find_optimal_split_neurosurgeon(self, input_tensor: torch.Tensor, server_address: str) -> Tuple[int, Dict]:
-        """Find optimal split point using NeuroSurgeon approach
+    def find_optimal_split(self, input_tensor: torch.Tensor, server_address: str) -> Tuple[int, Dict]:
+        """Find optimal split point using NeuroSurgeon approach with server-side profiling
         
         Args:
             input_tensor: Input tensor for profiling
@@ -378,23 +385,36 @@ class DNNSurgery:
         """
         logger.info("Finding optimal split point using NeuroSurgeon approach...")
         
-        # Step 1: Profile the model layers
-        layer_profiles = self.profile_model(input_tensor)
+        # Step 1: Profile the model layers on CLIENT
+        logger.info("Step 1: Profiling model layers on client...")
+        client_layer_profiles = self.profile_model(input_tensor)
         
-        # Step 2: Measure network performance
-        network_metrics = self.network_profiler.measure_network_performance(server_address)
+        # Step 2: Get SERVER-SIDE profiling results via gRPC
+        logger.info("Step 2: Requesting server-side profiling...")
+        server_layer_profiles = self._get_server_profile(input_tensor, server_address)
         
-        # Step 3: Calculate total time for each possible split point
+        if server_layer_profiles is None:
+            logger.warning("Failed to get server profiling. Falling back to client-only estimation.")
+            server_layer_profiles = client_layer_profiles  # Fallback
+        
+        # Step 3: Measure network performance
+        logger.info("Step 3: Measuring network performance...")
+        network_metrics = self.network_profiler.measure_network(server_address)
+        
+        # Step 4: Calculate total time for each possible split point using ACTUAL server timings
+        logger.info("Step 4: Analyzing split points with actual client and server performance...")
         split_analysis = {}
         min_total_time = float('inf')
         optimal_split = 0
         
-        logger.info("=== NeuroSurgeon Split Point Analysis ===")
+        logger.info("=== NeuroSurgeon Split Point Analysis (Client vs Server Performance) ===")
         logger.info(f"{'Split':<5} {'Client':<8} {'Server':<8} {'Transfer':<10} {'Total':<8} {'Description'}")
         logger.info("-" * 70)
         
         for split_point in range(len(self.splitter.layers) + 1):
-            timing = self._calculate_split_timing(layer_profiles, split_point, input_tensor)
+            timing = self._calculate_split_timing(
+                client_layer_profiles, server_layer_profiles, split_point, input_tensor
+            )
             split_analysis[split_point] = timing
             
             # Create description
@@ -420,8 +440,8 @@ class DNNSurgery:
         # Log detailed breakdown of optimal split
         optimal_timing = split_analysis[optimal_split]
         logger.info(f"Optimal split breakdown:")
-        logger.info(f"  Client time: {optimal_timing['client_time']:.2f}ms")
-        logger.info(f"  Server time: {optimal_timing['server_time']:.2f}ms")
+        logger.info(f"  Client time: {optimal_timing['client_time']:.2f}ms (measured on client)")
+        logger.info(f"  Server time: {optimal_timing['server_time']:.2f}ms (measured on server)")
         logger.info(f"  Input transfer: {optimal_timing['input_transfer_time']:.2f}ms ({optimal_timing['input_transfer_size']} bytes)")
         logger.info(f"  Output transfer: {optimal_timing['output_transfer_time']:.2f}ms ({optimal_timing['output_transfer_size']} bytes)")
         logger.info("=" * 50)
@@ -430,44 +450,141 @@ class DNNSurgery:
             'optimal_split': optimal_split,
             'min_total_time': min_total_time,
             'network_metrics': network_metrics,
+            'client_profiles': client_layer_profiles,
+            'server_profiles': server_layer_profiles,
             'all_splits': split_analysis
         }
     
-    def _calculate_split_timing(self, layer_profiles: List[Dict], split_point: int, input_tensor: torch.Tensor) -> Dict:
-        """Calculate timing for a specific split point using NeuroSurgeon formula
+    def _get_server_profile(self, input_tensor: torch.Tensor, server_address: str) -> Optional[List[Dict]]:
+        """Get server-side profiling results via gRPC
         
         Args:
-            layer_profiles: List of layer profiling data
+            input_tensor: Input tensor for profiling
+            server_address: Server address
+            
+        Returns:
+            List of server-side layer profiles or None if failed
+        """
+        try:
+            # Create gRPC channel
+            channel = grpc.insecure_channel(server_address)
+            stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
+            
+            # Create profiling request
+            client_profile = self.create_client_profile(input_tensor)
+            request = dnn_inference_pb2.ProfilingRequest(
+                profile=client_profile,
+                client_id="profiling_client"
+            )
+            
+            logger.info("Sending profiling request to server...")
+            response = stub.SendProfilingData(request)
+            
+            if response.success:
+                logger.info(f"Server profiling completed: {response.message}")
+                
+                # Parse server profiling data from response
+                server_profiles = self._parse_server_response(response.updated_split_config)
+                if server_profiles:
+                    logger.info("Successfully received server profiling data")
+                    return server_profiles
+                else:
+                    logger.warning("Failed to parse server profiling data")
+                    return None
+            else:
+                logger.error(f"Server profiling failed: {response.message}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Failed to get server profiling: {str(e)}")
+            return None
+    
+    def _parse_server_response(self, config_string: str) -> Optional[List[Dict]]:
+        """Parse server profiling data from the response string
+        
+        Args:
+            config_string: Configuration string from server response
+            
+        Returns:
+            List of server-side layer profiles or None if parsing failed
+        """
+        try:
+            # Parse the config string: "split_point:X;server_profile:time1,time2,time3..."
+            parts = config_string.split(';')
+            server_profile_part = None
+            
+            for part in parts:
+                if part.startswith('server_profile:'):
+                    server_profile_part = part.split(':', 1)[1]
+                    break
+            
+            if not server_profile_part:
+                logger.warning("No server profile data found in response")
+                return None
+            
+            # Parse the comma-separated execution times
+            server_times = [float(t.strip()) for t in server_profile_part.split(',')]
+            
+            # Convert to the same format as client profiles
+            server_profiles = []
+            for i, execution_time in enumerate(server_times):
+                profile = {
+                    'layer_idx': i,
+                    'layer_name': f'Layer_{i}',  # We don't have layer names from server
+                    'execution_time': execution_time,
+                    'input_size': [],  # Not needed for timing calculation
+                    'output_size': [],  # Not needed for timing calculation
+                    'data_transfer_size': 0,  # Will be filled from client profiles
+                    'computation_complexity': 0  # Not needed
+                }
+                server_profiles.append(profile)
+            
+            logger.info(f"Parsed {len(server_profiles)} server layer profiles")
+            return server_profiles
+            
+        except Exception as e:
+            logger.error(f"Failed to parse server profile response: {str(e)}")
+            return None
+    
+    def _calculate_split_timing(self, client_profiles: List[Dict], 
+                               server_profiles: List[Dict], 
+                               split_point: int, 
+                               input_tensor: torch.Tensor) -> Dict:
+        """Calculate timing for a specific split point using actual client and server profiles
+        
+        Args:
+            client_profiles: List of client-side layer profiling data
+            server_profiles: List of server-side layer profiling data
             split_point: Split point to analyze
             input_tensor: Input tensor
             
         Returns:
             Dictionary with timing breakdown
         """
-        # Client execution time (layers 0 to split_point-1)
-        client_time = sum(layer_profiles[i]['execution_time'] for i in range(min(split_point, len(layer_profiles))))
+        # Client execution time (layers 0 to split_point-1) using CLIENT measurements
+        client_time = sum(client_profiles[i]['execution_time'] for i in range(min(split_point, len(client_profiles))))
         
-        # Server execution time (layers split_point to end)
-        server_time = sum(layer_profiles[i]['execution_time'] for i in range(split_point, len(layer_profiles)))
+        # Server execution time (layers split_point to end) using SERVER measurements
+        server_time = sum(server_profiles[i]['execution_time'] for i in range(split_point, len(server_profiles)))
         
-        # Calculate data transfer sizes
+        # Calculate data transfer sizes (same as before)
         if split_point == 0:
             # All on server - transfer original input
             input_transfer_size = input_tensor.numel() * input_tensor.element_size()
-        elif split_point >= len(layer_profiles):
+        elif split_point >= len(client_profiles):
             # All on client - no intermediate transfer, but need to send final result back
             input_transfer_size = 0
         else:
-            # Transfer intermediate result
-            input_transfer_size = layer_profiles[split_point - 1]['data_transfer_size']
+            # Transfer intermediate result - use client profile since that's where data comes from
+            input_transfer_size = client_profiles[split_point - 1]['data_transfer_size']
         
-        # Output transfer size (final result back to client)
-        if split_point >= len(layer_profiles):
+        # Output transfer size (final result back to client) - use server profile for final output size
+        if split_point >= len(server_profiles):
             # All on client - no server output to transfer back
             output_transfer_size = 0
         else:
             # Transfer final server output back to client
-            output_transfer_size = layer_profiles[-1]['data_transfer_size']
+            output_transfer_size = server_profiles[-1]['data_transfer_size']
         
         # Calculate transfer times
         input_transfer_time = self.network_profiler.estimate_transfer_time(input_transfer_size)
@@ -477,11 +594,11 @@ class DNNSurgery:
         total_time = client_time + input_transfer_time + server_time + output_transfer_time
         
         # Log detailed calculation for debugging
-        logger.debug(f"Split {split_point} timing calculation:")
+        logger.debug(f"Split {split_point} timing calculation (with server profiles):")
         logger.debug(f"  Client layers: 0 to {split_point-1 if split_point > 0 else 'none'}")
-        logger.debug(f"  Server layers: {split_point} to {len(layer_profiles)-1 if split_point < len(layer_profiles) else 'none'}")
-        logger.debug(f"  Client time: {client_time:.2f}ms")
-        logger.debug(f"  Server time: {server_time:.2f}ms")
+        logger.debug(f"  Server layers: {split_point} to {len(server_profiles)-1 if split_point < len(server_profiles) else 'none'}")
+        logger.debug(f"  Client time: {client_time:.2f}ms (measured on client)")
+        logger.debug(f"  Server time: {server_time:.2f}ms (measured on server)")
         logger.debug(f"  Input transfer: {input_transfer_size} bytes -> {input_transfer_time:.2f}ms")
         logger.debug(f"  Output transfer: {output_transfer_size} bytes -> {output_transfer_time:.2f}ms")
         logger.debug(f"  Total time: {total_time:.2f}ms")
@@ -531,30 +648,4 @@ class DNNSurgery:
         )
         
         return client_profile
-        
-    def find_optimal_split(self, target_edge_percentage: float = 0.5) -> int:
-        """Find optimal split point based on execution time (legacy method)
-        
-        Args:
-            target_edge_percentage: Target percentage of computation on edge (0.0 to 1.0)
-            
-        Returns:
-            Optimal split point (layer index)
-        """
-        logger.warning("Using legacy split method. Consider using find_optimal_split_neurosurgeon() instead.")
-        
-        if not self.profiler.profiles:
-            logger.warning("No profiling data available. Run profile_model first.")
-            return 0
-            
-        total_time = sum(p['execution_time'] for p in self.profiler.profiles)
-        target_time = total_time * target_edge_percentage
-        
-        cumulative_time = 0
-        for i, profile in enumerate(self.profiler.profiles):
-            cumulative_time += profile['execution_time']
-            if cumulative_time >= target_time:
-                return i + 1  # Split after this layer
-                
-        return len(self.profiler.profiles)  # All layers on edge
 
