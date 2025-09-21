@@ -214,17 +214,6 @@ class ModelSplitter:
         # This preserves the model's intended structure
         layers = list(model.children())
         
-        # If the model has very few top-level children, we might want to go one level deeper
-        if len(layers) <= 2:
-            expanded_layers = []
-            for layer in layers:
-                if hasattr(layer, '__len__') and len(list(layer.children())) > 1:
-                    # If this layer has multiple children, expand them
-                    expanded_layers.extend(list(layer.children()))
-                else:
-                    expanded_layers.append(layer)
-            layers = expanded_layers
-        
         return layers
         
     def set_split_point(self, split_point: int):
