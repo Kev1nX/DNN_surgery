@@ -396,6 +396,12 @@ class DNNSurgery:
         if server_layer_profiles is None:
             logger.warning("Failed to get server profiling. Falling back to client-only estimation.")
             server_layer_profiles = client_layer_profiles  # Fallback
+        else:
+            logger.info(f"Successfully obtained server profiling data for {len(server_layer_profiles)} layers")
+            # Log comparison of first few server vs client times
+            for i in range(min(3, len(server_layer_profiles), len(client_layer_profiles))):
+                logger.info(f"Layer {i}: Client={client_layer_profiles[i]['execution_time']:.2f}ms, "
+                          f"Server={server_layer_profiles[i]['execution_time']:.2f}ms")
         
         # Step 3: Measure network performance
         logger.info("Step 3: Measuring network performance...")
@@ -480,6 +486,10 @@ class DNNSurgery:
             logger.info("Sending profiling request to server...")
             response = stub.SendProfilingData(request)
             
+            logger.info(f"Server response received - Success: {response.success}")
+            logger.info(f"Server message: {response.message}")
+            logger.info(f"Updated split config: {response.updated_split_config}")
+            
             if response.success:
                 logger.info(f"Server profiling completed: {response.message}")
                 
@@ -524,6 +534,7 @@ class DNNSurgery:
             
             # Parse the comma-separated execution times
             server_times = [float(t.strip()) for t in server_profile_part.split(',')]
+            logger.info(f"Parsed server execution times: {server_times}")
             
             # Convert to the same format as client profiles
             server_profiles = []

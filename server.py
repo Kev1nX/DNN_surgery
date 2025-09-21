@@ -309,8 +309,13 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             
             model = self.models[model_name]
             
+            # Ensure model is on the correct device
+            model = model.to(self.device)
+            
             # Create dummy input tensor with same shape as client used
             input_shape = client_profile.input_size
+            # Convert protobuf RepeatedScalarContainer to tuple
+            input_shape = tuple(input_shape)
             dummy_input = torch.randn(input_shape).to(self.device)
             
             logging.info(f"Profiling {model_name} on server (device: {self.device})")
@@ -326,6 +331,9 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             # Profile each layer on server
             for idx, layer in enumerate(layers):
                 layer_name = layer.__class__.__name__
+                
+                # Ensure layer is on the correct device
+                layer = layer.to(self.device)
                 
                 # Handle tensor shape transitions (same as client)
                 profile_input = current_tensor
@@ -353,6 +361,8 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                     if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
                         current_tensor = torch.flatten(current_tensor, 1)
                     current_tensor = layer(current_tensor)
+                    # Ensure tensor stays on the correct device
+                    current_tensor = current_tensor.to(self.device)
             
             logging.info(f"Server profiling completed for {model_name}")
             return server_execution_times
