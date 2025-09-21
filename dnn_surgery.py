@@ -146,17 +146,22 @@ class LayerProfiler:
         
     def profile_layer(self, layer: nn.Module, input_tensor: torch.Tensor, 
                      layer_idx: int, layer_name: str) -> Dict:
-        # Profile execution time
-        cuda_sync()
-        start_time = time.perf_counter()
-        
-        with torch.no_grad():
-            output = layer(input_tensor)
+        # Profile execution time with multiple runs for accuracy
+        times = []
+        for _ in range(3):  # Multiple measurements for accuracy
+            cuda_sync()
+            start_time = time.perf_counter()
+            
+            with torch.no_grad():
+                output = layer(input_tensor)
 
-        cuda_sync()
-        end_time = time.perf_counter()
+            cuda_sync()
+            end_time = time.perf_counter()
+            
+            times.append((end_time - start_time) * 1000)  # Convert to ms
         
-        execution_time = (end_time - start_time) * 1000  # Convert to ms
+        # Use median time to avoid outliers
+        execution_time = sorted(times)[len(times)//2]
     
         
         # Calculate tensor sizes

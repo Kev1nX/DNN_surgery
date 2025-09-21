@@ -309,8 +309,8 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             
             model = self.models[model_name]
             
-            # Ensure model is on the correct device
-            model = model.to(self.device)
+            # Ensure model is on the correct device (should already be, but make sure)
+            model = model.to(self.device).eval()
             
             # Create dummy input tensor with same shape as client used
             input_shape = client_profile.input_size
@@ -328,29 +328,31 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             server_execution_times = []
             current_tensor = dummy_input
             
-            # Profile each layer on server
+            # Profile each layer on server (using same approach as client)
             for idx, layer in enumerate(layers):
                 layer_name = layer.__class__.__name__
-                
-                # Ensure layer is on the correct device
-                layer = layer.to(self.device)
                 
                 # Handle tensor shape transitions (same as client)
                 profile_input = current_tensor
                 if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
                     profile_input = torch.flatten(current_tensor, 1)
                 
-                # Profile execution time on server
-                cuda_sync()
-                start_time = time.perf_counter()
+                # Profile execution time on server (multiple runs for accuracy)
+                times = []
+                for _ in range(3):  # Multiple measurements for accuracy
+                    cuda_sync()
+                    start_time = time.perf_counter()
+                    
+                    with torch.no_grad():
+                        output = layer(profile_input)
+                    
+                    cuda_sync()
+                    end_time = time.perf_counter()
+                    
+                    times.append((end_time - start_time) * 1000)  # Convert to ms
                 
-                with torch.no_grad():
-                    output = layer(profile_input)
-                
-                cuda_sync()
-                end_time = time.perf_counter()
-                
-                execution_time = (end_time - start_time) * 1000  # Convert to ms
+                # Use median time to avoid outliers
+                execution_time = sorted(times)[len(times)//2]
                 server_execution_times.append(execution_time)
                 
                 logging.info(f"Server Layer {idx} ({layer_name}): {execution_time:.2f}ms, "
@@ -361,8 +363,6 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                     if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
                         current_tensor = torch.flatten(current_tensor, 1)
                     current_tensor = layer(current_tensor)
-                    # Ensure tensor stays on the correct device
-                    current_tensor = current_tensor.to(self.device)
             
             logging.info(f"Server profiling completed for {model_name}")
             return server_execution_times
