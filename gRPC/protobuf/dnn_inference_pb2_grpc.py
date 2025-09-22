@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-from . import dnn_inference_pb2 as dnn__inference__pb2
+import dnn_inference_pb2 as dnn__inference__pb2
 
-GRPC_GENERATED_VERSION = '1.73.0'
+GRPC_GENERATED_VERSION = '1.74.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -45,6 +45,11 @@ class DNNInferenceStub(object):
                 request_serializer=dnn__inference__pb2.ProfilingRequest.SerializeToString,
                 response_deserializer=dnn__inference__pb2.ProfilingResponse.FromString,
                 _registered_method=True)
+        self.set_split_point = channel.unary_unary(
+                '/dnn_surgery.DNNInference/set_split_point',
+                request_serializer=dnn__inference__pb2.SplitConfigRequest.SerializeToString,
+                response_deserializer=dnn__inference__pb2.SplitConfigResponse.FromString,
+                _registered_method=True)
 
 
 class DNNInferenceServicer(object):
@@ -65,6 +70,13 @@ class DNNInferenceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def set_split_point(self, request, context):
+        """Send client's split point decision to server
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_DNNInferenceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -77,6 +89,11 @@ def add_DNNInferenceServicer_to_server(servicer, server):
                     servicer.SendProfilingData,
                     request_deserializer=dnn__inference__pb2.ProfilingRequest.FromString,
                     response_serializer=dnn__inference__pb2.ProfilingResponse.SerializeToString,
+            ),
+            'set_split_point': grpc.unary_unary_rpc_method_handler(
+                    servicer.set_split_point,
+                    request_deserializer=dnn__inference__pb2.SplitConfigRequest.FromString,
+                    response_serializer=dnn__inference__pb2.SplitConfigResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -134,6 +151,33 @@ class DNNInference(object):
             '/dnn_surgery.DNNInference/SendProfilingData',
             dnn__inference__pb2.ProfilingRequest.SerializeToString,
             dnn__inference__pb2.ProfilingResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def set_split_point(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/dnn_surgery.DNNInference/set_split_point',
+            dnn__inference__pb2.SplitConfigRequest.SerializeToString,
+            dnn__inference__pb2.SplitConfigResponse.FromString,
             options,
             channel_credentials,
             insecure,

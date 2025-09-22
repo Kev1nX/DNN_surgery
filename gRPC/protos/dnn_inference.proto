@@ -60,6 +60,18 @@ message ProfilingResponse {
     string updated_split_config = 3;  // Optional: new split configuration
 }
 
+// Request to set split point (client decision)
+message SplitConfigRequest {
+    string model_name = 1;
+    int32 split_point = 2;  // Client's optimal split point decision
+}
+
+// Response after setting split point
+message SplitConfigResponse {
+    bool success = 1;
+    string message = 2;
+}
+
 // Service definition for DNN inference
 service DNNInference {
     // Send intermediate tensor to cloud for further processing
@@ -67,4 +79,7 @@ service DNNInference {
     
     // Send client profiling data for optimal split calculation
     rpc SendProfilingData (ProfilingRequest) returns (ProfilingResponse) {}
+    
+    // Send client's split point decision to server
+    rpc set_split_point (SplitConfigRequest) returns (SplitConfigResponse) {}
 }

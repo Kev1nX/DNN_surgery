@@ -5,10 +5,10 @@ import torch
 import torch.nn as nn
 import io
 import time
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
-from dnn_surgery import DNNSurgery, ModelSplitter
+from dnn_surgery import DNNSurgery, ModelSplitter, NetworkProfiler
 
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
@@ -37,6 +37,9 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
         self.dnn_surgery_instances: Dict[str, DNNSurgery] = {}
         self.cloud_models: Dict[str, torch.nn.Module] = {}
         self.client_split_points: Dict[str, int] = {}
+        
+        # Network profiler for transfer time calculations (using same class as client)
+        self.network_profiler = NetworkProfiler()
         
         logging.info(f"Initializing DNNInferenceServicer with device: {self.device}")
         
@@ -222,14 +225,16 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
     
     def SendProfilingData(self, request: dnn_inference_pb2.ProfilingRequest,
                          context: grpc.ServicerContext) -> dnn_inference_pb2.ProfilingResponse:
-        """Receive profiling data, run server-side profiling, and return optimal split configuration
+        """Receive profiling data, run server-side profiling, and return server execution times
+        
+        The client will use this data to determine the optimal split point.
         
         Args:
             request: Profiling request containing client profile data
             context: gRPC context
             
         Returns:
-            Profiling response with optimal split configuration and server profiling data
+            Profiling response with server execution times (no split decision)
         """
         try:
             client_id = request.client_id
@@ -261,7 +266,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                     updated_split_config=""
                 )
             
-            # Compare client vs server performance
+            # Compare client vs server performance (for logging only)
             logging.info("=== Client vs Server Performance Comparison ===")
             for i, (client_layer, server_time) in enumerate(zip(client_profile.layer_metrics, server_times)):
                 speedup = client_layer.execution_time / server_time if server_time > 0 else float('inf')
@@ -270,31 +275,16 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                            f"Server={server_time:.2f}ms, "
                            f"Speedup={speedup:.2f}x")
             
-            # Find optimal split point using both client and server timings
-            optimal_split = self._find_optimal_split_server(client_profile, server_times)
-            
-            # Create cloud model for this client
-            client_model_key = f"{client_id}_{model_name}"
-            if model_name in self.dnn_surgery_instances:
-                cloud_model = self.create_cloud_model(model_name, optimal_split)
-                if cloud_model is not None:
-                    self.cloud_models[client_model_key] = cloud_model
-                    self.client_split_points[client_model_key] = optimal_split
-                    
-                    logging.info(f"Created cloud model for client {client_id} with optimal split point: {optimal_split}")
-                else:
-                    logging.warning(f"No cloud model needed for split point {optimal_split} - all computation on edge")
-            else:
-                logging.error(f"DNNSurgery instance not found for model {model_name}")
-                logging.info(f"Available models: {list(self.dnn_surgery_instances.keys())}")
-            
-            # Create response with server profiling data
+            # Create response with server profiling data ONLY
+            # The client will decide the optimal split point
             server_profile_data = self._create_server_response(server_times)
+            
+            logging.info("Server profiling completed. Sending execution times to client for split decision.")
             
             return dnn_inference_pb2.ProfilingResponse(
                 success=True,
-                message=f"Profiling completed. Optimal split point: {optimal_split}. Server profiling included.",
-                updated_split_config=f"split_point:{optimal_split};server_profile:{server_profile_data}"
+                message="Server profiling completed. Client will determine optimal split point.",
+                updated_split_config=f"server_profile:{server_profile_data}"
             )
             
         except Exception as e:
@@ -390,63 +380,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             import traceback
             logging.error(traceback.format_exc())
             return None
-    
-    def _find_optimal_split_server(self, client_profile: dnn_inference_pb2.ClientProfile, 
-                                           server_times: List[float]) -> int:
-        """Find optimal split point using both client and server timing data
-        
-        Args:
-            client_profile: Client profile with layer metrics
-            server_times: List of server execution times
-            
-        Returns:
-            Optimal split point
-        """
-        client_times = [layer.execution_time for layer in client_profile.layer_metrics]
-        
-        if len(client_times) != len(server_times):
-            logging.warning(f"Client and server layer counts don't match: {len(client_times)} vs {len(server_times)}")
-            # Fall back to simple split
-            return len(client_times) // 2
-        
-        best_split = 0
-        min_total_time = float('inf')
-        
-        logging.info("=== Server-side Split Analysis ===")
-        logging.info(f"{'Split':<5} {'Client':<8} {'Server':<8} {'Total':<8} {'Description'}")
-        logging.info("-" * 50)
-        
-        for split_point in range(len(client_times) + 1):
-            # Client execution time (layers 0 to split_point-1)
-            client_time = sum(client_times[:split_point])
-            
-            # Server execution time (layers split_point to end)
-            server_time = sum(server_times[split_point:])
-            
-            # Sequential execution time (like client calculation but without actual network measurement)
-            # This is a simplified version - the client will do the full calculation with network metrics
-            total_time = client_time + server_time  # Sequential execution without transfer overhead
-            
-            # Create description
-            if split_point == 0:
-                desc = "All server"
-            elif split_point >= len(client_times):
-                desc = "All client"
-            else:
-                desc = f"Split at {split_point}"
-            
-            logging.info(f"{split_point:<5} {client_time:<8.1f} {server_time:<8.1f} "
-                       f"{total_time:<8.1f} {desc}")
-            
-            if total_time < min_total_time:
-                min_total_time = total_time
-                best_split = split_point
-        
-        logging.info("-" * 50)
-        logging.info(f"Server recommends split point: {best_split}")
-        
-        return best_split
-    
+
     def _create_server_response(self, server_times: List[float]) -> str:
         """Create a compact representation of server profiling data
         
@@ -459,37 +393,58 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
         # Create a simple comma-separated string of execution times
         return ','.join(f"{t:.2f}" for t in server_times)
 
-    def create_cloud_model(self, model_name: str, split_point: int):
-        """Create cloud-side model for distributed inference
+    def set_split_point(self, request: dnn_inference_pb2.SplitConfigRequest,
+                       context: grpc.ServicerContext) -> dnn_inference_pb2.SplitConfigResponse:
+        """Receive split point decision from client and create cloud model accordingly
         
         Args:
-            model_name: Name of the model to split
-            split_point: Layer index where to split
+            request: Split configuration request containing split point decision
+            context: gRPC context
             
         Returns:
-            Cloud-side model or None if creation fails
+            Response confirming cloud model creation
         """
-        if model_name not in self.models:
-            logging.error(f"Model {model_name} not registered")
-            return None
-        
         try:
+            model_name = request.model_name
+            split_point = request.split_point
+            
+            logging.info(f"Received split point decision: split_point={split_point} for model {model_name}")
+            
             # Create a DNN Surgery instance for this model and split point
             original_model = self.models[model_name]
             splitter = ModelSplitter(original_model, model_name)
             splitter.set_split_point(split_point)
             cloud_model = splitter.get_cloud_model()
             
-            if cloud_model is None:
-                logging.warning(f"Cloud model is None for split point {split_point} - model runs entirely on edge")
-                return None
+            # Store the client's split decision
+            self.client_split_points[model_name] = split_point
             
-            logging.info(f"Created cloud model for {model_name} at split point {split_point}")
-            return cloud_model
+            if cloud_model is None:
+                logging.info(f"Split point {split_point} results in full edge execution for {model_name}")
+                return dnn_inference_pb2.SplitConfigResponse(
+                    success=True,
+                    message=f"Split point {split_point} configured for full edge execution of {model_name}"
+                )
+            
+            # Store the cloud model for later inference
+            cloud_key = f"{model_name}_split_{split_point}"
+            self.cloud_models[cloud_key] = cloud_model
+            
+            logging.info(f"Created and stored cloud model for {model_name} at split point {split_point}")
+            return dnn_inference_pb2.SplitConfigResponse(
+                success=True,
+                message=f"Split point {split_point} configured successfully for {model_name}"
+            )
             
         except Exception as e:
-            logging.error(f"Failed to create cloud model: {str(e)}")
-            return None
+            error_msg = f"Error setting split point: {str(e)}"
+            logging.error(error_msg)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(error_msg)
+            return dnn_inference_pb2.SplitConfigResponse(
+                success=False,
+                message=error_msg
+            )
             
 def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInferenceServicer]:
     """Start the gRPC server

@@ -129,7 +129,7 @@ class NetworkProfiler:
             Estimated transfer time in milliseconds
         """
         if self.bandwidth_mbps is None or self.latency_ms is None:
-            logger.warning("Network not profiled. Using conservative estimates.")
+            logger.warning("Network not profiled. Using conservative estimates: 10 Mbps bandwidth, 50ms latency")
             return (data_size_bytes * 8) / (10 * 1024 * 1024) * 1000 + 50  # 10 Mbps + 50ms latency
             
         # Transfer time = latency + (data_size_bits / bandwidth_bps)
@@ -482,6 +482,7 @@ class DNNSurgery:
         optimal_split = 0
         
         logger.info("=== Client-side NeuroSurgeon Split Point Analysis ===")
+        logger.info(f"Network measured: {network_metrics['bandwidth_mbps']:.1f} Mbps bandwidth, {network_metrics['latency_ms']:.1f}ms latency")
         logger.info(f"{'Split':<5} {'Client':<8} {'Server':<8} {'Transfer':<10} {'Total':<8} {'Description'}")
         logger.info("-" * 70)
         
@@ -569,39 +570,30 @@ class DNNSurgery:
             logger.error(f"Failed to get server profiling: {str(e)}")
             return None
     
-    def _parse_server_response(self, config_string: str) -> Optional[Dict]:
-        """Parse server profiling data and optimal split from the response string
+    def _parse_server_response(self, config_string: str) -> Optional[List[Dict]]:
+        """Parse server profiling data from the response string (NO split point recommendation)
         
         Args:
             config_string: Configuration string from server response
             
         Returns:
-            Dictionary with server profiles and optimal split, or None if parsing failed
+            List of server layer profiles, or None if parsing failed
         """
         try:
-            # Parse the config string: "split_point:X;server_profile:time1,time2,time3..."
-            parts = config_string.split(';')
-            server_profile_part = None
-            optimal_split = None
+            # Parse the config string: "server_profile:time1,time2,time3..."
+            if not config_string.startswith('server_profile:'):
+                logger.warning("Invalid server response format - expected 'server_profile:' prefix")
+                return None
             
-            for part in parts:
-                if part.startswith('server_profile:'):
-                    server_profile_part = part.split(':', 1)[1]
-                elif part.startswith('split_point:'):
-                    optimal_split = int(part.split(':', 1)[1])
+            server_profile_part = config_string.split(':', 1)[1]
             
             if not server_profile_part:
                 logger.warning("No server profile data found in response")
                 return None
             
-            if optimal_split is None:
-                logger.warning("No optimal split point found in server response")
-                return None
-            
             # Parse the comma-separated execution times
             server_times = [float(t.strip()) for t in server_profile_part.split(',')]
             logger.info(f"Parsed server execution times: {server_times}")
-            logger.info(f"Server recommended optimal split point: {optimal_split}")
             
             # Convert to the same format as client profiles
             server_profiles = []
@@ -616,6 +608,8 @@ class DNNSurgery:
                     'computation_complexity': 0  # Not needed
                 }
                 server_profiles.append(profile)
+            
+            return server_profiles
             
             logger.info(f"Parsed {len(server_profiles)} server layer profiles")
             return {
