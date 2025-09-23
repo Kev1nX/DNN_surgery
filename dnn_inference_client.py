@@ -97,7 +97,7 @@ class DNNInferenceClient:
             # Run edge inference if available
             if self.edge_model is not None:
                 logging.info("=== Edge Model Processing ===")
-                logging.info(f"Edge model structure:\n{self.edge_model}")
+                # logging.info(f"Edge model structure:\n{self.edge_model}")
                 
                 start_time = time.perf_counter()
                 with torch.no_grad():
