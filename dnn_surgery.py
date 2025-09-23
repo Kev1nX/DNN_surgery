@@ -368,7 +368,7 @@ class DNNSurgery:
         return self.profiler.get_profiles()
     
     def find_optimal_split(self, input_tensor: torch.Tensor, server_address: str) -> Tuple[int, Dict]:
-        """Find optimal split point using server recommendation when available
+        """Find optimal split point using client-side calculation with server execution times
         
         Args:
             input_tensor: Input tensor for profiling
@@ -377,118 +377,129 @@ class DNNSurgery:
         Returns:
             Tuple of (optimal_split_point, timing_analysis)
         """
-        logger.info("Finding optimal split point with server recommendation...")
+        logger.info("=== CLIENT-DECIDES ARCHITECTURE ===")
+        logger.info("Step 1: Profiling model layers on client...")
         
         # Step 1: Profile the model layers on CLIENT
-        logger.info("Step 1: Profiling model layers on client...")
         client_layer_profiles = self.profile_model(input_tensor)
         
-        # Step 2: Get SERVER-SIDE profiling results and recommendation via gRPC
-        logger.info("Step 2: Requesting server-side profiling and optimal split recommendation...")
-        server_data = self._get_server_profile(input_tensor, server_address)
-        
-        if server_data is None:
-            logger.warning("Failed to get server data. Falling back to client-only analysis.")
-            return self._client_only_analysis(input_tensor, client_layer_profiles, server_address)
-        
-        # Check if server provided an optimal split recommendation
-        if isinstance(server_data, dict) and 'optimal_split' in server_data:
-            optimal_split = server_data['optimal_split']
-            server_layer_profiles = server_data.get('server_profiles', client_layer_profiles)
-            
-            logger.info(f"Server recommended optimal split point: {optimal_split}")
-            logger.info("Performing detailed NeuroSurgeon analysis with server data...")
-            
-            # Still measure network metrics for timing breakdown
-            network_metrics = self.network_profiler.measure_network(server_address)
-            
-            # Perform full analysis to show the complete table, even with server recommendation
-            split_analysis = {}
-            min_total_time = float('inf')
-            
-            logger.info("=== NeuroSurgeon Split Point Analysis (with Server Data) ===")
-            logger.info(f"{'Split':<5} {'Client':<8} {'Server':<8} {'Transfer':<10} {'Total':<8} {'Description'}")
-            logger.info("-" * 70)
-            
-            for split_point in range(len(self.splitter.layers) + 1):
-                timing = self._calculate_split_timing(
-                    client_layer_profiles, server_layer_profiles, split_point, input_tensor
-                )
-                split_analysis[split_point] = timing
-                
-                # Create description
-                if split_point == 0:
-                    desc = "All cloud"
-                elif split_point >= len(self.splitter.layers):
-                    desc = "All client"
-                else:
-                    desc = f"Split after layer {split_point-1}"
-                
-                total_transfer = timing['input_transfer_time'] + timing['output_transfer_time']
-                
-                # Mark the server-recommended split with an asterisk
-                marker = " *" if split_point == optimal_split else ""
-                
-                logger.info(f"{split_point:<5} {timing['client_time']:<8.1f} {timing['server_time']:<8.1f} "
-                           f"{total_transfer:<10.1f} {timing['total_time']:<8.1f} {desc}{marker}")
-                
-                if timing['total_time'] < min_total_time:
-                    min_total_time = timing['total_time']
-            
-            logger.info("-" * 70)
-            logger.info(f"Server recommended split point: {optimal_split} (* marked above)")
-            logger.info(f"Recommended split total time: {split_analysis[optimal_split]['total_time']:.2f}ms")
-            
-            # Find the actual optimal split from client analysis
-            client_optimal_split = min(split_analysis.keys(), key=lambda k: split_analysis[k]['total_time'])
-            client_min_time = split_analysis[client_optimal_split]['total_time']
-            
-            if client_optimal_split != optimal_split:
-                logger.info(f"NOTE: Client analysis suggests split {client_optimal_split} is better ({client_min_time:.2f}ms)")
-                logger.info("Using client-calculated optimal split instead of server recommendation")
-                optimal_split = client_optimal_split
-            
-            return optimal_split, {
-                'optimal_split': optimal_split,
-                'min_total_time': split_analysis[optimal_split]['total_time'],
-                'network_metrics': network_metrics,
-                'client_profiles': client_layer_profiles,
-                'server_profiles': server_layer_profiles,
-                'all_splits': split_analysis,
-                'recommended_by_server': True
-            }
-        else:
-            # Fallback to traditional analysis if server didn't provide recommendation
-            logger.warning("Server didn't provide split recommendation. Performing client-side analysis.")
-            server_layer_profiles = server_data if isinstance(server_data, list) else client_layer_profiles
-            return self._client_only_analysis(input_tensor, client_layer_profiles, server_address, server_layer_profiles)
-    
-    def _client_only_analysis(self, input_tensor: torch.Tensor, client_layer_profiles: List[Dict], 
-                             server_address: str, server_layer_profiles: List[Dict] = None) -> Tuple[int, Dict]:
-        """Fallback analysis when server recommendation not available"""
-        logger.info("Performing client-side NeuroSurgeon analysis...")
+        # Step 2: Get SERVER-SIDE execution times via gRPC (no split recommendation)
+        logger.info("Step 2: Requesting server-side execution times...")
+        server_layer_profiles = self._get_server_profile(input_tensor, server_address)
         
         if server_layer_profiles is None:
-            server_layer_profiles = client_layer_profiles  # Fallback
+            logger.warning("Failed to get server execution times. Using client times as fallback.")
+            server_layer_profiles = client_layer_profiles
         
         # Step 3: Measure network performance
-        logger.info("Measuring network performance...")
+        logger.info("Step 3: Measuring network performance...")
         network_metrics = self.network_profiler.measure_network(server_address)
         
-        # Step 4: Calculate total time for each possible split point
-        logger.info("Analyzing split points with client-side analysis...")
+        # Step 4: CLIENT calculates optimal split point using server execution times
+        logger.info("Step 4: Client calculating optimal split point...")
+        optimal_split, split_analysis = self._calculate_optimal_split_client_side(
+            client_layer_profiles, server_layer_profiles, input_tensor, network_metrics
+        )
+        
+        # Step 5: Send optimal split decision back to server
+        logger.info(f"Step 5: Sending split decision to server: split_point={optimal_split}")
+        split_config_success = self._send_split_decision_to_server(optimal_split, server_address)
+        
+        if not split_config_success:
+            logger.error("Failed to configure server with split decision!")
+        else:
+            logger.info("Server successfully configured with client's split decision")
+        
+        return optimal_split, {
+            'optimal_split': optimal_split,
+            'min_total_time': split_analysis[optimal_split]['total_time'],
+            'network_metrics': network_metrics,
+            'client_profiles': client_layer_profiles,
+            'server_profiles': server_layer_profiles,
+            'all_splits': split_analysis,
+            'recommended_by_server': False,
+            'split_config_success': split_config_success
+        }
+    
+    def _get_server_profile(self, input_tensor: torch.Tensor, server_address: str) -> Optional[List[Dict]]:
+        """Get server-side execution times via gRPC (NO split recommendation)
+        
+        Args:
+            input_tensor: Input tensor for profiling
+            server_address: Server address
+            
+        Returns:
+            List of server layer profiles, or None if failed
+        """
+        try:
+            # Create gRPC channel
+            channel = grpc.insecure_channel(server_address)
+            stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
+            
+            # Create profiling request
+            client_profile = self.create_client_profile(input_tensor)
+            request = dnn_inference_pb2.ProfilingRequest(
+                profile=client_profile,
+                client_id="profiling_client"
+            )
+            
+            logger.info("Sending profiling request to server...")
+            response = stub.SendProfilingData(request)
+            
+            logger.info(f"Server response received - Success: {response.success}")
+            logger.info(f"Server message: {response.message}")
+            
+            if response.success:
+                logger.info("Server profiling completed successfully")
+                
+                # Parse server execution times from response
+                server_profiles = self._parse_server_response(response.updated_split_config)
+                if server_profiles:
+                    logger.info(f"Successfully received {len(server_profiles)} server execution times")
+                    return server_profiles
+                else:
+                    logger.warning("Failed to parse server execution times")
+                    return None
+            else:
+                logger.error(f"Server profiling failed: {response.message}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Failed to get server profiling: {str(e)}")
+            return None
+
+    def _calculate_optimal_split_client_side(self, client_profiles: List[Dict], 
+                                           server_profiles: List[Dict], 
+                                           input_tensor: torch.Tensor, 
+                                           network_metrics: Dict) -> Tuple[int, Dict]:
+        """Calculate optimal split point on client side using server execution times
+        
+        Args:
+            client_profiles: Client-side layer profiling data
+            server_profiles: Server-side layer profiling data  
+            input_tensor: Input tensor
+            network_metrics: Network performance metrics
+            
+        Returns:
+            Tuple of (optimal_split_point, all_split_analysis)
+        """
+        logger.info("=== Client-Side Split Point Analysis ===")
+        logger.info(f"Network: {network_metrics['bandwidth_mbps']:.1f} Mbps, {network_metrics['latency_ms']:.1f}ms latency")
+        logger.info(f"{'Split':<5} {'Client':<8} {'Server':<8} {'Transfer':<10} {'Total':<8} {'Description'}")
+        logger.info("-" * 75)
+        
         split_analysis = {}
         min_total_time = float('inf')
         optimal_split = 0
         
-        logger.info("=== Client-side NeuroSurgeon Split Point Analysis ===")
-        logger.info(f"Network measured: {network_metrics['bandwidth_mbps']:.1f} Mbps bandwidth, {network_metrics['latency_ms']:.1f}ms latency")
-        logger.info(f"{'Split':<5} {'Client':<8} {'Server':<8} {'Transfer':<10} {'Total':<8} {'Description'}")
-        logger.info("-" * 70)
+        # Ensure server profiles have the right data transfer sizes from client profiles
+        for i, server_profile in enumerate(server_profiles):
+            if i < len(client_profiles):
+                server_profile['data_transfer_size'] = client_profiles[i]['data_transfer_size']
         
         for split_point in range(len(self.splitter.layers) + 1):
             timing = self._calculate_split_timing(
-                client_layer_profiles, server_layer_profiles, split_point, input_tensor
+                client_profiles, server_profiles, split_point, input_tensor
             )
             split_analysis[split_point] = timing
             
@@ -509,66 +520,45 @@ class DNNSurgery:
                 min_total_time = timing['total_time']
                 optimal_split = split_point
         
-        logger.info("-" * 70)
-        logger.info(f"Client-side optimal split point: {optimal_split} with total time: {min_total_time:.2f}ms")
+        logger.info("-" * 75)
+        logger.info(f"CLIENT OPTIMAL SPLIT: {optimal_split} with total time: {min_total_time:.2f}ms")
         
-        return optimal_split, {
-            'optimal_split': optimal_split,
-            'min_total_time': min_total_time,
-            'network_metrics': network_metrics,
-            'client_profiles': client_layer_profiles,
-            'server_profiles': server_layer_profiles,
-            'all_splits': split_analysis,
-            'recommended_by_server': False
-        }
-    
-    def _get_server_profile(self, input_tensor: torch.Tensor, server_address: str) -> Optional[Dict]:
-        """Get server-side profiling results and optimal split recommendation via gRPC
+        return optimal_split, split_analysis
+
+    def _send_split_decision_to_server(self, split_point: int, server_address: str) -> bool:
+        """Send the client's split decision to the server
         
         Args:
-            input_tensor: Input tensor for profiling
+            split_point: The optimal split point decided by client
             server_address: Server address
             
         Returns:
-            Dictionary with server profiles and optimal split, or None if failed
+            True if successful, False otherwise
         """
         try:
             # Create gRPC channel
             channel = grpc.insecure_channel(server_address)
             stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
             
-            # Create profiling request
-            client_profile = self.create_client_profile(input_tensor)
-            request = dnn_inference_pb2.ProfilingRequest(
-                profile=client_profile,
-                client_id="profiling_client"
+            # Create split configuration request
+            request = dnn_inference_pb2.SplitConfigRequest(
+                model_name=self.model_name,
+                split_point=split_point
             )
             
-            logger.info("Sending profiling request to server...")
-            response = stub.SendProfilingData(request)
-            
-            logger.info(f"Server response received - Success: {response.success}")
-            logger.info(f"Server message: {response.message}")
-            logger.info(f"Updated split config: {response.updated_split_config}")
+            logger.info(f"Sending split decision to server: {self.model_name} -> split_point={split_point}")
+            response = stub.set_split_point(request)
             
             if response.success:
-                logger.info(f"Server profiling completed: {response.message}")
-                
-                # Parse server profiling data and recommendation from response
-                server_data = self._parse_server_response(response.updated_split_config)
-                if server_data:
-                    logger.info("Successfully received server profiling data and recommendation")
-                    return server_data
-                else:
-                    logger.warning("Failed to parse server profiling data")
-                    return None
+                logger.info(f"Server accepted split configuration: {response.message}")
+                return True
             else:
-                logger.error(f"Server profiling failed: {response.message}")
-                return None
+                logger.error(f"Server rejected split configuration: {response.message}")
+                return False
                 
         except Exception as e:
-            logger.error(f"Failed to get server profiling: {str(e)}")
-            return None
+            logger.error(f"Failed to send split decision to server: {str(e)}")
+            return False
     
     def _parse_server_response(self, config_string: str) -> Optional[List[Dict]]:
         """Parse server profiling data from the response string (NO split point recommendation)
@@ -609,13 +599,8 @@ class DNNSurgery:
                 }
                 server_profiles.append(profile)
             
-            return server_profiles
-            
             logger.info(f"Parsed {len(server_profiles)} server layer profiles")
-            return {
-                'server_profiles': server_profiles,
-                'optimal_split': optimal_split
-            }
+            return server_profiles
             
         except Exception as e:
             logger.error(f"Failed to parse server profile response: {str(e)}")
