@@ -8,7 +8,7 @@ import time
 from typing import Dict, Optional, List, Tuple
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
-from dnn_surgery import DNNSurgery, ModelSplitter, NetworkProfiler
+from dnn_surgery import DNNSurgery, ModelSplitter, NetworkProfiler, LayerProfiler
 
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
@@ -247,13 +247,6 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             logging.info(f"Received profiling data from client: {client_id}")
             logging.info(f"Model: {model_name}, Total layers: {client_profile.total_layers}")
             
-            # Log client-side layer details
-            logging.info("Client-side layer profiling:")
-            for layer_metric in client_profile.layer_metrics:
-                logging.info(f"  Layer {layer_metric.layer_idx} ({layer_metric.layer_name}): "
-                           f"{layer_metric.execution_time:.2f}ms (client), "
-                           f"Transfer size: {layer_metric.data_transfer_size} bytes")
-            
             # Run SERVER-SIDE profiling
             logging.info("Running server-side model profiling...")
             server_times = self._profile_server_model(model_name, client_profile)
@@ -265,15 +258,6 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                     message="Failed to profile model on server",
                     updated_split_config=""
                 )
-            
-            # Compare client vs server performance (for logging only)
-            logging.info("=== Client vs Server Performance Comparison ===")
-            for i, (client_layer, server_time) in enumerate(zip(client_profile.layer_metrics, server_times)):
-                speedup = client_layer.execution_time / server_time if server_time > 0 else float('inf')
-                logging.info(f"Layer {i} ({client_layer.layer_name}): "
-                           f"Client={client_layer.execution_time:.2f}ms, "
-                           f"Server={server_time:.2f}ms, "
-                           f"Speedup={speedup:.2f}x")
             
             # Create response with server profiling data ONLY
             # The client will decide the optimal split point
@@ -347,7 +331,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 
                 # Profile execution time on server (multiple runs for accuracy)
                 times = []
-                for _ in range(3):  # Multiple measurements for accuracy
+                for _ in range(5):  # Multiple measurements for accuracy
                     cuda_sync()
                     start_time = time.perf_counter()
                     

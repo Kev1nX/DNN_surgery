@@ -143,7 +143,7 @@ def test_connection(server_address: str) -> bool:
         
         # Try a simple inference to test connection
         test_input = torch.randn(1, 3, 224, 224)
-        result, timings = client.process_tensor(test_input, 'resnet18')
+        client.process_tensor(test_input, 'resnet18')
         
         logger.info("✓ Connection test successful!")
         return True

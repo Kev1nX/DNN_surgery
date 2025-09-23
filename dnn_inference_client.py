@@ -111,11 +111,6 @@ class DNNInferenceClient:
                 logging.info(f"Edge inference completed in {edge_time:.2f}ms")
                 logging.info(f"Intermediate tensor shape: {tensor.shape}")
                 logging.info(f"Intermediate tensor stats - Min: {tensor.min().item():.3f}, Max: {tensor.max().item():.3f}, Mean: {tensor.mean().item():.3f}")
-                
-                if torch.isnan(tensor).any():
-                    logging.error("Edge model output contains NaN values!")
-                if torch.isinf(tensor).any():
-                    logging.error("Edge model output contains Inf values!")
             
             # Check if cloud processing is required
             if not requires_cloud_processing:
@@ -265,7 +260,7 @@ def run_distributed_inference(model_id: str, input_tensor: torch.Tensor,
             split_point = optimal_split
             logging.info(f"NeuroSurgeon optimal split point: {split_point}")
             logging.info(f"Predicted total time: {analysis['min_total_time']:.2f}ms")
-        
+        dnn_surgery._send_split_decision_to_server(split_point=split_point, server_address=server_address)
         # Set split point and get edge model
         dnn_surgery.splitter.set_split_point(split_point)
         edge_model = dnn_surgery.splitter.get_edge_model()
@@ -282,10 +277,6 @@ def run_distributed_inference(model_id: str, input_tensor: torch.Tensor,
         
         # Run inference
         result, timings = client.process_tensor(input_tensor, model_id, requires_cloud_processing)
-        
-        # Send profiling data to server for future optimizations (only if server communication is available)
-        if requires_cloud_processing:
-            client.send_profiling_data(dnn_surgery, input_tensor)
         
         # Get timing summary
         timing_summary = client.get_timing_summary()

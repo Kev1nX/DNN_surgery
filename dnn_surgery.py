@@ -352,8 +352,8 @@ class DNNSurgery:
             if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
                 # For Linear layers, flatten the input for profiling
                 profile_input = torch.flatten(current_tensor, 1)
-                
-            profile = self.profiler.profile_layer(
+
+            self.profiler.profile_layer(
                 layer, profile_input, idx, layer_name
             )
             
@@ -385,7 +385,7 @@ class DNNSurgery:
         
         # Step 2: Get SERVER-SIDE execution times via gRPC (no split recommendation)
         logger.info("Step 2: Requesting server-side execution times...")
-        server_layer_profiles = self._get_server_profile(input_tensor, server_address)
+        server_layer_profiles = self._get_server_profile(client_layer_profiles, server_address)
         
         if server_layer_profiles is None:
             logger.warning("Failed to get server execution times. Using client times as fallback.")
@@ -421,7 +421,7 @@ class DNNSurgery:
             'split_config_success': split_config_success
         }
     
-    def _get_server_profile(self, input_tensor: torch.Tensor, server_address: str) -> Optional[List[Dict]]:
+    def _get_server_profile(self, profile, server_address: str) -> Optional[List[Dict]]:
         """Get server-side execution times via gRPC (NO split recommendation)
         
         Args:
@@ -437,7 +437,7 @@ class DNNSurgery:
             stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
             
             # Create profiling request
-            client_profile = self.create_client_profile(input_tensor)
+            client_profile = self.create_client_profile(profile)
             request = dnn_inference_pb2.ProfilingRequest(
                 profile=client_profile,
                 client_id="profiling_client"
@@ -445,9 +445,6 @@ class DNNSurgery:
             
             logger.info("Sending profiling request to server...")
             response = stub.SendProfilingData(request)
-            
-            logger.info(f"Server response received - Success: {response.success}")
-            logger.info(f"Server message: {response.message}")
             
             if response.success:
                 logger.info("Server profiling completed successfully")
@@ -503,13 +500,7 @@ class DNNSurgery:
             )
             split_analysis[split_point] = timing
             
-            # Create description
-            if split_point == 0:
-                desc = "All cloud"
-            elif split_point >= len(self.splitter.layers):
-                desc = "All client"
-            else:
-                desc = f"Split after layer {split_point-1}"
+            desc = f"Split after layer {split_point-1}"
             
             total_transfer = timing['input_transfer_time'] + timing['output_transfer_time']
             
@@ -521,7 +512,7 @@ class DNNSurgery:
                 optimal_split = split_point
         
         logger.info("-" * 75)
-        logger.info(f"CLIENT OPTIMAL SPLIT: {optimal_split} with total time: {min_total_time:.2f}ms")
+        logger.info(f"OPTIMAL SPLIT: {optimal_split} with total time: {min_total_time:.2f}ms")
         
         return optimal_split, split_analysis
 
@@ -674,7 +665,7 @@ class DNNSurgery:
             'total_time': total_time
         }
         
-    def create_client_profile(self, input_tensor: torch.Tensor) -> dnn_inference_pb2.ClientProfile:
+    def create_client_profile(self, profile) -> dnn_inference_pb2.ClientProfile:
         """Create a protobuf ClientProfile message
         
         Args:
@@ -684,7 +675,7 @@ class DNNSurgery:
             ClientProfile protobuf message
         """
         # Run profiling
-        layer_profiles = self.profile_model(input_tensor)
+        layer_profiles = profile
         
         # Create layer profile messages
         layer_metrics = []
