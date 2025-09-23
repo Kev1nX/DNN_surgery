@@ -354,7 +354,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 server_execution_times.append(execution_time)
                 
                 logging.info(f"Server Layer {idx} ({layer_name}): {execution_time:.2f}ms, "
-                           f"Output shape: {output.shape}")
+                           f"Input shape: {current_tensor.shape}, Output shape: {output.shape}")
                 
                 # Update current tensor for next layer (same logic as client)
                 with torch.no_grad():

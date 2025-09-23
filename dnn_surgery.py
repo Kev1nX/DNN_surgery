@@ -385,7 +385,7 @@ class DNNSurgery:
         
         # Step 2: Get SERVER-SIDE execution times via gRPC (no split recommendation)
         logger.info("Step 2: Requesting server-side execution times...")
-        server_layer_profiles = self._get_server_profile(client_layer_profiles, server_address)
+        server_layer_profiles = self._get_server_profile(input_tensor, client_layer_profiles, server_address)
         
         if server_layer_profiles is None:
             logger.warning("Failed to get server execution times. Using client times as fallback.")
@@ -420,8 +420,8 @@ class DNNSurgery:
             'recommended_by_server': False,
             'split_config_success': split_config_success
         }
-    
-    def _get_server_profile(self, profile, server_address: str) -> Optional[List[Dict]]:
+
+    def _get_server_profile(self, input_tensor: torch.Tensor, profile, server_address: str) -> Optional[List[Dict]]:
         """Get server-side execution times via gRPC (NO split recommendation)
         
         Args:
@@ -437,7 +437,7 @@ class DNNSurgery:
             stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
             
             # Create profiling request
-            client_profile = self.create_client_profile(profile)
+            client_profile = self.create_client_profile(input_tensor, profile)
             request = dnn_inference_pb2.ProfilingRequest(
                 profile=client_profile,
                 client_id="profiling_client"
@@ -665,7 +665,7 @@ class DNNSurgery:
             'total_time': total_time
         }
         
-    def create_client_profile(self, profile) -> dnn_inference_pb2.ClientProfile:
+    def create_client_profile(self, input_tensor, profile) -> dnn_inference_pb2.ClientProfile:
         """Create a protobuf ClientProfile message
         
         Args:
@@ -694,7 +694,7 @@ class DNNSurgery:
         client_profile = dnn_inference_pb2.ClientProfile(
             model_name=self.model_name,
             layer_metrics=layer_metrics,
-            input_size=profile['input_size'],
+            input_size=list(input_tensor.shape),
             total_layers=len(layer_profiles)
         )
         
