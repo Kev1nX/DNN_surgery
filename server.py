@@ -143,11 +143,17 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             model = None
             split_point = None
             
+            # Debug: Log what we're looking for and what we have
+            logging.info(f"Looking for cloud model for request.model_id: '{request.model_id}'")
+            logging.info(f"Available cloud model keys: {list(self.cloud_models.keys())}")
+            logging.info(f"Available split points: {self.client_split_points}")
+            
             # Look for a cloud model that matches this model_id
             for client_model_key in self.cloud_models:
-                if client_model_key.endswith(f"_{request.model_id}"):
+                logging.info(f"Checking if '{client_model_key}' starts with '{request.model_id}_split_'")
+                if client_model_key.startswith(f"{request.model_id}_split_"):
                     model = self.cloud_models[client_model_key]
-                    split_point = self.client_split_points[client_model_key]
+                    split_point = self.client_split_points.get(request.model_id)
                     cloud_model_found = True
                     logging.info(f"Using cloud model from key {client_model_key} with split point {split_point}")
                     break
@@ -179,7 +185,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             start_time = time.perf_counter()
             with torch.no_grad():
                 try:
-                    logging.info(f"Cloud model structure:\n{model}")
+                    # logging.info(f"Cloud model structure:\n{model}")
                     output_tensor = model(input_tensor)
                     
                 except Exception as e:
@@ -413,6 +419,11 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             # Store the cloud model for later inference
             cloud_key = f"{model_name}_split_{split_point}"
             self.cloud_models[cloud_key] = cloud_model
+            
+            logging.info(f"Stored cloud model with key: '{cloud_key}'")
+            logging.info(f"All cloud model keys now: {list(self.cloud_models.keys())}")
+            logging.info(f"Stored split point for '{model_name}': {split_point}")
+            logging.info(f"All split points now: {self.client_split_points}")
             
             logging.info(f"Created and stored cloud model for {model_name} at split point {split_point}")
             return dnn_inference_pb2.SplitConfigResponse(

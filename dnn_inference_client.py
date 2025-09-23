@@ -260,7 +260,13 @@ def run_distributed_inference(model_id: str, input_tensor: torch.Tensor,
             split_point = optimal_split
             logging.info(f"NeuroSurgeon optimal split point: {split_point}")
             logging.info(f"Predicted total time: {analysis['min_total_time']:.2f}ms")
-        dnn_surgery._send_split_decision_to_server(split_point=split_point, server_address=server_address)
+        else:
+            # Manual split point provided - send it to server
+            logging.info(f"Using manual split point: {split_point}")
+            success = dnn_surgery._send_split_decision_to_server(split_point, server_address)
+            if not success:
+                logging.error("Failed to send manual split decision to server")
+        
         # Set split point and get edge model
         dnn_surgery.splitter.set_split_point(split_point)
         edge_model = dnn_surgery.splitter.get_edge_model()

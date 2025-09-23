@@ -541,7 +541,7 @@ class DNNSurgery:
             response = stub.set_split_point(request)
             
             if response.success:
-                logger.info(f"Server accepted split configuration: {response.message}")
+                logger.info(f"Split configuration sent to server: {response.message}")
                 return True
             else:
                 logger.error(f"Server rejected split configuration: {response.message}")
@@ -694,7 +694,7 @@ class DNNSurgery:
         client_profile = dnn_inference_pb2.ClientProfile(
             model_name=self.model_name,
             layer_metrics=layer_metrics,
-            input_size=list(input_tensor.shape),
+            input_size=profile['input_size'],
             total_layers=len(layer_profiles)
         )
         

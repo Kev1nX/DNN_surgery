@@ -152,13 +152,13 @@ def test_connection(server_address: str) -> bool:
         logger.error(f"✗ Connection test failed: {str(e)}")
         return False
 
-def run_single_inference(server_address: str, model_name: str, split_point: int = None, 
+def run_single_inference(server_address: str, model_name, dnn_surgery: DNNSurgery, split_point: int = None, 
                         batch_size: int = 1) -> Tuple[torch.Tensor, Dict]:
     """Run a single inference with NeuroSurgeon optimization
     
     Args:
         server_address: Server address
-        model_name: Model name (must be 'resnet18' or 'alexnet' for ImageNet)
+        model_name: Model name
         split_point: Optional manual split point (if None, uses NeuroSurgeon optimization)
         batch_size: Batch size
         
@@ -172,9 +172,6 @@ def run_single_inference(server_address: str, model_name: str, split_point: int 
     # Create input - only uses ImageNet images
     input_tensor, true_labels, class_names = get_input_tensor(model_name, batch_size)
     
-    # Get model and set up DNN surgery
-    model = get_model(model_name)
-    dnn_surgery = DNNSurgery(model, model_name)
     
     if split_point is None:
         logger.info(f"Running NeuroSurgeon optimization for model={model_name}, batch_size={batch_size}")
@@ -308,7 +305,7 @@ def test_split_points(server_address: str, model_name: str, split_points: List[i
         
         for test_idx in range(num_tests):
             try:
-                result, timings = run_single_inference(server_address, model_name, split_point)
+                result, timings = run_single_inference(server_address, model_name, dnn_surgery, split_point)
                 timings_list.append(timings)
                 
                 total_time = timings.get('edge_time', 0) + timings.get('cloud_time', 0) + timings.get('transfer_time', 0)
@@ -488,9 +485,10 @@ def main():
             else:
                 split_point = None
                 logger.info(f"Running single inference with NeuroSurgeon optimization")
+            dnn_surgery = DNNSurgery(get_model(args.model), args.model)
             
             result, timings = run_single_inference(
-                args.server_address, args.model, split_point, args.batch_size
+                args.server_address, args.model, dnn_surgery, split_point, args.batch_size
             )
             
             total_time = timings.get('edge_time', 0) + timings.get('cloud_time', 0) + timings.get('transfer_time', 0)
