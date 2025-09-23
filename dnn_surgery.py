@@ -500,7 +500,7 @@ class DNNSurgery:
             )
             split_analysis[split_point] = timing
             
-            desc = f"Split after layer {split_point-1}"
+            desc = f"Split after layer {split_point}"
             
             total_transfer = timing['input_transfer_time'] + timing['output_transfer_time']
             
