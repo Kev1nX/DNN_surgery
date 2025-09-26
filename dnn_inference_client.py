@@ -1,13 +1,14 @@
 import grpc
 import logging
 import torch
-import io
 import time
 import uuid
 from typing import Dict, Optional, Tuple
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
+from config import GRPC_SETTINGS
 from dnn_surgery import DNNSurgery
+from grpc_utils import proto_to_tensor, tensor_to_proto
 
 # Configure logging
 logging.basicConfig(
@@ -20,11 +21,7 @@ class DNNInferenceClient:
     
     def __init__(self, server_address: str = 'localhost:50051', edge_model: Optional[torch.nn.Module] = None):
         # Configure gRPC options for larger messages (individual tensors)
-        max_message_size = 50 * 1024 * 1024  # 50MB
-        options = [
-            ('grpc.max_receive_message_length', max_message_size),
-            ('grpc.max_send_message_length', max_message_size),
-        ]
+        options = GRPC_SETTINGS.channel_options
         
         self.channel = grpc.insecure_channel(server_address, options=options)
         self.stub = dnn_inference_pb2_grpc.DNNInferenceStub(self.channel)
@@ -39,50 +36,7 @@ class DNNInferenceClient:
             logging.info(f"Initialized edge model: {type(edge_model).__name__}")
         
         logging.info(f"Client ID: {self.client_id}")
-        logging.info(f"Configured max gRPC message size: {max_message_size / (1024*1024):.0f}MB")
-        
-    def tensor_to_proto(self, tensor: torch.Tensor) -> dnn_inference_pb2.Tensor:
-        """Convert PyTorch tensor to protobuf message"""
-        try:
-            buffer = io.BytesIO()
-            torch.save(tensor, buffer)
-            tensor_bytes = buffer.getvalue()
-            
-            shape = dnn_inference_pb2.TensorShape(
-                dimensions=list(tensor.shape)
-            )
-            
-            logging.debug(f"Converting tensor of shape {tensor.shape} to proto message")
-            return dnn_inference_pb2.Tensor(
-                data=tensor_bytes,
-                shape=shape,
-                dtype=str(tensor.dtype),
-                requires_grad=tensor.requires_grad
-            )
-        except Exception as e:
-            logging.error(f"Failed to convert tensor to proto: {str(e)}")
-            raise
-        
-    def proto_to_tensor(self, proto: dnn_inference_pb2.Tensor) -> torch.Tensor:
-        """Convert protobuf message back to PyTorch tensor"""
-        try:
-            buffer = io.BytesIO(proto.data)
-            tensor = torch.load(buffer)
-            
-            # Verify received tensor
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError(f"Received data is not a tensor: {type(tensor)}")
-            if torch.isnan(tensor).any():
-                raise ValueError("Received tensor contains NaN values")
-            if torch.isinf(tensor).any():
-                raise ValueError("Received tensor contains infinite values")
-                
-            logging.debug(f"Converted proto message back to tensor of shape {tensor.shape}")
-            logging.debug(f"Tensor stats - Min: {tensor.min().item():.3f}, Max: {tensor.max().item():.3f}, Mean: {tensor.mean().item():.3f}")
-            return tensor
-        except Exception as e:
-            logging.error(f"Failed to convert proto back to tensor: {str(e)}")
-            raise
+        logging.info(f"Configured max gRPC message size: {GRPC_SETTINGS.max_message_mb}MB")
         
     def process_tensor(self, tensor: torch.Tensor, model_id: str, requires_cloud_processing: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Process tensor using edge model if available, then send to server for further processing
@@ -162,7 +116,7 @@ class DNNInferenceClient:
             
             # Measure cloud processing with transfer time
             request = dnn_inference_pb2.InferenceRequest(
-                tensor=self.tensor_to_proto(tensor),
+                tensor=tensor_to_proto(tensor, ensure_cpu=True),
                 model_id=model_id
             )
             
@@ -177,7 +131,11 @@ class DNNInferenceClient:
                 logging.error(f"Server processing failed: {response.error_message}")
                 raise RuntimeError(f"Server error: {response.error_message}")
             
-            result = self.proto_to_tensor(response.tensor)
+            result = proto_to_tensor(response.tensor)
+            if torch.isnan(result).any():
+                raise ValueError("Received tensor contains NaN values")
+            if torch.isinf(result).any():
+                raise ValueError("Received tensor contains infinite values")
             
             # Estimate transfer time (simplified: assume cloud processing is fast)
             # In a real implementation, you would separate this more carefully

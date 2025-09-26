@@ -9,6 +9,7 @@ from datetime import datetime
 import grpc
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
+from config import GRPC_SETTINGS
 
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
@@ -433,13 +434,9 @@ class DNNSurgery:
         """
         try:
             # Create gRPC channel with larger message size limits
-            max_message_size = 50 * 1024 * 1024  # 50MB
-            options = [
-                ('grpc.max_receive_message_length', max_message_size),
-                ('grpc.max_send_message_length', max_message_size),
-            ]
-            
-            channel = grpc.insecure_channel(server_address, options=options)
+            channel = grpc.insecure_channel(
+                server_address, options=GRPC_SETTINGS.channel_options
+            )
             stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
             
             # Create profiling request
@@ -534,13 +531,9 @@ class DNNSurgery:
         """
         try:
             # Create gRPC channel with larger message size limits
-            max_message_size = 50 * 1024 * 1024  # 50MB
-            options = [
-                ('grpc.max_receive_message_length', max_message_size),
-                ('grpc.max_send_message_length', max_message_size),
-            ]
-            
-            channel = grpc.insecure_channel(server_address, options=options)
+            channel = grpc.insecure_channel(
+                server_address, options=GRPC_SETTINGS.channel_options
+            )
             stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
             
             # Create split configuration request

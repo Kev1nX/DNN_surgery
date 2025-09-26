@@ -3,12 +3,13 @@ import logging
 from concurrent import futures
 import torch
 import torch.nn as nn
-import io
 import time
 from typing import Dict, Optional, List, Tuple
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
+from config import GRPC_SETTINGS
 from dnn_surgery import DNNSurgery, ModelSplitter, NetworkProfiler, LayerProfiler
+from grpc_utils import proto_to_tensor, tensor_to_proto
 
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
@@ -69,62 +70,6 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             logging.error(f"Failed to register model {model_id}: {str(e)}")
             raise
 
-    def tensor_to_proto(self, tensor: torch.Tensor) -> dnn_inference_pb2.Tensor:
-        """Convert PyTorch tensor to protobuf message
-        
-        Args:
-            tensor: PyTorch tensor to convert
-            
-        Returns:
-            Protobuf tensor message
-        """
-        try:
-            logging.debug(f"Converting tensor to proto - Shape: {tensor.shape}, Device: {tensor.device}, Dtype: {tensor.dtype}")
-            
-            # Move tensor to CPU for serialization
-            tensor = tensor.cpu()
-            
-            # Serialize tensor to bytes
-            buffer = io.BytesIO()
-            torch.save(tensor, buffer)
-            tensor_bytes = buffer.getvalue()
-            
-            # Create shape message
-            shape = dnn_inference_pb2.TensorShape(
-                dimensions=list(tensor.shape)
-            )
-            
-            # Create tensor message
-            proto = dnn_inference_pb2.Tensor(
-                data=tensor_bytes,
-                shape=shape,
-                dtype=str(tensor.dtype),
-                requires_grad=tensor.requires_grad
-            )
-            
-            logging.debug(f"Successfully converted tensor to proto message of size {len(tensor_bytes)} bytes")
-            return proto
-            
-        except Exception as e:
-            logging.error(f"Failed to convert tensor to proto: {str(e)}")
-            raise
-        
-    def proto_to_tensor(self, proto: dnn_inference_pb2.Tensor) -> torch.Tensor:
-        """Convert protobuf message back to PyTorch tensor
-        
-        Args:
-            proto: Protobuf tensor message
-            
-        Returns:
-            PyTorch tensor
-        """
-        # Deserialize tensor
-        buffer = io.BytesIO(proto.data)
-        tensor = torch.load(buffer)
-        
-        # Move to correct device
-        return tensor.to(self.device)
-        
     def ProcessTensor(self, request: dnn_inference_pb2.InferenceRequest, 
                      context: grpc.ServicerContext) -> dnn_inference_pb2.InferenceResponse:
         """Process a tensor using the specified model with timing
@@ -174,7 +119,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 )
                 
             # Convert proto to tensor
-            input_tensor = self.proto_to_tensor(request.tensor)
+            input_tensor = proto_to_tensor(request.tensor, device=self.device)
             
             # Log input tensor stats
             logging.info("=== Cloud Model Processing ===")
@@ -212,7 +157,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 logging.info(f"Prediction confidence: {max_prob.item():.3f}, Predicted class: {pred.item()}")
                 
             # Convert result back to proto
-            response_tensor = self.tensor_to_proto(output_tensor)
+            response_tensor = tensor_to_proto(output_tensor, ensure_cpu=True)
             
             return dnn_inference_pb2.InferenceResponse(
                 tensor=response_tensor,
@@ -452,13 +397,7 @@ def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInf
         Tuple of (server, servicer)
     """
     # Configure gRPC options for larger messages (individual tensors, not full batches)
-    # 50MB should be sufficient for individual ImageNet tensors with intermediate activations
-    max_message_size = 50 * 1024 * 1024  # 50MB
-    
-    options = [
-        ('grpc.max_receive_message_length', max_message_size),
-        ('grpc.max_send_message_length', max_message_size),
-    ]
+    options = GRPC_SETTINGS.channel_options
     
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers), options=options)
     servicer = DNNInferenceServicer()
@@ -468,7 +407,9 @@ def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInf
     server.add_insecure_port(server_addr)
     server.start()
     
-    logging.info(f"DNN Inference Server started on port {port} with max message size: {max_message_size / (1024*1024):.0f}MB")
+    logging.info(
+        f"DNN Inference Server started on port {port} with max message size: {GRPC_SETTINGS.max_message_mb}MB"
+    )
     return server, servicer
 
 
