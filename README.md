@@ -68,6 +68,8 @@ DNN_surgery/
 ├── dnn_surgery.py           # Main consolidated system
 ├── server.py               # gRPC server implementation
 ├── dnn_inference_client.py # gRPC client implementation
+├── config.py               # Shared configuration (e.g., gRPC sizing)
+├── grpc_utils.py           # Tensor serialization helpers for gRPC
 ├── rpi_profiler.py         # Raspberry Pi hardware profiling
 ├── networks/               # Model architectures
 │   ├── resnet18.py

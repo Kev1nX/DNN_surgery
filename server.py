@@ -82,34 +82,44 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             Inference response with processed tensor
         """
         try:
-            # For inference, use the model_id to find the appropriate cloud model
-            # Since there's typically one client per model, we can use just the model_id
-            cloud_model_found = False
             model = None
-            split_point = None
-            
-            # Debug: Log what we're looking for and what we have
+            split_point = self.client_split_points.get(request.model_id)
             logging.info(f"Looking for cloud model for request.model_id: '{request.model_id}'")
-            logging.info(f"Available cloud model keys: {list(self.cloud_models.keys())}")
-            logging.info(f"Available split points: {self.client_split_points}")
-            
-            # Look for a cloud model that matches this model_id
-            for client_model_key in self.cloud_models:
-                logging.info(f"Checking if '{client_model_key}' starts with '{request.model_id}_split_'")
-                if client_model_key.startswith(f"{request.model_id}_split_"):
-                    model = self.cloud_models[client_model_key]
-                    split_point = self.client_split_points.get(request.model_id)
-                    cloud_model_found = True
-                    logging.info(f"Using cloud model from key {client_model_key} with split point {split_point}")
-                    break
-            
-            if not cloud_model_found:
-                # Fallback: use full model (this shouldn't happen in distributed inference)
-                model = self.models.get(request.model_id)
-                logging.warning(f"No cloud model found for {request.model_id}, using full model")
-                
+            logging.info(f"Stored split points: {self.client_split_points}")
+            if split_point is not None:
+                cloud_key = f"{request.model_id}_split_{split_point}"
+                model = self.cloud_models.get(cloud_key)
+                if model is not None:
+                    logging.info(f"Using cached cloud model for key '{cloud_key}'")
+                else:
+                    logging.info(f"Cloud model '{cloud_key}' missing. Rebuilding from base model.")
+                    base_model = self.models.get(request.model_id)
+                    if base_model is None:
+                        error_msg = f"Base model {request.model_id} not registered"
+                        logging.error(error_msg)
+                        context.set_code(grpc.StatusCode.NOT_FOUND)
+                        context.set_details(error_msg)
+                        return dnn_inference_pb2.InferenceResponse(
+                            success=False,
+                            error_message=error_msg
+                        )
+                    splitter = ModelSplitter(base_model, request.model_id)
+                    splitter.set_split_point(split_point)
+                    model = splitter.get_cloud_model()
+                    if model is None:
+                        logging.warning(
+                            "Split point %s results in no cloud model for %s; using full model",
+                            split_point,
+                            request.model_id,
+                        )
+                        model = base_model
+                    else:
+                        model = model.to(self.device)
+                        self.cloud_models[cloud_key] = model
+                        logging.info(f"Recreated and cached cloud model under key '{cloud_key}'")
+
             if model is None:
-                error_msg = f'Model {request.model_id} not found'
+                error_msg = f"Model {request.model_id} not found"
                 logging.error(error_msg)
                 context.set_code(grpc.StatusCode.NOT_FOUND)
                 context.set_details(error_msg)
@@ -345,8 +355,18 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             
             logging.info(f"Received split point decision: split_point={split_point} for model {model_name}")
             
+            original_model = self.models.get(model_name)
+            if original_model is None:
+                error_msg = f"Model {model_name} not registered on server"
+                logging.error(error_msg)
+                context.set_code(grpc.StatusCode.NOT_FOUND)
+                context.set_details(error_msg)
+                return dnn_inference_pb2.SplitConfigResponse(
+                    success=False,
+                    message=error_msg
+                )
+
             # Create a DNN Surgery instance for this model and split point
-            original_model = self.models[model_name]
             splitter = ModelSplitter(original_model, model_name)
             splitter.set_split_point(split_point)
             cloud_model = splitter.get_cloud_model()
@@ -356,6 +376,9 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             
             if cloud_model is None:
                 logging.info(f"Split point {split_point} results in full edge execution for {model_name}")
+                # Remove any cached cloud model for this configuration
+                cloud_key = f"{model_name}_split_{split_point}"
+                self.cloud_models.pop(cloud_key, None)
                 return dnn_inference_pb2.SplitConfigResponse(
                     success=True,
                     message=f"Split point {split_point} configured for full edge execution of {model_name}"
@@ -363,7 +386,13 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             
             # Store the cloud model for later inference
             cloud_key = f"{model_name}_split_{split_point}"
-            self.cloud_models[cloud_key] = cloud_model
+            self.cloud_models[cloud_key] = cloud_model.to(self.device)
+
+            # Remove stale cloud models for the same base model
+            for key in list(self.cloud_models.keys()):
+                if key.startswith(f"{model_name}_split_") and key != cloud_key:
+                    logging.info(f"Removing stale cloud model entry '{key}'")
+                    self.cloud_models.pop(key, None)
             
             logging.info(f"Stored cloud model with key: '{cloud_key}'")
             logging.info(f"All cloud model keys now: {list(self.cloud_models.keys())}")
