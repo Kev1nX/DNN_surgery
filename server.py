@@ -451,7 +451,16 @@ def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInf
     Returns:
         Tuple of (server, servicer)
     """
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
+    # Configure gRPC options for larger messages (individual tensors, not full batches)
+    # 50MB should be sufficient for individual ImageNet tensors with intermediate activations
+    max_message_size = 50 * 1024 * 1024  # 50MB
+    
+    options = [
+        ('grpc.max_receive_message_length', max_message_size),
+        ('grpc.max_send_message_length', max_message_size),
+    ]
+    
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers), options=options)
     servicer = DNNInferenceServicer()
     dnn_inference_pb2_grpc.add_DNNInferenceServicer_to_server(servicer, server)
     
@@ -459,7 +468,7 @@ def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInf
     server.add_insecure_port(server_addr)
     server.start()
     
-    logging.info(f"DNN Inference Server started on port {port}")
+    logging.info(f"DNN Inference Server started on port {port} with max message size: {max_message_size / (1024*1024):.0f}MB")
     return server, servicer
 
 

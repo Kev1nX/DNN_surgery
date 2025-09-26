@@ -19,7 +19,14 @@ class DNNInferenceClient:
     """Client for the DNNInference service with edge computing capability and profiling."""
     
     def __init__(self, server_address: str = 'localhost:50051', edge_model: Optional[torch.nn.Module] = None):
-        self.channel = grpc.insecure_channel(server_address)
+        # Configure gRPC options for larger messages (individual tensors)
+        max_message_size = 50 * 1024 * 1024  # 50MB
+        options = [
+            ('grpc.max_receive_message_length', max_message_size),
+            ('grpc.max_send_message_length', max_message_size),
+        ]
+        
+        self.channel = grpc.insecure_channel(server_address, options=options)
         self.stub = dnn_inference_pb2_grpc.DNNInferenceStub(self.channel)
         self.edge_model = edge_model
         self.client_id = str(uuid.uuid4())
@@ -32,6 +39,7 @@ class DNNInferenceClient:
             logging.info(f"Initialized edge model: {type(edge_model).__name__}")
         
         logging.info(f"Client ID: {self.client_id}")
+        logging.info(f"Configured max gRPC message size: {max_message_size / (1024*1024):.0f}MB")
         
     def tensor_to_proto(self, tensor: torch.Tensor) -> dnn_inference_pb2.Tensor:
         """Convert PyTorch tensor to protobuf message"""
@@ -79,15 +87,39 @@ class DNNInferenceClient:
     def process_tensor(self, tensor: torch.Tensor, model_id: str, requires_cloud_processing: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Process tensor using edge model if available, then send to server for further processing
         
+        Automatically handles batched tensors by separating them into individual samples
+        to avoid gRPC message size limits.
+        
         Args:
-            tensor: Input tensor to process
+            tensor: Input tensor to process (can be batched)
             model_id: Model identifier
             requires_cloud_processing: Whether cloud processing is needed (False for all-edge inference)
             
         Returns:
             Tuple of (result tensor, timing dictionary)
         """
-        logging.info(f"Processing tensor of shape {tensor.shape} with model {model_id}")
+        batch_size = tensor.shape[0]
+        
+        if batch_size == 1:
+            # Single tensor - process normally
+            return self._process_single_tensor(tensor, model_id, requires_cloud_processing)
+        else:
+            # Batched tensor - separate into individual samples
+            logging.info(f"Processing batched tensor of shape {tensor.shape} (batch_size={batch_size}) with model {model_id}")
+            return self._process_batched_tensor(tensor, model_id, requires_cloud_processing)
+    
+    def _process_single_tensor(self, tensor: torch.Tensor, model_id: str, requires_cloud_processing: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Process a single tensor (batch_size=1)
+        
+        Args:
+            tensor: Input tensor to process (batch_size=1)
+            model_id: Model identifier
+            requires_cloud_processing: Whether cloud processing is needed (False for all-edge inference)
+            
+        Returns:
+            Tuple of (result tensor, timing dictionary)
+        """
+        logging.info(f"Processing single tensor of shape {tensor.shape} with model {model_id}")
         timings = {'edge_time': 0.0, 'transfer_time': 0.0, 'cloud_time': 0.0}
         
         try:
@@ -178,6 +210,49 @@ class DNNInferenceClient:
         except Exception as e:
             logging.error(f"Error processing tensor: {str(e)}")
             raise
+        
+    def _process_batched_tensor(self, tensor: torch.Tensor, model_id: str, requires_cloud_processing: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Process a batched tensor by separating into individual samples
+        
+        Args:
+            tensor: Input batched tensor to process
+            model_id: Model identifier
+            requires_cloud_processing: Whether cloud processing is needed
+            
+        Returns:
+            Tuple of (batched result tensor, aggregated timing dictionary)
+        """
+        batch_size = tensor.shape[0]
+        logging.info(f"Separating batch of {batch_size} samples for individual processing")
+        
+        # Initialize aggregated timings
+        aggregated_timings = {'edge_time': 0.0, 'transfer_time': 0.0, 'cloud_time': 0.0}
+        individual_results = []
+        
+        # Process each sample individually
+        for i in range(batch_size):
+            sample_tensor = tensor[i:i+1]  # Keep batch dimension but size 1
+            logging.info(f"Processing sample {i+1}/{batch_size} with shape {sample_tensor.shape}")
+            
+            result, timings = self._process_single_tensor(sample_tensor, model_id, requires_cloud_processing)
+            individual_results.append(result)
+            
+            # Aggregate timings
+            for key in aggregated_timings:
+                aggregated_timings[key] += timings.get(key, 0.0)
+        
+        # Concatenate results back into batch format
+        batched_result = torch.cat(individual_results, dim=0)
+        
+        # Calculate average timings per sample
+        avg_timings = {key: value / batch_size for key, value in aggregated_timings.items()}
+        avg_timings['total_batch_processing_time'] = sum(aggregated_timings.values())
+        avg_timings['batch_size'] = batch_size
+        
+        logging.info(f"Batch processing completed. Total time: {avg_timings['total_batch_processing_time']:.2f}ms, "
+                    f"Average per sample: {avg_timings['total_batch_processing_time']/batch_size:.2f}ms")
+        
+        return batched_result, avg_timings
     
     def send_profiling_data(self, dnn_surgery: DNNSurgery, input_tensor: torch.Tensor) -> bool:
         """Send profiling data to server

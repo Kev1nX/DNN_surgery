@@ -432,8 +432,14 @@ class DNNSurgery:
             List of server layer profiles, or None if failed
         """
         try:
-            # Create gRPC channel
-            channel = grpc.insecure_channel(server_address)
+            # Create gRPC channel with larger message size limits
+            max_message_size = 50 * 1024 * 1024  # 50MB
+            options = [
+                ('grpc.max_receive_message_length', max_message_size),
+                ('grpc.max_send_message_length', max_message_size),
+            ]
+            
+            channel = grpc.insecure_channel(server_address, options=options)
             stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
             
             # Create profiling request
@@ -527,8 +533,14 @@ class DNNSurgery:
             True if successful, False otherwise
         """
         try:
-            # Create gRPC channel
-            channel = grpc.insecure_channel(server_address)
+            # Create gRPC channel with larger message size limits
+            max_message_size = 50 * 1024 * 1024  # 50MB
+            options = [
+                ('grpc.max_receive_message_length', max_message_size),
+                ('grpc.max_send_message_length', max_message_size),
+            ]
+            
+            channel = grpc.insecure_channel(server_address, options=options)
             stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
             
             # Create split configuration request
