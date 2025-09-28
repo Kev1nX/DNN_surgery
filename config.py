@@ -14,9 +14,13 @@ class GrpcSettings:
         max_message_mb: Maximum message size in MiB allowed for both sending and
             receiving. Defaults to 50MB which safely covers ImageNet tensors and
             intermediate activations.
+        max_concurrent_rpcs: Number of simultaneous inference RPCs the client
+            should keep in flight. Keep this at or below the server's
+            ``max_workers`` value to avoid queue backpressure.
     """
 
-    max_message_mb: int = 10
+    max_message_mb: int = 50
+    max_concurrent_rpcs: int = 4
 
     @property
     def max_message_bytes(self) -> int:

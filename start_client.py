@@ -65,8 +65,10 @@ def get_input_tensor(model_name: str, batch_size: int = 1) -> Tuple[torch.Tensor
     global _dataset_iterator, _class_mapping
     
     # Only support pretrained ImageNet models
-    if model_name not in ['resnet18', 'alexnet']:
-        raise RuntimeError(f"Model '{model_name}' is not supported. Please use 'resnet18' or 'alexnet'.")
+    if model_name not in ['resnet18', 'alexnet', 'yolov5s']:
+        raise RuntimeError(
+            f"Model '{model_name}' is not supported. Please use 'resnet18', 'alexnet', or 'yolov5s'."
+        )
     
     # Initialize dataset loader if not already done
     if _dataset_loader is None:
@@ -128,12 +130,17 @@ def get_model(model_name: str):
         model = models.resnet18(pretrained=True)
         model.eval()
         return model
-    elif model_name == 'alexnet':
+    if model_name == 'alexnet':
         model = models.alexnet(pretrained=True)
         model.eval()
         return model
-    else:
-        raise ValueError(f"Unknown model: {model_name}. Only 'resnet18' and 'alexnet' are supported.")
+    if model_name == 'yolov5s':
+        model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, autoshape=False)
+        model.eval()
+        return model
+    raise ValueError(
+        f"Unknown model: {model_name}. Supported models are 'resnet18', 'alexnet', and 'yolov5s'."
+    )
 
 def test_connection(server_address: str) -> bool:
     """Test if server is reachable"""
@@ -198,8 +205,10 @@ def run_batch_processing(server_address: str, model_name: str, split_point: int 
     """Run multiple batches and collect timing statistics"""
     
     # Ensure model is supported
-    if model_name not in ['resnet18', 'alexnet']:
-        raise RuntimeError(f"Model '{model_name}' is not supported. Please use 'resnet18' or 'alexnet'.")
+    if model_name not in ['resnet18', 'alexnet', 'yolov5s']:
+        raise RuntimeError(
+            f"Model '{model_name}' is not supported. Please use 'resnet18', 'alexnet', or 'yolov5s'."
+        )
     
     # Initialize dataset
     initialize_dataset_loader(batch_size)
@@ -280,8 +289,10 @@ def test_split_points(server_address: str, model_name: str, split_points: List[i
     """Test different split points and return performance comparison"""
     
     # Ensure model is supported
-    if model_name not in ['resnet18', 'alexnet']:
-        raise RuntimeError(f"Model '{model_name}' is not supported. Please use 'resnet18' or 'alexnet'.")
+    if model_name not in ['resnet18', 'alexnet', 'yolov5s']:
+        raise RuntimeError(
+            f"Model '{model_name}' is not supported. Please use 'resnet18', 'alexnet', or 'yolov5s'."
+        )
     
     # Initialize dataset
     initialize_dataset_loader(1)  # Use batch size 1 for testing
@@ -392,8 +403,12 @@ def main():
     parser = argparse.ArgumentParser(description='DNN Surgery Client')
     parser.add_argument('--server-address', required=True,
                        help='Server address in format HOST:PORT (e.g., 192.168.1.100:50051)')
-    parser.add_argument('--model', choices=['resnet18', 'alexnet'], default='resnet18',
-                       help='Model to use for inference (default: resnet18) - only ImageNet-compatible models')
+    parser.add_argument(
+        '--model',
+        choices=['resnet18', 'alexnet', 'yolov5s'],
+        default='resnet18',
+        help='Model to use for inference (default: resnet18). Supported: resnet18, alexnet, yolov5s',
+    )
     parser.add_argument('--split-point', type=int, default=None,
                        help='Split point for model partitioning (default: None - use NeuroSurgeon optimization)')
     parser.add_argument('--batch-size', type=int, default=1,

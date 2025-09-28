@@ -3,7 +3,8 @@ import logging
 import torch
 import time
 import uuid
-from typing import Dict, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
@@ -19,7 +20,12 @@ logging.basicConfig(
 class DNNInferenceClient:
     """Client for the DNNInference service with edge computing capability and profiling."""
     
-    def __init__(self, server_address: str = 'localhost:50051', edge_model: Optional[torch.nn.Module] = None):
+    def __init__(
+        self,
+        server_address: str = 'localhost:50051',
+        edge_model: Optional[torch.nn.Module] = None,
+        max_inflight_requests: Optional[int] = None,
+    ):
         # Configure gRPC options for larger messages (individual tensors)
         options = GRPC_SETTINGS.channel_options
         
@@ -30,6 +36,9 @@ class DNNInferenceClient:
         self.transfer_times = []
         self.edge_times = []
         self.cloud_times = []
+        self.max_inflight_requests = (
+            max_inflight_requests if max_inflight_requests is not None else GRPC_SETTINGS.max_concurrent_rpcs
+        )
         
         if self.edge_model is not None:
             self.edge_model.eval()  # Ensure model is in evaluation mode
@@ -37,179 +46,142 @@ class DNNInferenceClient:
         
         logging.info(f"Client ID: {self.client_id}")
         logging.info(f"Configured max gRPC message size: {GRPC_SETTINGS.max_message_mb}MB")
+        logging.info(f"Max in-flight RPCs: {self.max_inflight_requests}")
         
     def process_tensor(self, tensor: torch.Tensor, model_id: str, requires_cloud_processing: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Process tensor using edge model if available, then send to server for further processing
-        
-        Automatically handles batched tensors by separating them into individual samples
-        to avoid gRPC message size limits.
-        
-        Args:
-            tensor: Input tensor to process (can be batched)
-            model_id: Model identifier
-            requires_cloud_processing: Whether cloud processing is needed (False for all-edge inference)
-            
-        Returns:
-            Tuple of (result tensor, timing dictionary)
-        """
+        """Process one or more tensors with optional edge/cloud pipelining."""
         batch_size = tensor.shape[0]
-        
-        if batch_size == 1:
-            # Single tensor - process normally
-            return self._process_single_tensor(tensor, model_id, requires_cloud_processing)
-        else:
-            # Batched tensor - separate into individual samples
-            logging.info(f"Processing batched tensor of shape {tensor.shape} (batch_size={batch_size}) with model {model_id}")
-            return self._process_batched_tensor(tensor, model_id, requires_cloud_processing)
-    
-    def _process_single_tensor(self, tensor: torch.Tensor, model_id: str, requires_cloud_processing: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Process a single tensor (batch_size=1)
-        
-        Args:
-            tensor: Input tensor to process (batch_size=1)
-            model_id: Model identifier
-            requires_cloud_processing: Whether cloud processing is needed (False for all-edge inference)
-            
-        Returns:
-            Tuple of (result tensor, timing dictionary)
-        """
-        logging.info(f"Processing single tensor of shape {tensor.shape} with model {model_id}")
-        timings = {'edge_time': 0.0, 'transfer_time': 0.0, 'cloud_time': 0.0}
-        
-        try:
-            # Log input tensor stats
-            logging.info(f"Input tensor stats - Min: {tensor.min().item():.3f}, Max: {tensor.max().item():.3f}, Mean: {tensor.mean().item():.3f}")
-            
-            # Run edge inference if available
-            if self.edge_model is not None:
-                logging.info("=== Edge Model Processing ===")
-                # logging.info(f"Edge model structure:\n{self.edge_model}")
-                
-                start_time = time.perf_counter()
-                with torch.no_grad():
-                    tensor = self.edge_model(tensor)
-                end_time = time.perf_counter()
-                
-                edge_time = (end_time - start_time) * 1000  # ms
-                timings['edge_time'] = edge_time
-                self.edge_times.append(edge_time)
-                
-                logging.info(f"Edge inference completed in {edge_time:.2f}ms")
-                logging.info(f"Intermediate tensor shape: {tensor.shape}")
-                logging.info(f"Intermediate tensor stats - Min: {tensor.min().item():.3f}, Max: {tensor.max().item():.3f}, Mean: {tensor.mean().item():.3f}")
-            
-            # Check if cloud processing is required
-            if not requires_cloud_processing:
-                # All inference is done on client side - return edge model result
-                logging.info("All inference completed on client side - no server communication needed")
-                result = tensor
-                
-                # Log output tensor stats
-                logging.info(f"Output tensor stats - Shape: {result.shape}")
-                if result.dim() == 2:  # For classification outputs
-                    probs = torch.softmax(result, dim=1)
-                    max_prob, pred = probs.max(1)
-                    logging.info(f"Prediction confidence: {max_prob.item():.3f}, Predicted class: {pred.item()}")
-                    
-                logging.info(f"Successfully processed tensor with model {model_id} (client-only)")
-                return result, timings
-            
-            # Measure cloud processing with transfer time
-            request = dnn_inference_pb2.InferenceRequest(
-                tensor=tensor_to_proto(tensor, ensure_cpu=True),
-                model_id=model_id
+        is_batch = batch_size > 1
+
+        aggregated_timings = {'edge_time': 0.0, 'transfer_time': 0.0, 'cloud_time': 0.0}
+        results: List[Optional[torch.Tensor]] = [None] * batch_size
+        pending_requests: Deque[Tuple[int, grpc.Future, float, Dict[str, float]]] = deque()
+        max_concurrency = max(1, min(batch_size, self.max_inflight_requests))
+
+        if is_batch:
+            logging.info(
+                f"Processing batched tensor of shape {tensor.shape} (batch_size={batch_size}) with model {model_id}"
             )
-            
-            # Measure total round-trip time
-            start_time = time.perf_counter()
-            response = self.stub.ProcessTensor(request)
-            end_time = time.perf_counter()
-            
-            total_time = (end_time - start_time) * 1000  # ms
-            
+
+        def _finalize_request(idx: int, future: grpc.Future, send_time: float, sample_metrics: Dict[str, float]) -> None:
+            try:
+                response = future.result()
+            except grpc.RpcError as rpc_error:
+                logging.error(f"gRPC error: {rpc_error.code()}: {rpc_error.details()}")
+                raise
+
+            recv_time = time.perf_counter()
+            total_time = (recv_time - send_time) * 1000  # ms
+
             if not response.success:
                 logging.error(f"Server processing failed: {response.error_message}")
                 raise RuntimeError(f"Server error: {response.error_message}")
-            
-            result = proto_to_tensor(response.tensor)
-            if torch.isnan(result).any():
+
+            result_tensor = proto_to_tensor(response.tensor)
+            if torch.isnan(result_tensor).any():
                 raise ValueError("Received tensor contains NaN values")
-            if torch.isinf(result).any():
+            if torch.isinf(result_tensor).any():
                 raise ValueError("Received tensor contains infinite values")
-            
-            # Estimate transfer time (simplified: assume cloud processing is fast)
-            # In a real implementation, you would separate this more carefully
-            transfer_time = total_time * 0.2  # Rough estimate: 20% transfer, 80% compute
+
+            transfer_time = total_time * 0.2
             cloud_time = total_time - transfer_time
-            
-            timings['transfer_time'] = transfer_time
-            timings['cloud_time'] = cloud_time
-            
+
+            sample_metrics['transfer_time'] = transfer_time
+            sample_metrics['cloud_time'] = cloud_time
+
+            aggregated_timings['transfer_time'] += transfer_time
+            aggregated_timings['cloud_time'] += cloud_time
+
             self.transfer_times.append(transfer_time)
             self.cloud_times.append(cloud_time)
-            
+
             logging.info(f"Cloud processing time: {cloud_time:.2f}ms")
             logging.info(f"Transfer time: {transfer_time:.2f}ms")
             logging.info(f"Total time: {total_time:.2f}ms")
-            
-            # Log output tensor stats
-            logging.info(f"Output tensor stats - Shape: {result.shape}")
-            if result.dim() == 2:  # For classification outputs
-                probs = torch.softmax(result, dim=1)
+            logging.info(f"Output tensor stats - Shape: {result_tensor.shape}")
+
+            if result_tensor.dim() == 2:
+                probs = torch.softmax(result_tensor, dim=1)
                 max_prob, pred = probs.max(1)
-                logging.info(f"Prediction confidence: {max_prob.item():.3f}, Predicted class: {pred.item()}")
-                
-            logging.info(f"Successfully processed tensor with model {model_id}")
-            return result, timings
-            
-        except grpc.RpcError as rpc_error:
-            logging.error(f"gRPC error: {rpc_error.code()}: {rpc_error.details()}")
+                logging.info(
+                    f"Prediction confidence: {max_prob.item():.3f}, Predicted class: {pred.item()}"
+                )
+
+            logging.info(f"Successfully processed tensor {idx + 1}/{batch_size} with model {model_id}")
+            results[idx] = result_tensor
+
+        try:
+            for idx in range(batch_size):
+                sample = tensor if not is_batch else tensor[idx:idx + 1]
+                sample_metrics = {'edge_time': 0.0, 'transfer_time': 0.0, 'cloud_time': 0.0}
+
+                logging.info(f"Processing sample {idx + 1}/{batch_size} with shape {sample.shape}")
+                logging.info(
+                    f"Input tensor stats - Min: {sample.min().item():.3f}, Max: {sample.max().item():.3f}, "
+                    f"Mean: {sample.mean().item():.3f}"
+                )
+
+                # Stage S1: edge inference
+                if self.edge_model is not None:
+                    logging.info("=== Edge Model Processing ===")
+                    edge_start = time.perf_counter()
+                    with torch.no_grad():
+                        sample = self.edge_model(sample)
+                    edge_end = time.perf_counter()
+
+                    edge_time = (edge_end - edge_start) * 1000  # ms
+                    sample_metrics['edge_time'] = edge_time
+                    aggregated_timings['edge_time'] += edge_time
+                    self.edge_times.append(edge_time)
+
+                    logging.info(f"Edge inference completed in {edge_time:.2f}ms")
+                    logging.info(f"Intermediate tensor shape: {sample.shape}")
+                    logging.info(
+                        f"Intermediate tensor stats - Min: {sample.min().item():.3f}, "
+                        f"Max: {sample.max().item():.3f}, Mean: {sample.mean().item():.3f}"
+                    )
+
+                if not requires_cloud_processing:
+                    results[idx] = sample
+                    continue
+
+                # Stage S2: async transfer + cloud inference
+                request = dnn_inference_pb2.InferenceRequest(
+                    tensor=tensor_to_proto(sample, ensure_cpu=True),
+                    model_id=model_id
+                )
+
+                send_time = time.perf_counter()
+                future = self.stub.ProcessTensor.future(request)
+                pending_requests.append((idx, future, send_time, sample_metrics))
+
+                if len(pending_requests) >= max_concurrency:
+                    idx_r, future_r, send_time_r, metrics_r = pending_requests.popleft()
+                    _finalize_request(idx_r, future_r, send_time_r, metrics_r)
+
+            # Drain any remaining in-flight requests
+            while pending_requests:
+                idx_r, future_r, send_time_r, metrics_r = pending_requests.popleft()
+                _finalize_request(idx_r, future_r, send_time_r, metrics_r)
+
+        except Exception as exc:
+            logging.error(f"Error processing tensor(s): {exc}")
             raise
-        except Exception as e:
-            logging.error(f"Error processing tensor: {str(e)}")
-            raise
-        
-    def _process_batched_tensor(self, tensor: torch.Tensor, model_id: str, requires_cloud_processing: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Process a batched tensor by separating into individual samples
-        
-        Args:
-            tensor: Input batched tensor to process
-            model_id: Model identifier
-            requires_cloud_processing: Whether cloud processing is needed
-            
-        Returns:
-            Tuple of (batched result tensor, aggregated timing dictionary)
-        """
-        batch_size = tensor.shape[0]
-        logging.info(f"Separating batch of {batch_size} samples for individual processing")
-        
-        # Initialize aggregated timings
-        aggregated_timings = {'edge_time': 0.0, 'transfer_time': 0.0, 'cloud_time': 0.0}
-        individual_results = []
-        
-        # Process each sample individually
-        for i in range(batch_size):
-            sample_tensor = tensor[i:i+1]  # Keep batch dimension but size 1
-            logging.info(f"Processing sample {i+1}/{batch_size} with shape {sample_tensor.shape}")
-            
-            result, timings = self._process_single_tensor(sample_tensor, model_id, requires_cloud_processing)
-            individual_results.append(result)
-            
-            # Aggregate timings
-            for key in aggregated_timings:
-                aggregated_timings[key] += timings.get(key, 0.0)
-        
-        # Concatenate results back into batch format
-        batched_result = torch.cat(individual_results, dim=0)
-        
-        # Calculate average timings per sample
-        avg_timings = {key: value / batch_size for key, value in aggregated_timings.items()}
+
+        if not is_batch:
+            return results[0], aggregated_timings
+
+        # Aggregate and average for batch response
+        batched_result = torch.cat(results, dim=0)  # type: ignore[arg-type]
+        avg_timings = {key: (value / batch_size) for key, value in aggregated_timings.items()}
         avg_timings['total_batch_processing_time'] = sum(aggregated_timings.values())
         avg_timings['batch_size'] = batch_size
-        
-        logging.info(f"Batch processing completed. Total time: {avg_timings['total_batch_processing_time']:.2f}ms, "
-                    f"Average per sample: {avg_timings['total_batch_processing_time']/batch_size:.2f}ms")
-        
+
+        logging.info(
+            f"Batch processing completed. Total time: {avg_timings['total_batch_processing_time']:.2f}ms, "
+            f"Average per sample: {avg_timings['total_batch_processing_time']/batch_size:.2f}ms"
+        )
+
         return batched_result, avg_timings
     
     def send_profiling_data(self, dnn_surgery: DNNSurgery, input_tensor: torch.Tensor) -> bool:
