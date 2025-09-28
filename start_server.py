@@ -18,6 +18,7 @@ import signal
 import sys
 import torch
 import torchvision.models as models
+from torchvision.models import AlexNet_Weights, ResNet18_Weights
 from server import serve
 
 # Configure logging
@@ -73,18 +74,18 @@ def main():
         for model_name in models_to_register:
             try:
                 if model_name == 'resnet18':
-                    model = models.resnet18(pretrained=True)
+                    model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
                     model.eval()
                     servicer.register_model('resnet18', model)
                     logger.info("ResNet18 (pretrained) registered successfully")
                     
                 elif model_name == 'alexnet':
-                    model = models.alexnet(pretrained=True)
+                    model = models.alexnet(weights=AlexNet_Weights.DEFAULT)
                     model.eval()
                     servicer.register_model('alexnet', model)
                     logger.info("AlexNet (pretrained) registered successfully")
                 elif model_name == 'yolov5s':
-                    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, autoshape=False)
+                    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
                     model.eval()
                     servicer.register_model('yolov5s', model)
                     logger.info("YOLOv5s (pretrained) registered successfully")

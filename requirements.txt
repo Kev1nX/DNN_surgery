@@ -45,7 +45,9 @@ fsspec==2025.7.0
 gitdb==4.0.12
     # via gitpython
 gitpython==3.1.45
-    # via yolov5
+    # via
+    #   -r ./requirements.in
+    #   yolov5
 grpcio==1.73.0
     # via
     #   -r ./requirements.in
@@ -169,6 +171,7 @@ pyyaml==6.0.3
     #   yolov5
 requests==2.32.5
     # via
+    #   -r ./requirements.in
     #   huggingface-hub
     #   requests-toolbelt
     #   roboflow
@@ -191,6 +194,7 @@ seaborn==0.13.2
     # via yolov5
 setuptools==80.9.0
     # via
+    #   -r ./requirements.in
     #   grpcio-tools
     #   tensorboard
     #   yolov5
@@ -232,6 +236,7 @@ torchvision==0.22.1+cu118
     #   yolov5
 tqdm==4.67.1
     # via
+    #   -r ./requirements.in
     #   huggingface-hub
     #   roboflow
     #   sahi

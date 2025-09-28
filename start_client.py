@@ -12,6 +12,7 @@ import random
 from dnn_inference_client import DNNInferenceClient, run_distributed_inference
 from dnn_surgery import DNNSurgery
 import torchvision.models as models
+from torchvision.models import AlexNet_Weights, ResNet18_Weights
 from dataset.imagenet_loader import ImageNetMiniLoader
 
 # Configure logging
@@ -127,11 +128,11 @@ def create_sample_input(model_name: str, batch_size: int = 1) -> torch.Tensor:
 def get_model(model_name: str):
     """Get model instance by name"""
     if model_name == 'resnet18':
-        model = models.resnet18(pretrained=True)
+        model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
         model.eval()
         return model
     if model_name == 'alexnet':
-        model = models.alexnet(pretrained=True)
+        model = models.alexnet(weights=AlexNet_Weights.DEFAULT)
         model.eval()
         return model
     if model_name == 'yolov5s':
@@ -434,13 +435,14 @@ def main():
         logger.info(f"Model: {args.model}")
         
         # Initialize dataset for supported models (ImageNet only)
-        if args.model in ['resnet18', 'alexnet']:
-            logger.info("Initializing ImageNet mini dataset for image inference...")
-            initialize_dataset_loader(args.batch_size)
-        else:
+        supported_models = ['resnet18', 'alexnet', 'yolov5s']
+        if args.model not in supported_models:
             logger.error(f"Model '{args.model}' is not supported")
-            logger.error("Only 'resnet18' and 'alexnet' pretrained models are supported")
+            logger.error("Supported models: resnet18, alexnet, yolov5s")
             sys.exit(1)
+
+        logger.info("Initializing ImageNet mini dataset for image inference...")
+        initialize_dataset_loader(args.batch_size)
         
         # Test connection if requested
         if args.test_connection:
