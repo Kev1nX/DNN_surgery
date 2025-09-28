@@ -136,7 +136,7 @@ def get_model(model_name: str):
         model.eval()
         return model
     if model_name == 'yolov5s':
-        model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, autoshape=False)
+        model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, trust_repo=True)
         model.eval()
         return model
     raise ValueError(
