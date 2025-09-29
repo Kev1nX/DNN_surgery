@@ -10,7 +10,7 @@ import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
 from dnn_surgery import DNNSurgery, ModelSplitter, NetworkProfiler, LayerProfiler
 from grpc_utils import proto_to_tensor, tensor_to_proto
-
+torch.backends.nnpack.enabled = False
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
     if torch.cuda.is_available():
@@ -129,6 +129,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 )
                 
             # Convert proto to tensor
+            request_start_time = time.perf_counter()
             input_tensor = proto_to_tensor(request.tensor, device=self.device)
             
             # Log input tensor stats
@@ -137,7 +138,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             logging.info(f"Input tensor stats - Min: {input_tensor.min().item():.3f}, Max: {input_tensor.max().item():.3f}, Mean: {input_tensor.mean().item():.3f}")
             
             # Run inference with timing
-            start_time = time.perf_counter()
+            compute_start_time = time.perf_counter()
             with torch.no_grad():
                 try:
                     # logging.info(f"Cloud model structure:\n{model}")
@@ -153,8 +154,8 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                         error_message=error_msg
                     )
             
-            end_time = time.perf_counter()
-            execution_time = (end_time - start_time) * 1000  # ms
+            compute_end_time = time.perf_counter()
+            execution_time = (compute_end_time - compute_start_time) * 1000  # ms
             
             logging.info(f"Cloud execution time: {execution_time:.2f}ms")
             logging.info(f"Output tensor shape: {output_tensor.shape}")
@@ -168,10 +169,14 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 
             # Convert result back to proto
             response_tensor = tensor_to_proto(output_tensor, ensure_cpu=True)
+            response_ready_time = time.perf_counter()
+            total_processing_time = (response_ready_time - request_start_time) * 1000  # ms
             
             return dnn_inference_pb2.InferenceResponse(
                 tensor=response_tensor,
-                success=True
+                success=True,
+                server_execution_time_ms=execution_time,
+                server_total_time_ms=total_processing_time
             )
             
         except Exception as e:

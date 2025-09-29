@@ -20,7 +20,7 @@ import torch
 import torchvision.models as models
 from torchvision.models import AlexNet_Weights, ResNet18_Weights
 from server import serve
-
+torch.backends.nnpack.enabled = False
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -45,7 +45,7 @@ def main():
     parser.add_argument('--max-workers', type=int, default=10,
                        help='Maximum number of worker threads (default: 10)')
     parser.add_argument('--models', nargs='+', 
-                       choices=['resnet18', 'alexnet', 'yolov5s', 'all'],
+                       choices=['resnet18', 'alexnet', 'all'],
                        default=['all'],
                        help='Models to register (default: all)')
     
@@ -65,7 +65,7 @@ def main():
         models_to_register = []
         
         if 'all' in args.models:
-            models_to_register = ['resnet18', 'alexnet', 'yolov5s']
+            models_to_register = ['resnet18', 'alexnet']
         else:
             models_to_register = args.models
             
@@ -84,11 +84,6 @@ def main():
                     model.eval()
                     servicer.register_model('alexnet', model)
                     logger.info("AlexNet (pretrained) registered successfully")
-                elif model_name == 'yolov5s':
-                    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-                    model.eval()
-                    servicer.register_model('yolov5s', model)
-                    logger.info("YOLOv5s (pretrained) registered successfully")
                     
             except Exception as e:
                 logger.error(f"Failed to register {model_name}: {str(e)}")

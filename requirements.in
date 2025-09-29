@@ -23,9 +23,3 @@ torch==2.7.1+cu118
 torchaudio==2.7.1+cu118
 torchvision==0.22.1+cu118
 
-# Detection models
-yolov5
-gitpython>=3.1.30
-requests>=2.32.2
-tqdm>=4.66.3
-setuptools>=70.0.0

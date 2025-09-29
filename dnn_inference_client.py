@@ -83,8 +83,19 @@ class DNNInferenceClient:
             if torch.isinf(result_tensor).any():
                 raise ValueError("Received tensor contains infinite values")
 
-            transfer_time = total_time * 0.2
-            cloud_time = total_time - transfer_time
+            server_exec_time = getattr(response, 'server_execution_time_ms', 0.0)
+            server_total_time = getattr(response, 'server_total_time_ms', 0.0)
+
+            if server_total_time <= 0:
+                # Fall back to execution time if total time is unavailable
+                server_total_time = server_exec_time
+
+            if server_exec_time <= 0:
+                # Ensure we at least report non-negative execution time
+                server_exec_time = max(server_total_time, 0.0)
+
+            transfer_time = max(total_time - server_total_time, 0.0) if server_total_time > 0 else max(total_time - server_exec_time, 0.0)
+            cloud_time = max(server_exec_time, 0.0)
 
             sample_metrics['transfer_time'] = transfer_time
             sample_metrics['cloud_time'] = cloud_time
@@ -95,8 +106,10 @@ class DNNInferenceClient:
             self.transfer_times.append(transfer_time)
             self.cloud_times.append(cloud_time)
 
-            logging.info(f"Cloud processing time: {cloud_time:.2f}ms")
-            logging.info(f"Transfer time: {transfer_time:.2f}ms")
+            logging.info(f"Cloud processing time (server reported): {cloud_time:.2f}ms")
+            logging.info(f"Transfer time (measured): {transfer_time:.2f}ms")
+            if server_total_time > 0:
+                logging.info(f"Server total handling time: {server_total_time:.2f}ms")
             logging.info(f"Total time: {total_time:.2f}ms")
             logging.info(f"Output tensor stats - Shape: {result_tensor.shape}")
 

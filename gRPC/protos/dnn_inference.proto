@@ -26,6 +26,8 @@ message InferenceResponse {
     Tensor tensor = 1;
     bool success = 2;
     string error_message = 3;
+    double server_execution_time_ms = 4;
+    double server_total_time_ms = 5;
 }
 
 // Layer profiling metrics from client hardware
