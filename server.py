@@ -44,6 +44,33 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
         
         logging.info(f"Initializing DNNInferenceServicer with device: {self.device}")
         
+    def MeasureBandwidth(self, request: dnn_inference_pb2.BandwidthProbeRequest,
+                         context: grpc.ServicerContext) -> dnn_inference_pb2.BandwidthProbeResponse:
+        """Echo payloads back to the client for bandwidth/latency probing."""
+        try:
+            processing_start = time.perf_counter()
+            payload = request.payload
+            processing_end = time.perf_counter()
+            processing_time_ms = (processing_end - processing_start) * 1000
+
+            return dnn_inference_pb2.BandwidthProbeResponse(
+                success=True,
+                message="Bandwidth probe successful",
+                server_processing_time_ms=processing_time_ms,
+                payload=payload
+            )
+        except Exception as exc:
+            error_msg = f"Bandwidth probe failed: {exc}"
+            logging.error(error_msg)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(error_msg)
+            return dnn_inference_pb2.BandwidthProbeResponse(
+                success=False,
+                message=error_msg,
+                server_processing_time_ms=0.0,
+                payload=b""
+            )
+
     def register_model(self, model_id: str, model: torch.nn.Module) -> None:
         """Register a model for inference
         

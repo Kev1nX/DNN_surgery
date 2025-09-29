@@ -3,9 +3,9 @@ import torch.nn as nn
 import time
 import logging
 import io
-import socket
 from typing import List, Dict, Tuple, Optional, Union
 from datetime import datetime
+import uuid
 import grpc
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
@@ -26,6 +26,7 @@ class NetworkProfiler:
     def __init__(self):
         self.bandwidth_mbps = None
         self.latency_ms = None
+        self.probe_client_id = f"bandwidth_probe_{uuid.uuid4()}"
         
     def measure_network(self, server_address: str, test_data_sizes: List[int] = None) -> Dict[str, float]:
         """Measure network bandwidth and latency
@@ -41,15 +42,16 @@ class NetworkProfiler:
             # Use various sizes to get accurate bandwidth measurement
             test_data_sizes = [1024, 4096, 16384, 65536, 262144]  # 1KB to 256KB
             
+        channel = None
         try:
-            host, port = server_address.split(':')
-            port = int(port)
-            
-            # Measure latency with small packets
-            latency_ms = self._measure_latency(host, port)
-            
-            # Measure bandwidth with larger data transfers
-            bandwidth_mbps = self._measure_bandwidth(host, port, test_data_sizes)
+            channel = grpc.insecure_channel(server_address, options=GRPC_SETTINGS.channel_options)
+            stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
+
+            # Warm-up the channel to avoid handshake artifacts skewing results
+            self._warm_up_channel(stub)
+
+            latency_ms = self._measure_latency(stub)
+            bandwidth_mbps = self._measure_bandwidth(stub, test_data_sizes)
             
             self.bandwidth_mbps = bandwidth_mbps
             self.latency_ms = latency_ms
@@ -64,58 +66,89 @@ class NetworkProfiler:
         except Exception as e:
             logger.error(f"Failed to measure network performance: {str(e)}")
             return {'bandwidth_mbps': 10.0, 'latency_ms': 50.0}  # Conservative fallback
+        finally:
+            try:
+                if channel is not None:
+                    channel.close()
+            except Exception:
+                pass
     
-    def _measure_latency(self, host: str, port: int, num_pings: int = 10) -> float:
-        """Measure network latency using socket connections"""
+    def _warm_up_channel(self, stub: dnn_inference_pb2_grpc.DNNInferenceStub) -> None:
+        """Perform a lightweight request to ensure the channel handshake is complete."""
+        try:
+            stub.MeasureBandwidth(
+                dnn_inference_pb2.BandwidthProbeRequest(
+                    client_id=self.probe_client_id,
+                    payload=b"warmup"
+                ),
+                timeout=5.0
+            )
+        except Exception as exc:
+            logger.debug(f"Warm-up probe failed (will retry during measurement): {exc}")
+
+    def _measure_latency(self, stub: dnn_inference_pb2_grpc.DNNInferenceStub, num_pings: int = 5) -> float:
+        """Measure network latency using small gRPC round-trips."""
         latencies = []
         
         for _ in range(num_pings):
             try:
                 start_time = time.perf_counter()
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                # Set socket options to handle connection issues
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.settimeout(5.0)
-                sock.connect((host, port))
-                sock.close()
+                response = stub.MeasureBandwidth(
+                    dnn_inference_pb2.BandwidthProbeRequest(
+                        client_id=self.probe_client_id,
+                        payload=b"latency"
+                    ),
+                    timeout=5.0
+                )
                 end_time = time.perf_counter()
-                
-                latency = (end_time - start_time) * 1000  # Convert to ms
-                latencies.append(latency)
-                
-            except Exception as e:
-                logger.warning(f"Latency measurement failed: {str(e)}")
-                latencies.append(100.0)  # Conservative fallback
-                
+
+                if not response.success:
+                    logger.warning(f"Latency probe unsuccessful: {response.message}")
+                    latencies.append(100.0)
+                    continue
+
+                round_trip_ms = (end_time - start_time) * 1000
+                network_only_ms = max(round_trip_ms - response.server_processing_time_ms, 0.0)
+                latencies.append(network_only_ms)
+            except Exception as exc:
+                logger.warning(f"Latency measurement failed: {exc}")
+                latencies.append(100.0)
+
         return sum(latencies) / len(latencies) if latencies else 100.0
     
-    def _measure_bandwidth(self, host: str, port: int, test_sizes: List[int]) -> float:
-        """Measure bandwidth by sending data of various sizes"""
+    def _measure_bandwidth(self, stub: dnn_inference_pb2_grpc.DNNInferenceStub, test_sizes: List[int]) -> float:
+        """Measure bandwidth by sending data of various sizes over gRPC."""
         bandwidth_measurements = []
         
         for size in test_sizes:
             try:
-                # Create test data
-                test_data = b'0' * size
-                
+                payload = b'0' * size
                 start_time = time.perf_counter()
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                # Set socket options to handle connection issues
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.settimeout(10.0)
-                sock.connect((host, port))
-                sock.sendall(test_data)
-                sock.close()
+                response = stub.MeasureBandwidth(
+                    dnn_inference_pb2.BandwidthProbeRequest(
+                        client_id=self.probe_client_id,
+                        payload=payload
+                    ),
+                    timeout=10.0
+                )
                 end_time = time.perf_counter()
-                
-                transfer_time = end_time - start_time
-                if transfer_time > 0:
-                    bandwidth_bps = (size * 8) / transfer_time  # bits per second
-                    bandwidth_mbps = bandwidth_bps / (1024 * 1024)  # Convert to Mbps
-                    bandwidth_measurements.append(bandwidth_mbps)
-                    
-            except Exception as e:
-                logger.warning(f"Bandwidth measurement failed for size {size}: {str(e)}")
+
+                if not response.success:
+                    logger.warning(f"Bandwidth probe failed for size {size}: {response.message}")
+                    continue
+
+                round_trip_ms = (end_time - start_time) * 1000
+                network_ms = max(round_trip_ms - response.server_processing_time_ms, 0.0)
+
+                if network_ms <= 0:
+                    logger.warning(f"Non-positive network time for size {size}; skipping measurement")
+                    continue
+
+                total_bits = (len(payload) + len(response.payload)) * 8
+                bandwidth_mbps = total_bits / (network_ms / 1000) / (1024 * 1024)
+                bandwidth_measurements.append(bandwidth_mbps)
+            except Exception as exc:
+                logger.warning(f"Bandwidth measurement failed for size {size}: {exc}")
                 continue
         
         return sum(bandwidth_measurements) / len(bandwidth_measurements) if bandwidth_measurements else 10.0

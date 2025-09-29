@@ -50,6 +50,11 @@ class DNNInferenceStub(object):
                 request_serializer=dnn__inference__pb2.SplitConfigRequest.SerializeToString,
                 response_deserializer=dnn__inference__pb2.SplitConfigResponse.FromString,
                 _registered_method=True)
+        self.MeasureBandwidth = channel.unary_unary(
+                '/dnn_surgery.DNNInference/MeasureBandwidth',
+                request_serializer=dnn__inference__pb2.BandwidthProbeRequest.SerializeToString,
+                response_deserializer=dnn__inference__pb2.BandwidthProbeResponse.FromString,
+                _registered_method=True)
 
 
 class DNNInferenceServicer(object):
@@ -77,6 +82,13 @@ class DNNInferenceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def MeasureBandwidth(self, request, context):
+        """Round-trip payload to measure effective bandwidth/latency
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_DNNInferenceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -94,6 +106,11 @@ def add_DNNInferenceServicer_to_server(servicer, server):
                     servicer.set_split_point,
                     request_deserializer=dnn__inference__pb2.SplitConfigRequest.FromString,
                     response_serializer=dnn__inference__pb2.SplitConfigResponse.SerializeToString,
+            ),
+            'MeasureBandwidth': grpc.unary_unary_rpc_method_handler(
+                    servicer.MeasureBandwidth,
+                    request_deserializer=dnn__inference__pb2.BandwidthProbeRequest.FromString,
+                    response_serializer=dnn__inference__pb2.BandwidthProbeResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -178,6 +195,33 @@ class DNNInference(object):
             '/dnn_surgery.DNNInference/set_split_point',
             dnn__inference__pb2.SplitConfigRequest.SerializeToString,
             dnn__inference__pb2.SplitConfigResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def MeasureBandwidth(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/dnn_surgery.DNNInference/MeasureBandwidth',
+            dnn__inference__pb2.BandwidthProbeRequest.SerializeToString,
+            dnn__inference__pb2.BandwidthProbeResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -30,6 +30,20 @@ message InferenceResponse {
     double server_total_time_ms = 5;
 }
 
+// Request for network bandwidth probing via gRPC
+message BandwidthProbeRequest {
+    string client_id = 1;
+    bytes payload = 2;
+}
+
+// Response for network bandwidth probing via gRPC
+message BandwidthProbeResponse {
+    bool success = 1;
+    string message = 2;
+    double server_processing_time_ms = 3;
+    bytes payload = 4;
+}
+
 // Layer profiling metrics from client hardware
 message LayerProfile {
     int32 layer_idx = 1;
@@ -84,4 +98,7 @@ service DNNInference {
     
     // Send client's split point decision to server
     rpc set_split_point (SplitConfigRequest) returns (SplitConfigResponse) {}
+
+    // Round-trip payload to measure effective bandwidth/latency
+    rpc MeasureBandwidth (BandwidthProbeRequest) returns (BandwidthProbeResponse) {}
 }
