@@ -49,16 +49,27 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
         """Echo payloads back to the client for bandwidth/latency probing."""
         try:
             processing_start = time.perf_counter()
-            payload = request.payload
-            processing_end = time.perf_counter()
-            processing_time_ms = (processing_end - processing_start) * 1000
 
-            return dnn_inference_pb2.BandwidthProbeResponse(
-                success=True,
-                message="Bandwidth probe successful",
-                server_processing_time_ms=processing_time_ms,
-                payload=payload
-            )
+            response_kwargs = {
+                "success": True,
+                "message": "Bandwidth probe successful",
+            }
+
+            if request.HasField("tensor"):
+                deserialize_start = time.perf_counter()
+                _ = proto_to_tensor(request.tensor, device=self.device)
+                deserialize_end = time.perf_counter()
+                server_overhead_ms = (deserialize_end - processing_start) * 1000
+                if request.echo:
+                    response_kwargs["tensor"] = request.tensor
+            else:
+                if request.HasField("payload") and request.echo:
+                    response_kwargs["payload"] = request.payload
+                server_overhead_ms = (time.perf_counter() - processing_start) * 1000
+
+            response_kwargs["server_overhead_ms"] = server_overhead_ms
+
+            return dnn_inference_pb2.BandwidthProbeResponse(**response_kwargs)
         except Exception as exc:
             error_msg = f"Bandwidth probe failed: {exc}"
             logging.error(error_msg)
@@ -67,8 +78,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             return dnn_inference_pb2.BandwidthProbeResponse(
                 success=False,
                 message=error_msg,
-                server_processing_time_ms=0.0,
-                payload=b""
+                server_overhead_ms=0.0
             )
 
     def register_model(self, model_id: str, model: torch.nn.Module) -> None:

@@ -33,15 +33,22 @@ message InferenceResponse {
 // Request for network bandwidth probing via gRPC
 message BandwidthProbeRequest {
     string client_id = 1;
-    bytes payload = 2;
+    oneof data {
+        bytes payload = 2;
+        Tensor tensor = 3;
+    }
+    bool echo = 4;
 }
 
 // Response for network bandwidth probing via gRPC
 message BandwidthProbeResponse {
     bool success = 1;
     string message = 2;
-    double server_processing_time_ms = 3;
-    bytes payload = 4;
+    double server_overhead_ms = 3;
+    oneof echoed_data {
+        bytes payload = 4;
+        Tensor tensor = 5;
+    }
 }
 
 // Layer profiling metrics from client hardware

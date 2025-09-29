@@ -10,6 +10,7 @@ import grpc
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
+from grpc_utils import tensor_to_proto
 
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
@@ -27,6 +28,7 @@ class NetworkProfiler:
         self.bandwidth_mbps = None
         self.latency_ms = None
         self.probe_client_id = f"bandwidth_probe_{uuid.uuid4()}"
+        self.transfer_ms_per_byte = None
         
     def measure_network(self, server_address: str, test_data_sizes: List[int] = None) -> Dict[str, float]:
         """Measure network bandwidth and latency
@@ -51,7 +53,9 @@ class NetworkProfiler:
             self._warm_up_channel(stub)
 
             latency_ms = self._measure_latency(stub)
-            bandwidth_mbps = self._measure_bandwidth(stub, test_data_sizes)
+            transfer_metrics = self._measure_transfer_metrics(stub, test_data_sizes, latency_ms)
+            bandwidth_mbps = transfer_metrics['bandwidth_mbps']
+            self.transfer_ms_per_byte = transfer_metrics['transfer_ms_per_byte']
             
             self.bandwidth_mbps = bandwidth_mbps
             self.latency_ms = latency_ms
@@ -116,42 +120,60 @@ class NetworkProfiler:
 
         return sum(latencies) / len(latencies) if latencies else 100.0
     
-    def _measure_bandwidth(self, stub: dnn_inference_pb2_grpc.DNNInferenceStub, test_sizes: List[int]) -> float:
-        """Measure bandwidth by sending data of various sizes over gRPC."""
+    def _measure_transfer_metrics(
+        self,
+        stub: dnn_inference_pb2_grpc.DNNInferenceStub,
+        test_sizes: List[int],
+        latency_ms: float
+    ) -> Dict[str, float]:
+        transfer_per_byte = []
         bandwidth_measurements = []
-        
+
         for size in test_sizes:
             try:
-                payload = b'0' * size
-                start_time = time.perf_counter()
+                num_elements = max(1, (size + 3) // 4)
+                probe_tensor = torch.randn(num_elements, dtype=torch.float32)
+
+                loop_start = time.perf_counter()
+                tensor_proto = tensor_to_proto(probe_tensor, ensure_cpu=True)
                 response = stub.MeasureBandwidth(
                     dnn_inference_pb2.BandwidthProbeRequest(
                         client_id=self.probe_client_id,
-                        payload=payload
+                        tensor=tensor_proto,
+                        echo=False
                     ),
                     timeout=10.0
                 )
-                end_time = time.perf_counter()
+                loop_end = time.perf_counter()
 
                 if not response.success:
                     logger.warning(f"Bandwidth probe failed for size {size}: {response.message}")
                     continue
 
-                round_trip_ms = (end_time - start_time) * 1000
-                network_ms = max(round_trip_ms - response.server_processing_time_ms, 0.0)
+                payload_size = len(tensor_proto.data)
+                elapsed_ms = (loop_end - loop_start) * 1000
 
-                if network_ms <= 0:
-                    logger.warning(f"Non-positive network time for size {size}; skipping measurement")
+                if payload_size <= 0:
+                    logger.warning("Probe payload size was zero; skipping measurement")
                     continue
 
-                total_bits = (len(payload) + len(response.payload)) * 8
-                bandwidth_mbps = total_bits / (network_ms / 1000) / (1024 * 1024)
-                bandwidth_measurements.append(bandwidth_mbps)
+                transfer_per_byte.append(elapsed_ms / payload_size)
+
+                network_ms = max(elapsed_ms - latency_ms, 0.0)
+                if network_ms > 0:
+                    bandwidth = (payload_size * 8) / (network_ms / 1000) / (1024 * 1024)
+                    bandwidth_measurements.append(bandwidth)
             except Exception as exc:
-                logger.warning(f"Bandwidth measurement failed for size {size}: {exc}")
+                logger.warning(f"Transfer measurement failed for size {size}: {exc}")
                 continue
-        
-        return sum(bandwidth_measurements) / len(bandwidth_measurements) if bandwidth_measurements else 10.0
+
+        avg_transfer_per_byte = sum(transfer_per_byte) / len(transfer_per_byte) if transfer_per_byte else 0.0
+        avg_bandwidth = sum(bandwidth_measurements) / len(bandwidth_measurements) if bandwidth_measurements else 10.0
+
+        return {
+            'transfer_ms_per_byte': avg_transfer_per_byte,
+            'bandwidth_mbps': avg_bandwidth
+        }
     
     def estimate_transfer_time(self, data_size_bytes: int) -> float:
         """Estimate transfer time for given data size
@@ -162,16 +184,12 @@ class NetworkProfiler:
         Returns:
             Estimated transfer time in milliseconds
         """
-        if self.bandwidth_mbps is None or self.latency_ms is None:
+        if self.transfer_ms_per_byte is None or self.latency_ms is None:
             logger.warning("Network not profiled. Using conservative estimates: 10 Mbps bandwidth, 50ms latency")
             return (data_size_bytes * 8) / (10 * 1024 * 1024) * 1000 + 50  # 10 Mbps + 50ms latency
             
-        # Transfer time = latency + (data_size_bits / bandwidth_bps)
-        data_size_bits = data_size_bytes * 8
-        bandwidth_bps = self.bandwidth_mbps * 1024 * 1024
-        transfer_time_ms = self.latency_ms + (data_size_bits / bandwidth_bps) * 1000
-        
-        return transfer_time_ms
+        size_ms = data_size_bytes * self.transfer_ms_per_byte
+        return self.latency_ms + size_ms
 
 
 class LayerProfiler:
