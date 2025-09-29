@@ -56,16 +56,13 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             }
 
             if request.HasField("tensor"):
-                deserialize_start = time.perf_counter()
                 _ = proto_to_tensor(request.tensor, device=self.device)
-                deserialize_end = time.perf_counter()
-                server_overhead_ms = (deserialize_end - processing_start) * 1000
                 if request.echo:
                     response_kwargs["tensor"] = request.tensor
             else:
                 if request.HasField("payload") and request.echo:
                     response_kwargs["payload"] = request.payload
-                server_overhead_ms = (time.perf_counter() - processing_start) * 1000
+            server_overhead_ms = (time.perf_counter() - processing_start) * 1000
 
             response_kwargs["server_overhead_ms"] = server_overhead_ms
 

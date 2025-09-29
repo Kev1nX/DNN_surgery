@@ -2,9 +2,7 @@ import torch
 import torch.nn as nn
 import time
 import logging
-import io
-from typing import List, Dict, Tuple, Optional, Union
-from datetime import datetime
+from typing import List, Dict, Tuple, Optional
 import uuid
 import grpc
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
@@ -22,175 +20,73 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class NetworkProfiler:
-    """Measures network bandwidth and latency between client and server"""
-    
+    """Measures actual tensor transfer time between client and server."""
+
     def __init__(self):
-        self.bandwidth_mbps = None
-        self.latency_ms = None
         self.probe_client_id = f"bandwidth_probe_{uuid.uuid4()}"
-        self.transfer_ms_per_byte = None
-        
-    def measure_network(self, server_address: str, test_data_sizes: List[int] = None) -> Dict[str, float]:
-        """Measure network bandwidth and latency
-        
+        self._transfer_cache: Dict[Tuple[str, int], float] = {}
+
+    def clear_cache(self) -> None:
+        """Reset cached transfer measurements."""
+        self._transfer_cache.clear()
+
+    def measure_tensor_transfer(self, tensor: torch.Tensor, server_address: str, echo: bool = False) -> float:
+        """Send the given tensor to the server and measure total round-trip time.
+
         Args:
-            server_address: Server address in format "host:port"
-            test_data_sizes: List of data sizes in bytes for bandwidth testing
-            
+            tensor: Tensor to transfer.
+            server_address: Server address ("host:port").
+            echo: Whether the server should echo the tensor back.
+
         Returns:
-            Dictionary with bandwidth (Mbps) and latency (ms)
+            Observed transfer time in milliseconds.
         """
-        if test_data_sizes is None:
-            # Use various sizes to get accurate bandwidth measurement
-            test_data_sizes = [1024, 4096, 16384, 65536, 262144]  # 1KB to 256KB
-            
+        payload_size = tensor.numel() * tensor.element_size()
+        if payload_size <= 0:
+            logger.debug("Tensor payload size is zero; returning 0 transfer time")
+            return 0.0
+
+        cache_key = (server_address, payload_size)
+        if cache_key in self._transfer_cache:
+            return self._transfer_cache[cache_key]
+
         channel = None
         try:
             channel = grpc.insecure_channel(server_address, options=GRPC_SETTINGS.channel_options)
             stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
 
-            # Warm-up the channel to avoid handshake artifacts skewing results
-            self._warm_up_channel(stub)
-
-            latency_ms = self._measure_latency(stub)
-            transfer_metrics = self._measure_transfer_metrics(stub, test_data_sizes, latency_ms)
-            bandwidth_mbps = transfer_metrics['bandwidth_mbps']
-            self.transfer_ms_per_byte = transfer_metrics['transfer_ms_per_byte']
-            
-            self.bandwidth_mbps = bandwidth_mbps
-            self.latency_ms = latency_ms
-            
-            logger.info(f"Network performance measured - Bandwidth: {bandwidth_mbps:.2f} Mbps, Latency: {latency_ms:.2f} ms")
-            
-            return {
-                'bandwidth_mbps': bandwidth_mbps,
-                'latency_ms': latency_ms
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to measure network performance: {str(e)}")
-            return {'bandwidth_mbps': 10.0, 'latency_ms': 50.0}  # Conservative fallback
-        finally:
-            try:
-                if channel is not None:
-                    channel.close()
-            except Exception:
-                pass
-    
-    def _warm_up_channel(self, stub: dnn_inference_pb2_grpc.DNNInferenceStub) -> None:
-        """Perform a lightweight request to ensure the channel handshake is complete."""
-        try:
-            stub.MeasureBandwidth(
+            start_time = time.perf_counter()
+            tensor_proto = tensor_to_proto(tensor, ensure_cpu=True)
+            response = stub.MeasureBandwidth(
                 dnn_inference_pb2.BandwidthProbeRequest(
                     client_id=self.probe_client_id,
-                    payload=b"warmup"
+                    tensor=tensor_proto,
+                    echo=echo
                 ),
-                timeout=5.0
+                timeout=15.0
             )
+            end_time = time.perf_counter()
+
+            if not response.success:
+                logger.warning(f"Transfer probe failed: {response.message}")
+                return 0.0
+
+            elapsed_ms = (end_time - start_time) * 1000
+            self._transfer_cache[cache_key] = elapsed_ms
+            return elapsed_ms
         except Exception as exc:
-            logger.debug(f"Warm-up probe failed (will retry during measurement): {exc}")
+            logger.error(f"Failed to measure tensor transfer: {exc}")
+            return 0.0
+        finally:
+            if channel is not None:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
 
-    def _measure_latency(self, stub: dnn_inference_pb2_grpc.DNNInferenceStub, num_pings: int = 5) -> float:
-        """Measure network latency using small gRPC round-trips."""
-        latencies = []
-        
-        for _ in range(num_pings):
-            try:
-                start_time = time.perf_counter()
-                response = stub.MeasureBandwidth(
-                    dnn_inference_pb2.BandwidthProbeRequest(
-                        client_id=self.probe_client_id,
-                        payload=b"latency"
-                    ),
-                    timeout=5.0
-                )
-                end_time = time.perf_counter()
-
-                if not response.success:
-                    logger.warning(f"Latency probe unsuccessful: {response.message}")
-                    latencies.append(100.0)
-                    continue
-
-                round_trip_ms = (end_time - start_time) * 1000
-                server_overhead_ms = getattr(response, "server_overhead_ms", 0.0)
-                network_only_ms = max(round_trip_ms - server_overhead_ms, 0.0)
-                latencies.append(network_only_ms)
-            except Exception as exc:
-                logger.warning(f"Latency measurement failed: {exc}")
-                latencies.append(100.0)
-
-        return sum(latencies) / len(latencies) if latencies else 100.0
-    
-    def _measure_transfer_metrics(
-        self,
-        stub: dnn_inference_pb2_grpc.DNNInferenceStub,
-        test_sizes: List[int],
-        latency_ms: float
-    ) -> Dict[str, float]:
-        transfer_per_byte = []
-        bandwidth_measurements = []
-
-        for size in test_sizes:
-            try:
-                num_elements = max(1, (size + 3) // 4)
-                probe_tensor = torch.randn(num_elements, dtype=torch.float32)
-
-                loop_start = time.perf_counter()
-                tensor_proto = tensor_to_proto(probe_tensor, ensure_cpu=True)
-                response = stub.MeasureBandwidth(
-                    dnn_inference_pb2.BandwidthProbeRequest(
-                        client_id=self.probe_client_id,
-                        tensor=tensor_proto,
-                        echo=False
-                    ),
-                    timeout=10.0
-                )
-                loop_end = time.perf_counter()
-
-                if not response.success:
-                    logger.warning(f"Bandwidth probe failed for size {size}: {response.message}")
-                    continue
-
-                payload_size = len(tensor_proto.data)
-                elapsed_ms = (loop_end - loop_start) * 1000
-
-                if payload_size <= 0:
-                    logger.warning("Probe payload size was zero; skipping measurement")
-                    continue
-
-                transfer_per_byte.append(elapsed_ms / payload_size)
-
-                network_ms = max(elapsed_ms - latency_ms, 0.0)
-                if network_ms > 0:
-                    bandwidth = (payload_size * 8) / (network_ms / 1000) / (1024 * 1024)
-                    bandwidth_measurements.append(bandwidth)
-            except Exception as exc:
-                logger.warning(f"Transfer measurement failed for size {size}: {exc}")
-                continue
-
-        avg_transfer_per_byte = sum(transfer_per_byte) / len(transfer_per_byte) if transfer_per_byte else 0.0
-        avg_bandwidth = sum(bandwidth_measurements) / len(bandwidth_measurements) if bandwidth_measurements else 10.0
-
-        return {
-            'transfer_ms_per_byte': avg_transfer_per_byte,
-            'bandwidth_mbps': avg_bandwidth
-        }
-    
-    def estimate_transfer_time(self, data_size_bytes: int) -> float:
-        """Estimate transfer time for given data size
-        
-        Args:
-            data_size_bytes: Size of data to transfer in bytes
-            
-        Returns:
-            Estimated transfer time in milliseconds
-        """
-        if self.transfer_ms_per_byte is None or self.latency_ms is None:
-            logger.warning("Network not profiled. Using conservative estimates: 10 Mbps bandwidth, 50ms latency")
-            return (data_size_bytes * 8) / (10 * 1024 * 1024) * 1000 + 50  # 10 Mbps + 50ms latency
-            
-        size_ms = data_size_bytes * self.transfer_ms_per_byte
-        return self.latency_ms + size_ms
+    def get_cached_measurements(self) -> Dict[Tuple[str, int], float]:
+        """Return a copy of the cached transfer measurements keyed by (server, payload)."""
+        return dict(self._transfer_cache)
 
 
 class LayerProfiler:
@@ -378,6 +274,8 @@ class DNNSurgery:
         self.splitter = ModelSplitter(model, model_name)
         self.profiler = LayerProfiler()
         self.network_profiler = NetworkProfiler()
+        self.layer_outputs: List[torch.Tensor] = []
+        self.input_sample: Optional[torch.Tensor] = None
         
         logger.info(f"Initialized DNNSurgery for model: {model_name}")
         
@@ -392,6 +290,8 @@ class DNNSurgery:
         logger.info(f"Starting model profiling with input shape: {input_tensor.shape}")
         
         self.profiler.clear_profiles()
+        self.layer_outputs = []
+        self.input_sample = input_tensor.detach().cpu()
         current_tensor = input_tensor
         
         # Profile each layer
@@ -417,6 +317,7 @@ class DNNSurgery:
                     current_tensor = torch.flatten(current_tensor, 1)
                     
                 current_tensor = layer(current_tensor)
+                self.layer_outputs.append(current_tensor.detach().cpu())
                 
         return self.profiler.get_profiles()
     
@@ -444,18 +345,14 @@ class DNNSurgery:
             logger.warning("Failed to get server execution times. Using client times as fallback.")
             server_layer_profiles = client_layer_profiles
         
-        # Step 3: Measure network performance
-        logger.info("Step 3: Measuring network performance...")
-        network_metrics = self.network_profiler.measure_network(server_address)
-        
-        # Step 4: CLIENT calculates optimal split point using server execution times
-        logger.info("Step 4: Client calculating optimal split point...")
+        # Step 3: CLIENT calculates optimal split point using direct transfer measurements
+        logger.info("Step 3: Client calculating optimal split point with live transfer probes...")
         optimal_split, split_analysis = self._calculate_optimal_split_client_side(
-            client_layer_profiles, server_layer_profiles, input_tensor, network_metrics
+            client_layer_profiles, server_layer_profiles, input_tensor, server_address
         )
         
-        # Step 5: Send optimal split decision back to server
-        logger.info(f"Step 5: Sending split decision to server: split_point={optimal_split}")
+        # Step 4: Send optimal split decision back to server
+        logger.info(f"Step 4: Sending split decision to server: split_point={optimal_split}")
         split_config_success = self._send_split_decision_to_server(optimal_split, server_address)
         
         if not split_config_success:
@@ -466,7 +363,7 @@ class DNNSurgery:
         return optimal_split, {
             'optimal_split': optimal_split,
             'min_total_time': split_analysis[optimal_split]['total_time'],
-            'network_metrics': network_metrics,
+            'transfer_measurements_ms': self.network_profiler.get_cached_measurements(),
             'client_profiles': client_layer_profiles,
             'server_profiles': server_layer_profiles,
             'all_splits': split_analysis,
@@ -522,21 +419,21 @@ class DNNSurgery:
 
     def _calculate_optimal_split_client_side(self, client_profiles: List[Dict], 
                                            server_profiles: List[Dict], 
-                                           input_tensor: torch.Tensor, 
-                                           network_metrics: Dict) -> Tuple[int, Dict]:
+                                           input_tensor: torch.Tensor,
+                                           server_address: str) -> Tuple[int, Dict]:
         """Calculate optimal split point on client side using server execution times
         
         Args:
             client_profiles: Client-side layer profiling data
             server_profiles: Server-side layer profiling data  
             input_tensor: Input tensor
-            network_metrics: Network performance metrics
+            server_address: Server address for transfer probes
             
         Returns:
             Tuple of (optimal_split_point, all_split_analysis)
         """
         logger.info("=== Client-Side Split Point Analysis ===")
-        logger.info(f"Network: {network_metrics['bandwidth_mbps']:.1f} Mbps, {network_metrics['latency_ms']:.1f}ms latency")
+        logger.info("Transfer probes will use real tensors captured during profiling")
         logger.info(f"{'Split':<5} {'Client':<8} {'Server':<8} {'Transfer':<10} {'Total':<8} {'Description'}")
         logger.info("-" * 75)
         
@@ -551,7 +448,7 @@ class DNNSurgery:
         
         for split_point in range(len(self.splitter.layers) + 1):
             timing = self._calculate_split_timing(
-                client_profiles, server_profiles, split_point, input_tensor
+                client_profiles, server_profiles, split_point, input_tensor, server_address
             )
             split_analysis[split_point] = timing
             
@@ -657,7 +554,8 @@ class DNNSurgery:
     def _calculate_split_timing(self, client_profiles: List[Dict], 
                                server_profiles: List[Dict], 
                                split_point: int, 
-                               input_tensor: torch.Tensor) -> Dict:
+                               input_tensor: torch.Tensor,
+                               server_address: str) -> Dict:
         """Calculate timing for a specific split point using actual client and server profiles
         
         Args:
@@ -694,9 +592,26 @@ class DNNSurgery:
             # Transfer final server output back to client
             output_transfer_size = server_profiles[-1]['data_transfer_size']
         
-        # Calculate transfer times
-        input_transfer_time = self.network_profiler.estimate_transfer_time(input_transfer_size)
-        output_transfer_time = self.network_profiler.estimate_transfer_time(output_transfer_size)
+        # Measure transfer times using actual tensors
+        input_transfer_time = 0.0
+        output_transfer_time = 0.0
+
+        input_tensor_sample: Optional[torch.Tensor] = None
+        if split_point == 0:
+            input_tensor_sample = self.input_sample
+        elif 0 < split_point < len(self.layer_outputs):
+            input_tensor_sample = self.layer_outputs[split_point - 1]
+
+        if input_tensor_sample is not None:
+            input_transfer_time = self.network_profiler.measure_tensor_transfer(
+                input_tensor_sample, server_address
+            )
+
+        if split_point < len(self.layer_outputs) and self.layer_outputs:
+            output_tensor_sample = self.layer_outputs[-1]
+            output_transfer_time = self.network_profiler.measure_tensor_transfer(
+                output_tensor_sample, server_address
+            )
         
         # Total time = Client Execution + Input Transfer + Server Execution + Output Transfer
         total_time = client_time + input_transfer_time + server_time + output_transfer_time
