@@ -112,7 +112,8 @@ class NetworkProfiler:
                     continue
 
                 round_trip_ms = (end_time - start_time) * 1000
-                network_only_ms = max(round_trip_ms - response.server_processing_time_ms, 0.0)
+                server_overhead_ms = getattr(response, "server_overhead_ms", 0.0)
+                network_only_ms = max(round_trip_ms - server_overhead_ms, 0.0)
                 latencies.append(network_only_ms)
             except Exception as exc:
                 logger.warning(f"Latency measurement failed: {exc}")
