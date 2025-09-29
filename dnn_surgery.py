@@ -8,7 +8,6 @@ import grpc
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
-from grpc_utils import tensor_to_proto
 
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
@@ -55,12 +54,12 @@ class NetworkProfiler:
             channel = grpc.insecure_channel(server_address, options=GRPC_SETTINGS.channel_options)
             stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
 
+            payload_bytes = bytes(payload_size)
             start_time = time.perf_counter()
-            tensor_proto = tensor_to_proto(tensor, ensure_cpu=True)
             response = stub.MeasureBandwidth(
                 dnn_inference_pb2.BandwidthProbeRequest(
                     client_id=self.probe_client_id,
-                    tensor=tensor_proto,
+                    payload=payload_bytes,
                     echo=echo
                 ),
                 timeout=15.0
