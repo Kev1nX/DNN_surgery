@@ -11,7 +11,7 @@ import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
 from dnn_surgery import DNNSurgery
-from visualization import plot_split_timing
+from visualization import plot_actual_inference_breakdown, plot_split_timing
 from grpc_utils import proto_to_tensor, tensor_to_proto
 
 # Configure logging
@@ -259,6 +259,38 @@ class DNNInferenceClient:
             
         return summary
 
+
+def resolve_plot_paths(
+    model_id: str,
+    split_point: Optional[int],
+    plot_path: str | None,
+) -> Tuple[Path, Path]:
+    """Resolve output locations for predicted and measured plots."""
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    split_label = f"split-{split_point}" if split_point is not None else "split-optimal"
+
+    if plot_path is None:
+        base_dir = Path("plots")
+        base_name = f"{model_id}_{split_label}_{timestamp}"
+        predicted_path = base_dir / f"{base_name}_predicted.png"
+        actual_path = base_dir / f"{base_name}_actual.png"
+        return predicted_path, actual_path
+
+    destination = Path(plot_path)
+
+    if destination.suffix:
+        base_dir = destination.parent if destination.parent != Path("") else Path(".")
+        predicted_path = destination
+        actual_path = base_dir / f"{destination.stem}_actual{destination.suffix}"
+        return predicted_path, actual_path
+
+    base_dir = destination
+    base_name = f"{model_id}_{split_label}_{timestamp}"
+    predicted_path = base_dir / f"{base_name}_predicted.png"
+    actual_path = base_dir / f"{base_name}_actual.png"
+    return predicted_path, actual_path
+
 def run_distributed_inference(
     model_id: str,
     input_tensor: torch.Tensor,
@@ -283,9 +315,13 @@ def run_distributed_inference(
         Tuple of (result tensor, timing dictionary)
     """
     try:
-        # Use NeuroSurgeon approach if no manual split point provided
-        split_summary = None
+        split_summary: Optional[List[Dict[str, float]]] = None
+        predicted_plot_path: Optional[Path] = None
+        actual_plot_path: Optional[Path] = None
+        predicted_plot_path_resolved: Optional[str] = None
+        actual_plot_path_resolved: Optional[str] = None
 
+        # Use NeuroSurgeon approach if no manual split point provided
         if split_point is None:
             optimal_split, analysis = dnn_surgery.find_optimal_split(input_tensor, server_address)
             split_point = optimal_split
@@ -294,49 +330,38 @@ def run_distributed_inference(
             split_summary = analysis.get("split_summary")
             logging.info("Split timing summary:\n%s", analysis.get("split_summary_table", "(none)"))
         else:
-            # Manual split point provided - send it to server
             logging.info(f"Using manual split point: {split_point}")
             success = dnn_surgery._send_split_decision_to_server(split_point, server_address)
             if not success:
                 logging.error("Failed to send manual split decision to server")
-        
-        saved_plot_path: Optional[Path] = None
 
         if auto_plot:
+            predicted_plot_path, actual_plot_path = resolve_plot_paths(model_id, split_point, plot_path)
+
             if split_summary is None:
-                logging.warning("Split summary not available; skipping auto-plot")
+                logging.warning("Split summary not available; skipping predicted split chart")
             else:
                 logging.info("Auto-plot enabled; generating split timing chart")
                 try:
-                    if plot_path is not None:
-                        saved_plot_path = Path(plot_path)
-                    else:
-                        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-                        split_label = (
-                            f"split-{split_point}"
-                            if split_point is not None
-                            else "split-optimal"
-                        )
-                        saved_plot_path = Path("plots") / f"{model_id}_{split_label}_{timestamp}.png"
-
-                    saved_plot_path.parent.mkdir(parents=True, exist_ok=True)
-
+                    predicted_plot_path.parent.mkdir(parents=True, exist_ok=True)
                     plot_split_timing(
                         split_summary,
                         show=plot_show,
-                        save_path=str(saved_plot_path),
+                        save_path=str(predicted_plot_path),
+                        title=f"Predicted Split Timing ({model_id})",
                     )
-
+                    predicted_plot_path_resolved = str(predicted_plot_path.resolve())
                     logging.info(
-                        "Split timing plot saved to %s",
-                        saved_plot_path.resolve(),
+                        "Predicted split timing plot saved to %s",
+                        predicted_plot_path_resolved,
                     )
                 except ImportError as plt_error:
                     logging.warning(
                         "Auto-plot requested but matplotlib is unavailable: %s",
                         plt_error,
                     )
-                    saved_plot_path = None
+                except Exception as plot_error:
+                    logging.error("Failed to render predicted split chart: %s", plot_error)
 
         # Set split point and get edge model
         dnn_surgery.splitter.set_split_point(split_point)
@@ -359,8 +384,39 @@ def run_distributed_inference(
         timing_summary = client.get_timing_summary()
         timings.update(timing_summary)
 
-        if saved_plot_path is not None:
-            timings['split_plot_path'] = str(saved_plot_path.resolve())
+        total_metrics = {
+            "edge_time": timings.get("edge_time", 0.0),
+            "transfer_time": timings.get("transfer_time", 0.0),
+            "cloud_time": timings.get("cloud_time", 0.0),
+            "total_batch_processing_time": timings.get("total_batch_processing_time"),
+        }
+
+        if auto_plot and actual_plot_path is not None:
+            try:
+                actual_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                plot_actual_inference_breakdown(
+                    total_metrics,
+                    show=plot_show,
+                    save_path=str(actual_plot_path),
+                    title=f"Measured Inference Breakdown ({model_id})",
+                )
+                actual_plot_path_resolved = str(actual_plot_path.resolve())
+                logging.info(
+                    "Measured inference plot saved to %s",
+                    actual_plot_path_resolved,
+                )
+            except ImportError as plt_error:
+                logging.warning(
+                    "Auto-plot requested but matplotlib is unavailable: %s",
+                    plt_error,
+                )
+            except Exception as plot_error:
+                logging.error("Failed to render measured inference chart: %s", plot_error)
+
+        if predicted_plot_path_resolved:
+            timings['predicted_split_plot_path'] = predicted_plot_path_resolved
+        if actual_plot_path_resolved:
+            timings['actual_split_plot_path'] = actual_plot_path_resolved
         
         # Add split point info
         timings['split_point'] = split_point

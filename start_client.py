@@ -4,16 +4,18 @@ import argparse
 import logging
 import sys
 import time
+from collections import defaultdict
 import torch
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 
 
-from dnn_inference_client import DNNInferenceClient, run_distributed_inference
+from dnn_inference_client import DNNInferenceClient, resolve_plot_paths, run_distributed_inference
 from dnn_surgery import DNNSurgery
 import torchvision.models as models
 from torchvision.models import AlexNet_Weights, ResNet18_Weights
 from dataset.imagenet_loader import ImageNetMiniLoader
+from visualization import plot_actual_inference_breakdown, plot_actual_split_comparison
 
 # Configure logging
 logging.basicConfig(
@@ -211,9 +213,12 @@ def run_single_inference(
     timings['true_labels'] = true_labels.tolist()
     timings['class_names'] = class_names
 
-    plot_path_saved = timings.get('split_plot_path')
-    if plot_path_saved:
-        logger.info("Split timing chart saved to %s", plot_path_saved)
+    predicted_plot_path = timings.get('predicted_split_plot_path')
+    actual_plot_path = timings.get('actual_split_plot_path')
+    if predicted_plot_path:
+        logger.info("Predicted split timing chart saved to %s", predicted_plot_path)
+    if actual_plot_path:
+        logger.info("Measured inference chart saved to %s", actual_plot_path)
     
     return result, timings
 
@@ -267,6 +272,32 @@ def run_batch_processing(
         if split_point is not None:
             # Use manual split point
             result, timings = client.process_tensor(input_tensor, model_name)
+            if auto_plot and should_plot:
+                _, manual_actual_path = resolve_plot_paths(model_name, split_point, plot_path)
+                try:
+                    manual_actual_path.parent.mkdir(parents=True, exist_ok=True)
+                    plot_actual_inference_breakdown(
+                        {
+                            "edge_time": timings.get("edge_time", 0.0),
+                            "transfer_time": timings.get("transfer_time", 0.0),
+                            "cloud_time": timings.get("cloud_time", 0.0),
+                            "total_batch_processing_time": timings.get("total_batch_processing_time"),
+                        },
+                        show=plot_show,
+                        save_path=str(manual_actual_path),
+                        title=f"Measured Inference Breakdown ({model_name}, split {split_point})",
+                    )
+                    manual_actual_path_resolved = str(manual_actual_path.resolve())
+                    timings['actual_split_plot_path'] = manual_actual_path_resolved
+                    logger.info("Measured inference chart saved to %s", manual_actual_path_resolved)
+                except ImportError as plt_error:
+                    logger.warning(
+                        "Auto-plot requested but matplotlib is unavailable: %s",
+                        plt_error,
+                    )
+                except Exception as plot_error:
+                    logger.error("Failed to render measured inference chart: %s", plot_error)
+                should_plot = False
         else:
             # Use NeuroSurgeon (either find optimal or reuse)
             if optimal_split_found is not None:
@@ -296,10 +327,12 @@ def run_batch_processing(
                 optimal_split_found = timings.get('split_point', 2)
                 should_plot = False
                 logger.info(f"Found optimal split point: {optimal_split_found} (will reuse for remaining batches)")
-        
-            plot_path_saved = timings.get('split_plot_path')
-            if plot_path_saved:
-                logger.info("Split timing chart saved to %s", plot_path_saved)
+        predicted_plot_path = timings.get('predicted_split_plot_path')
+        actual_plot_path = timings.get('actual_split_plot_path')
+        if predicted_plot_path:
+            logger.info("Predicted split timing chart saved to %s", predicted_plot_path)
+        if actual_plot_path:
+            logger.info("Measured inference chart saved to %s", actual_plot_path)
         
         total_time = time.time() - start_time
         
@@ -331,6 +364,7 @@ def run_batch_processing(
     
     return all_timings
 
+
 def test_split_points(
     server_address: str,
     model_name: str,
@@ -341,34 +375,32 @@ def test_split_points(
     plot_show: bool = True,
     plot_path: Optional[str] = None,
 ) -> Dict[int, Dict]:
-    """Test different split points and return performance comparison"""
-    
-    # Ensure model is supported
+    """Test different split points and return performance comparison."""
+
     if model_name not in ['resnet18', 'alexnet']:
         raise RuntimeError(
             f"Model '{model_name}' is not supported. Please use 'resnet18' or 'alexnet'."
         )
-    
-    # Initialize dataset
+
     initialize_dataset_loader(1)  # Use batch size 1 for testing
-    
+
     model = get_model(model_name)
     dnn_surgery = DNNSurgery(model, model_name)
-    
-    # Profile the model first with a sample input
+
     input_tensor, _, _ = get_input_tensor(model_name, 1)
     logger.info("Profiling model layers...")
-    profiles = dnn_surgery.profile_model(input_tensor)
-    
-    results = {}
-    
+    dnn_surgery.profile_model(input_tensor)
+
+    results: Dict[int, Dict] = {}
+    split_actual_totals: Dict[int, List[float]] = defaultdict(list)
+
     logger.info(f"Testing split points: {split_points}")
-    
+
     for split_point in split_points:
         logger.info(f"\n--- Testing split point {split_point} ---")
-        
-        timings_list = []
-        
+
+        timings_list: List[Dict] = []
+
         for test_idx in range(num_tests):
             try:
                 result, timings = run_single_inference(
@@ -381,13 +413,17 @@ def test_split_points(
                     plot_path=plot_path,
                 )
                 timings_list.append(timings)
-                
-                total_time = timings.get('edge_time', 0) + timings.get('cloud_time', 0) + timings.get('transfer_time', 0)
-                
-                # Show prediction results with true labels
+
+                total_time = (
+                    timings.get('edge_time', 0)
+                    + timings.get('cloud_time', 0)
+                    + timings.get('transfer_time', 0)
+                )
+                split_actual_totals[split_point].append(total_time)
+
                 true_labels = timings['true_labels']
                 class_names = timings['class_names']
-                
+
                 if result.dim() == 2:
                     probs = torch.softmax(result, dim=1)
                     _, predicted = probs.max(1)
@@ -395,40 +431,67 @@ def test_split_points(
                     true_class = true_labels[0]
                     true_name = class_names[0]
                     correct = "✓" if pred_class == true_class else "✗"
-                    
-                    logger.info(f"  Test {test_idx + 1}: Total={total_time:.1f}ms "
-                              f"(Edge={timings.get('edge_time', 0):.1f}ms, "
-                              f"Cloud={timings.get('cloud_time', 0):.1f}ms, "
-                              f"Transfer={timings.get('transfer_time', 0):.1f}ms) "
-                              f"Pred={pred_class}, True={true_class} ({true_name}) {correct}")
+
+                    logger.info(
+                        f"  Test {test_idx + 1}: Total={total_time:.1f}ms "
+                        f"(Edge={timings.get('edge_time', 0):.1f}ms, "
+                        f"Cloud={timings.get('cloud_time', 0):.1f}ms, "
+                        f"Transfer={timings.get('transfer_time', 0):.1f}ms) "
+                        f"Pred={pred_class}, True={true_class} ({true_name}) {correct}"
+                    )
                 else:
-                    logger.info(f"  Test {test_idx + 1}: Total={total_time:.1f}ms "
-                              f"(Edge={timings.get('edge_time', 0):.1f}ms, "
-                              f"Cloud={timings.get('cloud_time', 0):.1f}ms, "
-                              f"Transfer={timings.get('transfer_time', 0):.1f}ms)")
-                
+                    logger.info(
+                        f"  Test {test_idx + 1}: Total={total_time:.1f}ms "
+                        f"(Edge={timings.get('edge_time', 0):.1f}ms, "
+                        f"Cloud={timings.get('cloud_time', 0):.1f}ms, "
+                        f"Transfer={timings.get('transfer_time', 0):.1f}ms)"
+                    )
+
             except Exception as e:
                 logger.error(f"  Test {test_idx + 1} failed: {str(e)}")
                 continue
-        
+
         if timings_list:
-            # Calculate averages
             avg_edge = np.mean([t.get('edge_time', 0) for t in timings_list])
             avg_cloud = np.mean([t.get('cloud_time', 0) for t in timings_list])
             avg_transfer = np.mean([t.get('transfer_time', 0) for t in timings_list])
             avg_total = avg_edge + avg_cloud + avg_transfer
-            
+
             results[split_point] = {
                 'avg_edge_time': avg_edge,
                 'avg_cloud_time': avg_cloud,
                 'avg_transfer_time': avg_transfer,
                 'avg_total_time': avg_total,
-                'num_tests': len(timings_list)
+                'num_tests': len(timings_list),
             }
-            
-            logger.info(f"  Average: Total={avg_total:.1f}ms "
-                       f"(Edge={avg_edge:.1f}ms, Cloud={avg_cloud:.1f}ms, Transfer={avg_transfer:.1f}ms)")
-    
+
+            logger.info(
+                f"  Average: Total={avg_total:.1f}ms "
+                f"(Edge={avg_edge:.1f}ms, Cloud={avg_cloud:.1f}ms, Transfer={avg_transfer:.1f}ms)"
+            )
+
+    if auto_plot and split_actual_totals:
+        _, comparison_seed_path = resolve_plot_paths(model_name, None, plot_path)
+        comparison_path = comparison_seed_path.with_name(
+            comparison_seed_path.stem.replace("_actual", "") + "_comparison" + comparison_seed_path.suffix
+        )
+        try:
+            comparison_path.parent.mkdir(parents=True, exist_ok=True)
+            plot_actual_split_comparison(
+                split_actual_totals,
+                show=plot_show,
+                save_path=str(comparison_path),
+                title=f"Measured Inference Totals ({model_name})",
+            )
+            logger.info("Split comparison chart saved to %s", comparison_path.resolve())
+        except ImportError as plt_error:
+            logger.warning(
+                "Auto-plot requested but matplotlib is unavailable: %s",
+                plt_error,
+            )
+        except Exception as plot_error:
+            logger.error("Failed to render split comparison chart: %s", plot_error)
+
     return results
 
 def print_performance_summary(results: Dict[int, Dict]):
@@ -628,9 +691,12 @@ def main():
             print(f"   Cloud time: {timings.get('cloud_time', 0):.1f}ms")
             print(f"   Transfer time: {timings.get('transfer_time', 0):.1f}ms")
 
-            plot_path_saved = timings.get('split_plot_path')
-            if plot_path_saved:
-                print(f"   Split timing chart saved to: {plot_path_saved}")
+            predicted_plot_path = timings.get('predicted_split_plot_path')
+            actual_plot_path = timings.get('actual_split_plot_path')
+            if predicted_plot_path:
+                print(f"   Predicted split chart saved to: {predicted_plot_path}")
+            if actual_plot_path:
+                print(f"   Measured inference chart saved to: {actual_plot_path}")
             
             # Show prediction for classification with true labels (always available)
             if result.dim() == 2:
