@@ -210,6 +210,10 @@ def run_single_inference(
     # Add true label information to timing results for analysis
     timings['true_labels'] = true_labels.tolist()
     timings['class_names'] = class_names
+
+    plot_path_saved = timings.get('split_plot_path')
+    if plot_path_saved:
+        logger.info("Split timing chart saved to %s", plot_path_saved)
     
     return result, timings
 
@@ -292,6 +296,10 @@ def run_batch_processing(
                 optimal_split_found = timings.get('split_point', 2)
                 should_plot = False
                 logger.info(f"Found optimal split point: {optimal_split_found} (will reuse for remaining batches)")
+        
+            plot_path_saved = timings.get('split_plot_path')
+            if plot_path_saved:
+                logger.info("Split timing chart saved to %s", plot_path_saved)
         
         total_time = time.time() - start_time
         
@@ -619,6 +627,10 @@ def main():
             print(f"   Edge time: {timings.get('edge_time', 0):.1f}ms")
             print(f"   Cloud time: {timings.get('cloud_time', 0):.1f}ms")
             print(f"   Transfer time: {timings.get('transfer_time', 0):.1f}ms")
+
+            plot_path_saved = timings.get('split_plot_path')
+            if plot_path_saved:
+                print(f"   Split timing chart saved to: {plot_path_saved}")
             
             # Show prediction for classification with true labels (always available)
             if result.dim() == 2:

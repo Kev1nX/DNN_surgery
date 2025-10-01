@@ -3,7 +3,9 @@ import logging
 import torch
 import time
 import uuid
+from datetime import datetime
 from collections import deque
+from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
@@ -298,17 +300,43 @@ def run_distributed_inference(
             if not success:
                 logging.error("Failed to send manual split decision to server")
         
+        saved_plot_path: Optional[Path] = None
+
         if auto_plot:
             if split_summary is None:
                 logging.warning("Split summary not available; skipping auto-plot")
             else:
                 logging.info("Auto-plot enabled; generating split timing chart")
                 try:
-                    plot_split_timing(split_summary, show=plot_show, save_path=plot_path)
-                    if plot_path:
-                        logging.info("Split timing plot saved to %s", plot_path)
+                    if plot_path is not None:
+                        saved_plot_path = Path(plot_path)
+                    else:
+                        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                        split_label = (
+                            f"split-{split_point}"
+                            if split_point is not None
+                            else "split-optimal"
+                        )
+                        saved_plot_path = Path("plots") / f"{model_id}_{split_label}_{timestamp}.png"
+
+                    saved_plot_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    plot_split_timing(
+                        split_summary,
+                        show=plot_show,
+                        save_path=str(saved_plot_path),
+                    )
+
+                    logging.info(
+                        "Split timing plot saved to %s",
+                        saved_plot_path.resolve(),
+                    )
                 except ImportError as plt_error:
-                    logging.warning("Auto-plot requested but matplotlib is unavailable: %s", plt_error)
+                    logging.warning(
+                        "Auto-plot requested but matplotlib is unavailable: %s",
+                        plt_error,
+                    )
+                    saved_plot_path = None
 
         # Set split point and get edge model
         dnn_surgery.splitter.set_split_point(split_point)
@@ -330,6 +358,9 @@ def run_distributed_inference(
         # Get timing summary
         timing_summary = client.get_timing_summary()
         timings.update(timing_summary)
+
+        if saved_plot_path is not None:
+            timings['split_plot_path'] = str(saved_plot_path.resolve())
         
         # Add split point info
         timings['split_point'] = split_point
