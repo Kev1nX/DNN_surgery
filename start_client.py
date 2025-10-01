@@ -392,7 +392,16 @@ def test_split_points(
     dnn_surgery.profile_model(input_tensor)
 
     results: Dict[int, Dict] = {}
-    split_actual_totals: Dict[int, List[float]] = defaultdict(list)
+
+    def _init_component_buckets() -> Dict[str, List[float]]:
+        return {
+            'edge': [],
+            'cloud': [],
+            'transfer': [],
+            'total': [],
+        }
+
+    split_actual_components: Dict[int, Dict[str, List[float]]] = defaultdict(_init_component_buckets)
 
     logger.info(f"Testing split points: {split_points}")
 
@@ -414,12 +423,16 @@ def test_split_points(
                 )
                 timings_list.append(timings)
 
-                total_time = (
-                    timings.get('edge_time', 0)
-                    + timings.get('cloud_time', 0)
-                    + timings.get('transfer_time', 0)
-                )
-                split_actual_totals[split_point].append(total_time)
+                edge_time = float(timings.get('edge_time', 0.0))
+                cloud_time = float(timings.get('cloud_time', 0.0))
+                transfer_time = float(timings.get('transfer_time', 0.0))
+                total_time = edge_time + cloud_time + transfer_time
+
+                buckets = split_actual_components[split_point]
+                buckets['edge'].append(edge_time)
+                buckets['cloud'].append(cloud_time)
+                buckets['transfer'].append(transfer_time)
+                buckets['total'].append(total_time)
 
                 true_labels = timings['true_labels']
                 class_names = timings['class_names']
@@ -470,7 +483,7 @@ def test_split_points(
                 f"(Edge={avg_edge:.1f}ms, Cloud={avg_cloud:.1f}ms, Transfer={avg_transfer:.1f}ms)"
             )
 
-    if auto_plot and split_actual_totals:
+    if auto_plot and split_actual_components:
         _, comparison_seed_path = resolve_plot_paths(model_name, None, plot_path)
         comparison_path = comparison_seed_path.with_name(
             comparison_seed_path.stem.replace("_actual", "") + "_comparison" + comparison_seed_path.suffix
@@ -478,12 +491,12 @@ def test_split_points(
         try:
             comparison_path.parent.mkdir(parents=True, exist_ok=True)
             plot_actual_split_comparison(
-                split_actual_totals,
+                split_actual_components,
                 show=plot_show,
                 save_path=str(comparison_path),
-                title=f"Measured Inference Totals ({model_name})",
+                title=f"Measured Inference Timings ({model_name})",
             )
-            logger.info("Split comparison chart saved to %s", comparison_path.resolve())
+            logger.info("Split comparison line chart saved to %s", comparison_path.resolve())
         except ImportError as plt_error:
             logger.warning(
                 "Auto-plot requested but matplotlib is unavailable: %s",

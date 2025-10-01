@@ -8,9 +8,10 @@ objects that can be reused by the CLI, notebooks, or any future reporting tools.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from statistics import mean
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:  # Optional dependency for plotting
     import matplotlib.pyplot as plt  # type: ignore
@@ -246,15 +247,28 @@ def plot_actual_inference_breakdown(
 
 
 def plot_actual_split_comparison(
-    split_totals_ms: Dict[int, Sequence[float]],
+    split_component_timings: Dict[int, Dict[str, Sequence[float]]],
     *,
     show: bool = False,
     save_path: Optional[str] = None,
     title: Optional[str] = None,
 ):
-    """Visualize measured inference totals across multiple split points."""
+    """Visualize measured inference timings across multiple split points using a line chart.
 
-    if not split_totals_ms:
+    Args:
+        split_component_timings: Mapping of split point to measured timing samples.
+            Each value should be a dictionary containing timing categories (e.g.,
+            ``edge``, ``transfer``, ``cloud``, ``total``) mapped to iterables of
+            sample values in milliseconds.
+        show: Whether to display the chart interactively.
+        save_path: Optional filesystem path to persist the chart as an image.
+        title: Optional override for the chart title.
+
+    Returns:
+        The created ``matplotlib.figure.Figure`` instance.
+    """
+
+    if not split_component_timings:
         raise ValueError("Cannot plot split comparison without timing data")
 
     if plt is None:
@@ -262,57 +276,115 @@ def plot_actual_split_comparison(
             "matplotlib is required to plot split comparisons. Install with 'pip install matplotlib'."
         )
 
-    filtered_items = [
-        (split_point, [float(t) for t in totals if t is not None])
-        for split_point, totals in split_totals_ms.items()
-    ]
-    filtered_items = [(sp, vals) for sp, vals in filtered_items if vals]
+    preferred_order = ["total", "edge", "transfer", "cloud"]
 
-    if not filtered_items:
+    sanitized_items: List[Tuple[int, Dict[str, List[float]]]] = []
+    for split_point, component_map in split_component_timings.items():
+        cleaned_components: Dict[str, List[float]] = {}
+        for component, samples in component_map.items():
+            numeric_samples = [float(sample) for sample in samples if sample is not None]
+            if numeric_samples:
+                cleaned_components[component] = numeric_samples
+        if cleaned_components:
+            sanitized_items.append((split_point, cleaned_components))
+
+    if not sanitized_items:
         raise ValueError("No valid timing samples available for split comparison plot")
 
-    filtered_items.sort(key=lambda item: item[0])
-    split_points = [item[0] for item in filtered_items]
-    total_avgs = [mean(item[1]) for item in filtered_items]
-    total_mins = [min(item[1]) for item in filtered_items]
-    total_maxs = [max(item[1]) for item in filtered_items]
+    sanitized_items.sort(key=lambda item: item[0])
+    split_points = [item[0] for item in sanitized_items]
 
-    asym_errors = [
-        (
-            avg - min_val,
-            max_val - avg,
-        )
-        for avg, min_val, max_val in zip(total_avgs, total_mins, total_maxs)
-    ]
+    available_components = []
+    for component in preferred_order:
+        if any(component in components for _, components in sanitized_items):
+            available_components.append(component)
+    additional_components = {
+        component
+        for _, components in sanitized_items
+        for component in components.keys()
+    }
+    for component in sorted(additional_components):
+        if component not in available_components:
+            available_components.append(component)
 
-    lower_errors = [err[0] for err in asym_errors]
-    upper_errors = [err[1] for err in asym_errors]
+    if not available_components:
+        raise ValueError("No timing components found for split comparison plot")
 
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.bar(
-        split_points,
-        total_avgs,
-        yerr=[lower_errors, upper_errors],
-        color="#1f77b4",
-        alpha=0.8,
-        capsize=5,
-    )
+    color_map = {
+        "total": "#1f77b4",
+        "edge": "#ff7f0e",
+        "transfer": "#d62728",
+        "cloud": "#2ca02c",
+    }
+
+    label_map = {
+        "total": "Total",
+        "edge": "Edge",
+        "transfer": "Transfer",
+        "cloud": "Cloud",
+    }
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+
+    for component in available_components:
+        averages: List[float] = []
+        mins: List[float] = []
+        maxs: List[float] = []
+        for _, component_timings in sanitized_items:
+            samples = component_timings.get(component)
+            if samples:
+                averages.append(mean(samples))
+                mins.append(min(samples))
+                maxs.append(max(samples))
+            else:
+                averages.append(float("nan"))
+                mins.append(float("nan"))
+                maxs.append(float("nan"))
+
+        color = color_map.get(component, None)
+        label = label_map.get(component, component.capitalize())
+        ax.plot(split_points, averages, marker="o", linewidth=2.0, label=label, color=color)
+
+        has_variance = False
+        lower_bounds: List[float] = []
+        upper_bounds: List[float] = []
+        for avg, lo, hi in zip(averages, mins, maxs):
+            if any(math.isnan(value) for value in (avg, lo, hi)):
+                lower_bounds.append(avg)
+                upper_bounds.append(avg)
+            else:
+                lower_bounds.append(lo)
+                upper_bounds.append(hi)
+                if hi != lo:
+                    has_variance = True
+
+        if has_variance:
+            ax.fill_between(
+                split_points,
+                lower_bounds,
+                upper_bounds,
+                alpha=0.15,
+                color=color,
+            )
+
+        for x, avg in zip(split_points, averages):
+            if not math.isnan(avg):
+                ax.annotate(
+                    f"{avg:.1f}ms",
+                    xy=(x, avg),
+                    xytext=(0, 6),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
 
     ax.set_xlabel("Split Point")
-    ax.set_ylabel("Measured Total Latency (ms)")
+    ax.set_ylabel("Measured Latency (ms)")
     ax.set_xticks(split_points)
-    ax.set_title(title or "Measured Inference Time per Split Point")
-    ax.grid(axis="y", linestyle=":", linewidth=0.5, alpha=0.7)
-
-    for x, avg in zip(split_points, total_avgs):
-        ax.annotate(
-            f"{avg:.1f}ms",
-            xy=(x, avg),
-            xytext=(0, 6),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-        )
+    ax.set_title(title or "Measured Inference Timings by Split Point")
+    ax.grid(True, which="major", linestyle=":", linewidth=0.5, alpha=0.7)
+    ax.legend()
 
     fig.tight_layout()
 
