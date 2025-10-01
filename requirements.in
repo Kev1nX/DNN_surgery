@@ -16,6 +16,9 @@ psutil
 # Data Loading and Processing
 pillow>=10.3.0
 
+# Visualization
+matplotlib
+
 --index-url https://download.pytorch.org/whl/cu118
 
 # Deep Learning Framework

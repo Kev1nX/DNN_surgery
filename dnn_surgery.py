@@ -8,6 +8,7 @@ import grpc
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
+from visualization import build_split_timing_summary, format_split_summary
 
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
@@ -359,6 +360,8 @@ class DNNSurgery:
         else:
             logger.info("Server successfully configured with client's split decision")
         
+        split_summary = build_split_timing_summary(split_analysis)
+
         return optimal_split, {
             'optimal_split': optimal_split,
             'min_total_time': split_analysis[optimal_split]['total_time'],
@@ -366,6 +369,8 @@ class DNNSurgery:
             'client_profiles': client_layer_profiles,
             'server_profiles': server_layer_profiles,
             'all_splits': split_analysis,
+            'split_summary': split_summary,
+            'split_summary_table': format_split_summary(split_summary, sort_by_total_time=False),
             'recommended_by_server': False,
             'split_config_success': split_config_success
         }
