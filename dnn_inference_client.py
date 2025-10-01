@@ -9,6 +9,7 @@ import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
 from dnn_surgery import DNNSurgery
+from visualization import plot_split_timing
 from grpc_utils import proto_to_tensor, tensor_to_proto
 
 # Configure logging
@@ -256,9 +257,17 @@ class DNNInferenceClient:
             
         return summary
 
-def run_distributed_inference(model_id: str, input_tensor: torch.Tensor, 
-                                            dnn_surgery: DNNSurgery, split_point: int = None,
-                                            server_address: str = 'localhost:50051') -> Tuple[torch.Tensor, Dict]:
+def run_distributed_inference(
+    model_id: str,
+    input_tensor: torch.Tensor,
+    dnn_surgery: DNNSurgery,
+    split_point: int | None = None,
+    server_address: str = "localhost:50051",
+    *,
+    auto_plot: bool = True,
+    plot_show: bool = True,
+    plot_path: str | None = None,
+) -> Tuple[torch.Tensor, Dict]:
     """Run distributed inference with NeuroSurgeon optimization
     
     Args:
@@ -273,11 +282,15 @@ def run_distributed_inference(model_id: str, input_tensor: torch.Tensor,
     """
     try:
         # Use NeuroSurgeon approach if no manual split point provided
+        split_summary = None
+
         if split_point is None:
             optimal_split, analysis = dnn_surgery.find_optimal_split(input_tensor, server_address)
             split_point = optimal_split
             logging.info(f"NeuroSurgeon optimal split point: {split_point}")
             logging.info(f"Predicted total time: {analysis['min_total_time']:.2f}ms")
+            split_summary = analysis.get("split_summary")
+            logging.info("Split timing summary:\n%s", analysis.get("split_summary_table", "(none)"))
         else:
             # Manual split point provided - send it to server
             logging.info(f"Using manual split point: {split_point}")
@@ -285,6 +298,18 @@ def run_distributed_inference(model_id: str, input_tensor: torch.Tensor,
             if not success:
                 logging.error("Failed to send manual split decision to server")
         
+        if auto_plot:
+            if split_summary is None:
+                logging.warning("Split summary not available; skipping auto-plot")
+            else:
+                logging.info("Auto-plot enabled; generating split timing chart")
+                try:
+                    plot_split_timing(split_summary, show=plot_show, save_path=plot_path)
+                    if plot_path:
+                        logging.info("Split timing plot saved to %s", plot_path)
+                except ImportError as plt_error:
+                    logging.warning("Auto-plot requested but matplotlib is unavailable: %s", plt_error)
+
         # Set split point and get edge model
         dnn_surgery.splitter.set_split_point(split_point)
         edge_model = dnn_surgery.splitter.get_edge_model()

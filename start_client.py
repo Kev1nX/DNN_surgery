@@ -156,8 +156,17 @@ def test_connection(server_address: str) -> bool:
         logger.error(f"✗ Connection test failed: {str(e)}")
         return False
 
-def run_single_inference(server_address: str, model_name, dnn_surgery: DNNSurgery, split_point: int = None, 
-                        batch_size: int = 1) -> Tuple[torch.Tensor, Dict]:
+def run_single_inference(
+    server_address: str,
+    model_name,
+    dnn_surgery: DNNSurgery,
+    split_point: int = None,
+    batch_size: int = 1,
+    *,
+    auto_plot: bool = True,
+    plot_show: bool = True,
+    plot_path: Optional[str] = None,
+) -> Tuple[torch.Tensor, Dict]:
     """Run a single inference with NeuroSurgeon optimization
     
     Args:
@@ -188,7 +197,14 @@ def run_single_inference(server_address: str, model_name, dnn_surgery: DNNSurger
     
     # Run distributed inference
     result, timings = run_distributed_inference(
-        model_name, input_tensor, dnn_surgery, split_point, server_address
+        model_name,
+        input_tensor,
+        dnn_surgery,
+        split_point,
+        server_address,
+        auto_plot=auto_plot,
+        plot_show=plot_show,
+        plot_path=plot_path,
     )
     
     # Add true label information to timing results for analysis
@@ -197,8 +213,17 @@ def run_single_inference(server_address: str, model_name, dnn_surgery: DNNSurger
     
     return result, timings
 
-def run_batch_processing(server_address: str, model_name: str, split_point: int = None, 
-                        batch_size: int = 1, num_batches: int = 1) -> List[Dict]:
+def run_batch_processing(
+    server_address: str,
+    model_name: str,
+    split_point: int = None,
+    batch_size: int = 1,
+    num_batches: int = 1,
+    *,
+    auto_plot: bool = True,
+    plot_show: bool = True,
+    plot_path: Optional[str] = None,
+) -> List[Dict]:
     """Run multiple batches and collect timing statistics"""
     
     # Ensure model is supported
@@ -227,6 +252,8 @@ def run_batch_processing(server_address: str, model_name: str, split_point: int 
     
     logger.info(f"Starting batch processing: {num_batches} batches of size {batch_size}")
     
+    should_plot = auto_plot
+
     for batch_idx in range(num_batches):
         # Get input
         input_tensor, true_labels, class_names = get_input_tensor(model_name, batch_size)
@@ -241,14 +268,29 @@ def run_batch_processing(server_address: str, model_name: str, split_point: int 
             if optimal_split_found is not None:
                 # Reuse previously found optimal split
                 result, timings = run_distributed_inference(
-                    model_name, input_tensor, dnn_surgery, optimal_split_found, server_address
+                    model_name,
+                    input_tensor,
+                    dnn_surgery,
+                    optimal_split_found,
+                    server_address,
+                    auto_plot=False,
+                    plot_show=plot_show,
+                    plot_path=plot_path,
                 )
             else:
                 # Find optimal split for first batch
                 result, timings = run_distributed_inference(
-                    model_name, input_tensor, dnn_surgery, None, server_address
+                    model_name,
+                    input_tensor,
+                    dnn_surgery,
+                    None,
+                    server_address,
+                    auto_plot=should_plot,
+                    plot_show=plot_show,
+                    plot_path=plot_path,
                 )
                 optimal_split_found = timings.get('split_point', 2)
+                should_plot = False
                 logger.info(f"Found optimal split point: {optimal_split_found} (will reuse for remaining batches)")
         
         total_time = time.time() - start_time
@@ -281,8 +323,16 @@ def run_batch_processing(server_address: str, model_name: str, split_point: int 
     
     return all_timings
 
-def test_split_points(server_address: str, model_name: str, split_points: List[int], 
-                     num_tests: int = 3) -> Dict[int, Dict]:
+def test_split_points(
+    server_address: str,
+    model_name: str,
+    split_points: List[int],
+    num_tests: int = 3,
+    *,
+    auto_plot: bool = True,
+    plot_show: bool = True,
+    plot_path: Optional[str] = None,
+) -> Dict[int, Dict]:
     """Test different split points and return performance comparison"""
     
     # Ensure model is supported
@@ -313,7 +363,15 @@ def test_split_points(server_address: str, model_name: str, split_points: List[i
         
         for test_idx in range(num_tests):
             try:
-                result, timings = run_single_inference(server_address, model_name, dnn_surgery, split_point)
+                result, timings = run_single_inference(
+                    server_address,
+                    model_name,
+                    dnn_surgery,
+                    split_point,
+                    auto_plot=auto_plot and test_idx == 0,
+                    plot_show=plot_show,
+                    plot_path=plot_path,
+                )
                 timings_list.append(timings)
                 
                 total_time = timings.get('edge_time', 0) + timings.get('cloud_time', 0) + timings.get('transfer_time', 0)
@@ -422,6 +480,25 @@ def main():
                        help='Use NeuroSurgeon optimization (default: True)')
     parser.add_argument('--no-neurosurgeon', action='store_true',
                        help='Disable NeuroSurgeon optimization')
+    parser.add_argument(
+        '--auto-plot',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Automatically generate split timing plots (default: enabled)'
+    )
+    parser.add_argument(
+        '--show-plot',
+        dest='plot_show',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Display the split timing plot window (default: enabled)'
+    )
+    parser.add_argument(
+        '--plot-save',
+        metavar='PATH',
+        default=None,
+        help='Optional path to save the generated split timing plot'
+    )
     
     args = parser.parse_args()
     
@@ -429,6 +506,12 @@ def main():
         logger.info("Starting DNN Surgery Client")
         logger.info(f"Server address: {args.server_address}")
         logger.info(f"Model: {args.model}")
+        logger.info(
+            "Auto-plot: %s (show=%s, save=%s)",
+            "enabled" if args.auto_plot else "disabled",
+            args.plot_show,
+            args.plot_save or "<none>",
+        )
         
         # Initialize dataset for supported models (ImageNet only)
         supported_models = ['resnet18', 'alexnet']
@@ -454,7 +537,15 @@ def main():
             split_points = [int(x.strip()) for x in args.test_splits.split(',')]
             logger.info(f"Testing split points: {split_points}")
             
-            results = test_split_points(args.server_address, args.model, split_points, args.num_tests)
+            results = test_split_points(
+                args.server_address,
+                args.model,
+                split_points,
+                args.num_tests,
+                auto_plot=args.auto_plot,
+                plot_show=args.plot_show,
+                plot_path=args.plot_save,
+            )
             print_performance_summary(results)
             
         # Run batch processing
@@ -464,8 +555,14 @@ def main():
             split_point = args.split_point if args.no_neurosurgeon else None
             
             timings_list = run_batch_processing(
-                args.server_address, args.model, split_point, 
-                args.batch_size, args.num_batches
+                args.server_address,
+                args.model,
+                split_point,
+                args.batch_size,
+                args.num_batches,
+                auto_plot=args.auto_plot,
+                plot_show=args.plot_show,
+                plot_path=args.plot_save,
             )
             
             # Print batch summary
@@ -501,7 +598,14 @@ def main():
             dnn_surgery = DNNSurgery(get_model(args.model), args.model)
             
             result, timings = run_single_inference(
-                args.server_address, args.model, dnn_surgery, split_point, args.batch_size
+                args.server_address,
+                args.model,
+                dnn_surgery,
+                split_point,
+                args.batch_size,
+                auto_plot=args.auto_plot,
+                plot_show=args.plot_show,
+                plot_path=args.plot_save,
             )
             
             total_time = timings.get('edge_time', 0) + timings.get('cloud_time', 0) + timings.get('transfer_time', 0)
