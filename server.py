@@ -325,7 +325,9 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 
                 # Handle tensor shape transitions (same as client)
                 profile_input = current_tensor
-                if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
+                needs_flatten = dnn_surgery._needs_flattening_for_layer(layer, current_tensor)
+                
+                if needs_flatten:
                     profile_input = torch.flatten(current_tensor, 1)
                 
                 # Profile execution time on server (multiple runs for accuracy)
@@ -351,7 +353,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 
                 # Update current tensor for next layer (same logic as client)
                 with torch.no_grad():
-                    if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
+                    if needs_flatten:
                         current_tensor = torch.flatten(current_tensor, 1)
                     current_tensor = layer(current_tensor)
             

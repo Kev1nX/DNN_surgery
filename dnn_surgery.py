@@ -300,8 +300,10 @@ class DNNSurgery:
                 
             # Before profiling, handle tensor shape transitions
             profile_input = current_tensor
-            if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
-                # For Linear layers, flatten the input for profiling
+            needs_flatten = self._needs_flattening_for_layer(layer, current_tensor)
+            
+            if needs_flatten:
+                # For layers that need flattening, flatten the input for profiling
                 profile_input = torch.flatten(current_tensor, 1)
 
             self.profiler.profile_layer(
@@ -310,7 +312,7 @@ class DNNSurgery:
             
             # Execute layer with the actual input (including potential flattening logic)
             with torch.no_grad():
-                if isinstance(layer, nn.Linear) and current_tensor.dim() > 2:
+                if needs_flatten:
                     # Apply flattening for the actual execution too
                     current_tensor = torch.flatten(current_tensor, 1)
                     
@@ -318,6 +320,30 @@ class DNNSurgery:
                 self.layer_outputs.append(current_tensor.detach().cpu())
                 
         return self.profiler.get_profiles()
+    
+    def _needs_flattening_for_layer(self, layer: nn.Module, input_tensor: torch.Tensor) -> bool:
+        """Check if we need to flatten the input before applying this layer
+        
+        Args:
+            layer: The layer to check
+            input_tensor: The input tensor
+            
+        Returns:
+            True if flattening is needed, False otherwise
+        """
+        # Check if this is a Linear layer expecting 2D input but receiving >2D input
+        if isinstance(layer, nn.Linear) and input_tensor.dim() > 2:
+            return True
+            
+        # Check if this is a Sequential classifier (like AlexNet's classifier)
+        # The classifier Sequential may contain Dropout, Linear, etc.
+        if isinstance(layer, nn.Sequential) and len(layer) > 0 and input_tensor.dim() > 2:
+            # Check if any layer in the sequential is Linear - if so, we need to flatten
+            for sublayer in layer:
+                if isinstance(sublayer, nn.Linear):
+                    return True
+        
+        return False
     
     def find_optimal_split(self, input_tensor: torch.Tensor, server_address: str) -> Tuple[int, Dict]:
         """Find optimal split point using client-side calculation with server execution times
