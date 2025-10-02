@@ -21,9 +21,10 @@ import torchvision.models as models
 from torchvision.models import (
     AlexNet_Weights,
     ResNet18_Weights,
-    EfficientNet_V2_L_Weights,
+    ResNet50_Weights,
+    GoogLeNet_Weights,
+    EfficientNet_B2_Weights,
     ConvNeXt_Base_Weights,
-    ViT_B_16_Weights,
 )
 from server import serve
 torch.backends.nnpack.enabled = False
@@ -50,7 +51,7 @@ def main():
     parser.add_argument('--max-workers', type=int, default=10,
                        help='Maximum number of worker threads (default: 10)')
     parser.add_argument('--models', nargs='+', 
-                       choices=['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16', 'all'],
+                       choices=['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base', 'all'],
                        default=['all'],
                        help='Models to register (default: all)')
     
@@ -70,7 +71,7 @@ def main():
         models_to_register = []
         
         if 'all' in args.models:
-            models_to_register = ['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16']
+            models_to_register = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
         else:
             models_to_register = args.models
             
@@ -84,29 +85,35 @@ def main():
                     servicer.register_model('resnet18', model)
                     logger.info("ResNet18 (pretrained) registered successfully")
                     
+                elif model_name == 'resnet50':
+                    model = models.resnet50(weights=ResNet50_Weights.DEFAULT)
+                    model.eval()
+                    servicer.register_model('resnet50', model)
+                    logger.info("ResNet50 (pretrained) registered successfully")
+                    
                 elif model_name == 'alexnet':
                     model = models.alexnet(weights=AlexNet_Weights.DEFAULT)
                     model.eval()
                     servicer.register_model('alexnet', model)
                     logger.info("AlexNet (pretrained) registered successfully")
                     
-                elif model_name == 'efficientnet_v2_l':
-                    model = models.efficientnet_v2_l(weights=EfficientNet_V2_L_Weights.DEFAULT)
+                elif model_name == 'googlenet':
+                    model = models.googlenet(weights=GoogLeNet_Weights.DEFAULT)
                     model.eval()
-                    servicer.register_model('efficientnet_v2_l', model)
-                    logger.info("EfficientNetV2-L (pretrained) registered successfully")
+                    servicer.register_model('googlenet', model)
+                    logger.info("GoogLeNet (pretrained) registered successfully")
+                    
+                elif model_name == 'efficientnet_b2':
+                    model = models.efficientnet_b2(weights=EfficientNet_B2_Weights.DEFAULT)
+                    model.eval()
+                    servicer.register_model('efficientnet_b2', model)
+                    logger.info("EfficientNet-B2 (pretrained) registered successfully")
                     
                 elif model_name == 'convnext_base':
                     model = models.convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT)
                     model.eval()
                     servicer.register_model('convnext_base', model)
                     logger.info("ConvNeXt-Base (pretrained) registered successfully")
-                    
-                elif model_name == 'vit_b_16':
-                    model = models.vit_b_16(weights=ViT_B_16_Weights.DEFAULT)
-                    model.eval()
-                    servicer.register_model('vit_b_16', model)
-                    logger.info("ViT-B/16 (pretrained) registered successfully")
                     
             except Exception as e:
                 logger.error(f"Failed to register {model_name}: {str(e)}")

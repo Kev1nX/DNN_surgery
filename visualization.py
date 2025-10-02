@@ -368,17 +368,33 @@ def plot_actual_split_comparison(
                 color=color,
             )
 
-        for x, avg in zip(split_points, averages):
-            if not math.isnan(avg):
-                ax.annotate(
-                    f"{avg:.1f}ms",
-                    xy=(x, avg),
-                    xytext=(0, 6),
-                    textcoords="offset points",
-                    ha="center",
-                    va="bottom",
-                    fontsize=9,
-                )
+        # Only annotate key points to avoid clutter (first, middle, last, and optimal)
+        if len(split_points) > 0:
+            key_indices = set()
+            # Always show first and last
+            key_indices.add(0)
+            if len(split_points) > 1:
+                key_indices.add(len(split_points) - 1)
+            # Add middle point if there are more than 3 points
+            if len(split_points) > 3:
+                key_indices.add(len(split_points) // 2)
+            # Add optimal point (minimum) for total component
+            if component == "total" and averages:
+                min_idx = min(range(len(averages)), key=lambda i: averages[i] if not math.isnan(averages[i]) else float('inf'))
+                key_indices.add(min_idx)
+            
+            for i in key_indices:
+                if i < len(averages) and not math.isnan(averages[i]):
+                    ax.annotate(
+                        f"{averages[i]:.1f}ms",
+                        xy=(split_points[i], averages[i]),
+                        xytext=(0, 8),
+                        textcoords="offset points",
+                        ha="center",
+                        va="bottom",
+                        fontsize=9,
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="none", alpha=0.7),
+                    )
 
     ax.set_xlabel("Split Point")
     ax.set_ylabel("Measured Latency (ms)")
@@ -469,10 +485,8 @@ def plot_multi_model_comparison(
 
         for split_point in split_points:
             timing = split_data[split_point]
-            if metric == "transfer_time":
-                value = timing.get("input_transfer_time", 0.0) + timing.get("output_transfer_time", 0.0)
-            else:
-                value = timing.get(metric, 0.0)
+            # Get the value directly from the timing dict
+            value = timing.get(metric, 0.0)
             values.append(value)
 
         color = colors[idx % len(colors)]

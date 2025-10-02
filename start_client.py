@@ -14,9 +14,10 @@ import torchvision.models as models
 from torchvision.models import (
     AlexNet_Weights,
     ResNet18_Weights,
-    EfficientNet_V2_L_Weights,
+    ResNet50_Weights,
+    GoogLeNet_Weights,
+    EfficientNet_B2_Weights,
     ConvNeXt_Base_Weights,
-    ViT_B_16_Weights,
 )
 
 from dataset.imagenet_loader import ImageNetMiniLoader
@@ -79,7 +80,7 @@ def get_input_tensor(model_name: str, batch_size: int = 1) -> Tuple[torch.Tensor
     global _dataset_iterator, _class_mapping
     
     # Only support pretrained ImageNet models
-    supported_models = ['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16']
+    supported_models = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
     if model_name not in supported_models:
         raise RuntimeError(
             f"Model '{model_name}' is not supported. Supported models: {', '.join(supported_models)}"
@@ -145,24 +146,28 @@ def get_model(model_name: str):
         model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
         model.eval()
         return model
+    if model_name == 'resnet50':
+        model = models.resnet50(weights=ResNet50_Weights.DEFAULT)
+        model.eval()
+        return model
     if model_name == 'alexnet':
         model = models.alexnet(weights=AlexNet_Weights.DEFAULT)
         model.eval()
         return model
-    if model_name == 'efficientnet_v2_l':
-        model = models.efficientnet_v2_l(weights=EfficientNet_V2_L_Weights.DEFAULT)
+    if model_name == 'googlenet':
+        model = models.googlenet(weights=GoogLeNet_Weights.DEFAULT)
+        model.eval()
+        return model
+    if model_name == 'efficientnet_b2':
+        model = models.efficientnet_b2(weights=EfficientNet_B2_Weights.DEFAULT)
         model.eval()
         return model
     if model_name == 'convnext_base':
         model = models.convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT)
         model.eval()
         return model
-    if model_name == 'vit_b_16':
-        model = models.vit_b_16(weights=ViT_B_16_Weights.DEFAULT)
-        model.eval()
-        return model
     raise ValueError(
-        f"Unknown model: {model_name}. Supported models: resnet18, alexnet, efficientnet_v2_l, convnext_base, vit_b_16"
+        f"Unknown model: {model_name}. Supported models: resnet18, resnet50, alexnet, googlenet, efficientnet_b2, convnext_base"
     )
 
 def test_connection(server_address: str) -> bool:
@@ -260,7 +265,7 @@ def run_batch_processing(
     """Run multiple batches and collect timing statistics"""
     
     # Ensure model is supported
-    supported_models = ['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16']
+    supported_models = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
     if model_name not in supported_models:
         raise RuntimeError(
             f"Model '{model_name}' is not supported. Supported models: {', '.join(supported_models)}"
@@ -402,7 +407,7 @@ def test_split_points(
 ) -> Dict[int, Dict]:
     """Test different split points and return performance comparison."""
 
-    supported_models = ['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16']
+    supported_models = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
     if model_name not in supported_models:
         raise RuntimeError(
             f"Model '{model_name}' is not supported. Supported models: {', '.join(supported_models)}"
@@ -584,7 +589,7 @@ def test_all_models_all_splits(
     Returns:
         Dictionary mapping model names to their test results
     """
-    supported_models = ['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16']
+    supported_models = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
     
     # Initialize dataset once
     initialize_dataset_loader(1)
@@ -713,9 +718,9 @@ def main():
                        help='Server address in format HOST:PORT (e.g., 192.168.1.100:50051)')
     parser.add_argument(
         '--model',
-        choices=['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16'],
+        choices=['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base'],
         default='resnet18',
-        help='Model to use for inference (default: resnet18). Supported: resnet18, alexnet, efficientnet_v2_l, convnext_base, vit_b_16',
+        help='Model to use for inference (default: resnet18). Supported: resnet18, resnet50, alexnet, googlenet, efficientnet_b2, convnext_base',
     )
     parser.add_argument('--split-point', type=int, default=None,
                        help='Split point for model partitioning (default: None - use NeuroSurgeon optimization)')
