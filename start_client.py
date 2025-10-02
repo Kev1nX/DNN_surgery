@@ -5,17 +5,28 @@ import logging
 import sys
 import time
 from collections import defaultdict
-import torch
-import numpy as np
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
+import numpy as np
+import torch
+import torchvision.models as models
+from torchvision.models import (
+    AlexNet_Weights,
+    ResNet18_Weights,
+    EfficientNet_V2_L_Weights,
+    ConvNeXt_Base_Weights,
+    ViT_B_16_Weights,
+)
 
+from dataset.imagenet_loader import ImageNetMiniLoader
 from dnn_inference_client import DNNInferenceClient, resolve_plot_paths, run_distributed_inference
 from dnn_surgery import DNNSurgery
-import torchvision.models as models
-from torchvision.models import AlexNet_Weights, ResNet18_Weights
-from dataset.imagenet_loader import ImageNetMiniLoader
-from visualization import plot_actual_inference_breakdown, plot_actual_split_comparison
+from visualization import (
+    plot_actual_inference_breakdown,
+    plot_actual_split_comparison,
+    plot_multi_model_comparison,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -68,9 +79,10 @@ def get_input_tensor(model_name: str, batch_size: int = 1) -> Tuple[torch.Tensor
     global _dataset_iterator, _class_mapping
     
     # Only support pretrained ImageNet models
-    if model_name not in ['resnet18', 'alexnet']:
+    supported_models = ['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16']
+    if model_name not in supported_models:
         raise RuntimeError(
-            f"Model '{model_name}' is not supported. Please use 'resnet18' or 'alexnet'."
+            f"Model '{model_name}' is not supported. Supported models: {', '.join(supported_models)}"
         )
     
     # Initialize dataset loader if not already done
@@ -137,8 +149,20 @@ def get_model(model_name: str):
         model = models.alexnet(weights=AlexNet_Weights.DEFAULT)
         model.eval()
         return model
+    if model_name == 'efficientnet_v2_l':
+        model = models.efficientnet_v2_l(weights=EfficientNet_V2_L_Weights.DEFAULT)
+        model.eval()
+        return model
+    if model_name == 'convnext_base':
+        model = models.convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT)
+        model.eval()
+        return model
+    if model_name == 'vit_b_16':
+        model = models.vit_b_16(weights=ViT_B_16_Weights.DEFAULT)
+        model.eval()
+        return model
     raise ValueError(
-        f"Unknown model: {model_name}. Supported models are 'resnet18' and 'alexnet'."
+        f"Unknown model: {model_name}. Supported models: resnet18, alexnet, efficientnet_v2_l, convnext_base, vit_b_16"
     )
 
 def test_connection(server_address: str) -> bool:
@@ -236,9 +260,10 @@ def run_batch_processing(
     """Run multiple batches and collect timing statistics"""
     
     # Ensure model is supported
-    if model_name not in ['resnet18', 'alexnet']:
+    supported_models = ['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16']
+    if model_name not in supported_models:
         raise RuntimeError(
-            f"Model '{model_name}' is not supported. Please use 'resnet18' or 'alexnet'."
+            f"Model '{model_name}' is not supported. Supported models: {', '.join(supported_models)}"
         )
     
     # Initialize dataset
@@ -377,9 +402,10 @@ def test_split_points(
 ) -> Dict[int, Dict]:
     """Test different split points and return performance comparison."""
 
-    if model_name not in ['resnet18', 'alexnet']:
+    supported_models = ['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16']
+    if model_name not in supported_models:
         raise RuntimeError(
-            f"Model '{model_name}' is not supported. Please use 'resnet18' or 'alexnet'."
+            f"Model '{model_name}' is not supported. Supported models: {', '.join(supported_models)}"
         )
 
     initialize_dataset_loader(1)  # Use batch size 1 for testing
@@ -538,15 +564,158 @@ def print_performance_summary(results: Dict[int, Dict]):
     print(f"OPTIMAL SPLIT POINT: {optimal_split} (Average time: {optimal_time:.1f}ms)")
     print("="*80)
 
+def test_all_models_all_splits(
+    server_address: str,
+    num_tests: int = 3,
+    *,
+    auto_plot: bool = True,
+    plot_show: bool = True,
+    plot_base_path: Optional[str] = None,
+) -> Dict[str, Dict[int, Dict]]:
+    """Test all supported models across all their split points.
+    
+    Args:
+        server_address: Server address
+        num_tests: Number of test runs per split point
+        auto_plot: Whether to generate plots
+        plot_show: Whether to show plots interactively
+        plot_base_path: Base directory for saving plots
+        
+    Returns:
+        Dictionary mapping model names to their test results
+    """
+    supported_models = ['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16']
+    
+    # Initialize dataset once
+    initialize_dataset_loader(1)
+    
+    all_model_results = {}
+    all_model_timings = {}  # For multi-model comparison
+    
+    logger.info("="*80)
+    logger.info("COMPREHENSIVE MODEL TESTING")
+    logger.info("Testing all models across all split points")
+    logger.info("="*80)
+    
+    for model_name in supported_models:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Testing model: {model_name}")
+        logger.info('='*80)
+        
+        try:
+            # Get model and create DNN Surgery instance
+            model = get_model(model_name)
+            dnn_surgery = DNNSurgery(model, model_name)
+            
+            # Profile to determine number of layers
+            input_tensor, _, _ = get_input_tensor(model_name, 1)
+            dnn_surgery.profile_model(input_tensor)
+            num_layers = len(dnn_surgery.splitter.layers)
+            
+            # Test all split points for this model
+            split_points = list(range(num_layers + 1))
+            logger.info(f"Model has {num_layers} layers, testing {len(split_points)} split points: {split_points}")
+            
+            # Determine save path for this model's individual plot
+            model_plot_path = None
+            if auto_plot and plot_base_path:
+                plot_dir = Path(plot_base_path)
+                plot_dir.mkdir(parents=True, exist_ok=True)
+                model_plot_path = str(plot_dir / f"{model_name}_split_comparison.png")
+            
+            # Run the split point tests
+            results = test_split_points(
+                server_address,
+                model_name,
+                split_points,
+                num_tests=num_tests,
+                auto_plot=auto_plot,
+                plot_show=plot_show,
+                plot_path=model_plot_path,
+            )
+            
+            all_model_results[model_name] = results
+            
+            # Extract timing data for multi-model comparison
+            model_timings = {}
+            for split_point, metrics in results.items():
+                model_timings[split_point] = {
+                    'total_time': metrics['avg_total_time'],
+                    'client_time': metrics.get('avg_edge_time', 0.0),
+                    'server_time': metrics.get('avg_cloud_time', 0.0),
+                    'transfer_time': metrics.get('avg_transfer_time', 0.0),
+                }
+            all_model_timings[model_name] = model_timings
+            
+            logger.info(f"✓ Completed testing {model_name}")
+            
+        except Exception as e:
+            logger.error(f"✗ Failed to test {model_name}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Generate multi-model comparison plot
+    if auto_plot and all_model_timings:
+        logger.info("\n" + "="*80)
+        logger.info("Generating multi-model comparison plots...")
+        logger.info("="*80)
+        
+        try:
+            plot_dir = Path(plot_base_path) if plot_base_path else Path("plots")
+            plot_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Generate comparison for each metric
+            metrics_to_plot = [
+                ('total_time', 'Total Latency'),
+                ('client_time', 'Client Execution Time'),
+                ('server_time', 'Server Execution Time'),
+                ('transfer_time', 'Data Transfer Time'),
+            ]
+            
+            for metric, metric_name in metrics_to_plot:
+                save_path = str(plot_dir / f"multi_model_comparison_{metric}.png")
+                plot_multi_model_comparison(
+                    all_model_timings,
+                    show=plot_show,
+                    save_path=save_path,
+                    title=f"Multi-Model Comparison: {metric_name}",
+                    metric=metric,
+                )
+                logger.info(f"✓ Saved {metric_name} comparison to {save_path}")
+            
+            logger.info("✓ All comparison plots generated successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate multi-model comparison: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    # Print summary
+    logger.info("\n" + "="*80)
+    logger.info("COMPREHENSIVE TEST SUMMARY")
+    logger.info("="*80)
+    
+    for model_name, results in all_model_results.items():
+        if results:
+            best_split = min(results.items(), key=lambda x: x[1]['avg_total_time'])
+            logger.info(f"{model_name:20s}: Optimal split={best_split[0]:2d}, Time={best_split[1]['avg_total_time']:.1f}ms")
+        else:
+            logger.info(f"{model_name:20s}: No results")
+    
+    logger.info("="*80)
+    
+    return all_model_results
+
 def main():
     parser = argparse.ArgumentParser(description='DNN Surgery Client')
     parser.add_argument('--server-address', required=True,
                        help='Server address in format HOST:PORT (e.g., 192.168.1.100:50051)')
     parser.add_argument(
         '--model',
-        choices=['resnet18', 'alexnet'],
+        choices=['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16'],
         default='resnet18',
-        help='Model to use for inference (default: resnet18). Supported: resnet18, alexnet',
+        help='Model to use for inference (default: resnet18). Supported: resnet18, alexnet, efficientnet_v2_l, convnext_base, vit_b_16',
     )
     parser.add_argument('--split-point', type=int, default=None,
                        help='Split point for model partitioning (default: None - use NeuroSurgeon optimization)')
@@ -560,6 +729,8 @@ def main():
                        help='Number of tests per split point (default: 3)')
     parser.add_argument('--test-connection', action='store_true',
                        help='Test connection to server and exit')
+    parser.add_argument('--test-all-models', action='store_true',
+                       help='Test all supported models across all split points and generate comparison plots')
     parser.add_argument('--use-neurosurgeon', action='store_true', default=True,
                        help='Use NeuroSurgeon optimization (default: True)')
     parser.add_argument('--no-neurosurgeon', action='store_true',
@@ -598,10 +769,10 @@ def main():
         )
         
         # Initialize dataset for supported models (ImageNet only)
-        supported_models = ['resnet18', 'alexnet']
+        supported_models = ['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16']
         if args.model not in supported_models:
             logger.error(f"Model '{args.model}' is not supported")
-            logger.error("Supported models: resnet18, alexnet")
+            logger.error(f"Supported models: {', '.join(supported_models)}")
             sys.exit(1)
 
         logger.info("Initializing ImageNet mini dataset for image inference...")
@@ -615,6 +786,19 @@ def main():
             else:
                 logger.error("Connection test failed!")
                 sys.exit(1)
+        
+        # Test all models across all split points
+        if args.test_all_models:
+            logger.info("Testing all models across all split points...")
+            test_all_models_all_splits(
+                args.server_address,
+                num_tests=args.num_tests,
+                auto_plot=args.auto_plot,
+                plot_show=args.plot_show,
+                plot_base_path=args.plot_save or "plots/comprehensive",
+            )
+            logger.info("Comprehensive testing complete!")
+            sys.exit(0)
         
         # Test multiple split points if specified
         if args.test_splits:

@@ -25,6 +25,7 @@ __all__ = [
     "plot_split_timing",
     "plot_actual_inference_breakdown",
     "plot_actual_split_comparison",
+    "plot_multi_model_comparison",
 ]
 
 
@@ -385,6 +386,141 @@ def plot_actual_split_comparison(
     ax.set_title(title or "Measured Inference Timings by Split Point")
     ax.grid(True, which="major", linestyle=":", linewidth=0.5, alpha=0.7)
     ax.legend()
+
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+
+    return fig
+
+
+def plot_multi_model_comparison(
+    model_timings: Dict[str, Dict[int, Dict[str, float]]],
+    *,
+    show: bool = False,
+    save_path: Optional[str] = None,
+    title: Optional[str] = None,
+    metric: str = "total_time",
+) -> object:
+    """Compare timing performance across multiple models and split points.
+
+    Args:
+        model_timings: Nested dictionary structure:
+            {
+                'model_name': {
+                    split_point: {
+                        'total_time': float,
+                        'client_time': float,
+                        'server_time': float,
+                        'input_transfer_time': float,
+                        'output_transfer_time': float,
+                    },
+                    ...
+                },
+                ...
+            }
+        show: Whether to display the chart interactively.
+        save_path: Optional filesystem path to persist the chart as an image.
+        title: Optional override for the chart title.
+        metric: Which timing metric to compare. Options:
+            - 'total_time': Total latency (default)
+            - 'client_time': Client-side execution time
+            - 'server_time': Server-side execution time
+            - 'transfer_time': Combined transfer time
+
+    Returns:
+        The created ``matplotlib.figure.Figure`` instance.
+    """
+
+    if not model_timings:
+        raise ValueError("Cannot plot multi-model comparison without timing data")
+
+    if plt is None:
+        raise ImportError(
+            "matplotlib is required to plot multi-model comparisons. Install with 'pip install matplotlib'."
+        )
+
+    # Color palette for different models
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f"]
+    
+    # Markers for different models
+    markers = ["o", "s", "^", "D", "v", "p", "*", "X"]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    metric_labels = {
+        "total_time": "Total Latency (ms)",
+        "client_time": "Client Time (ms)",
+        "server_time": "Server Time (ms)",
+        "transfer_time": "Transfer Time (ms)",
+    }
+
+    ylabel = metric_labels.get(metric, "Latency (ms)")
+
+    for idx, (model_name, split_data) in enumerate(sorted(model_timings.items())):
+        if not split_data:
+            continue
+
+        split_points = sorted(split_data.keys())
+        values = []
+
+        for split_point in split_points:
+            timing = split_data[split_point]
+            if metric == "transfer_time":
+                value = timing.get("input_transfer_time", 0.0) + timing.get("output_transfer_time", 0.0)
+            else:
+                value = timing.get(metric, 0.0)
+            values.append(value)
+
+        color = colors[idx % len(colors)]
+        marker = markers[idx % len(markers)]
+        
+        ax.plot(
+            split_points,
+            values,
+            marker=marker,
+            linewidth=2.0,
+            markersize=8,
+            label=model_name,
+            color=color,
+        )
+
+        # Add value annotations at key points (first, middle, last)
+        if len(split_points) >= 3:
+            key_indices = [0, len(split_points) // 2, -1]
+        else:
+            key_indices = range(len(split_points))
+
+        for i in key_indices:
+            ax.annotate(
+                f"{values[i]:.1f}",
+                xy=(split_points[i], values[i]),
+                xytext=(0, 8),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color=color,
+            )
+
+    ax.set_xlabel("Split Point", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    
+    # Set x-axis ticks to show all split points
+    all_splits = sorted(set(
+        split_point
+        for split_data in model_timings.values()
+        for split_point in split_data.keys()
+    ))
+    if all_splits:
+        ax.set_xticks(all_splits)
+
+    ax.set_title(title or f"Multi-Model Comparison: {ylabel}", fontsize=14)
+    ax.grid(True, which="major", linestyle=":", linewidth=0.5, alpha=0.7)
+    ax.legend(loc="best", fontsize=10)
 
     fig.tight_layout()
 
