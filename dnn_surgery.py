@@ -205,11 +205,13 @@ class ModelSplitter:
                 if isinstance(layer, nn.Linear) and input_tensor.dim() > 2:
                     return True
                     
-                # Check if this is a Sequential that starts with Linear/Dropout
-                if isinstance(layer, nn.Sequential) and len(layer) > 0:
-                    first_layer = layer[0]
-                    if isinstance(first_layer, (nn.Linear, nn.Dropout)) and input_tensor.dim() > 2:
-                        return True
+                # Check if this is a Sequential classifier (like AlexNet's classifier)
+                # The classifier Sequential may contain Dropout, Linear, etc.
+                if isinstance(layer, nn.Sequential) and len(layer) > 0 and input_tensor.dim() > 2:
+                    # Check if any layer in the sequential is Linear - if so, we need to flatten
+                    for sublayer in layer:
+                        if isinstance(sublayer, nn.Linear):
+                            return True
                 
                 return False
                 
@@ -248,17 +250,13 @@ class ModelSplitter:
                 if isinstance(layer, nn.Linear) and input_tensor.dim() > 2:
                     return True
                     
-                # Check if this is a Sequential classifier that starts with Linear/Dropout
-                if isinstance(layer, nn.Sequential) and len(layer) > 0:
-                    first_layer = layer[0]
-                    if isinstance(first_layer, (nn.Linear, nn.Dropout)) and input_tensor.dim() > 2:
-                        return True
-                
-                # Check for adaptive pooling followed by flatten
-                # Some models have this pattern: AdaptiveAvgPool2d -> flatten -> Linear
-                if hasattr(layer, '__class__') and 'Linear' in str(layer.__class__):
-                    if input_tensor.dim() > 2:
-                        return True
+                # Check if this is a Sequential classifier (like AlexNet's classifier)
+                # The classifier Sequential may contain Dropout, Linear, etc.
+                if isinstance(layer, nn.Sequential) and len(layer) > 0 and input_tensor.dim() > 2:
+                    # Check if any layer in the sequential is Linear - if so, we need to flatten
+                    for sublayer in layer:
+                        if isinstance(sublayer, nn.Linear):
+                            return True
                 
                 return False
                 
