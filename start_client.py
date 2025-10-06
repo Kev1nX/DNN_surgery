@@ -4,7 +4,9 @@ import argparse
 import logging
 import sys
 import time
+import traceback
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
@@ -27,6 +29,7 @@ from visualization import (
     plot_actual_inference_breakdown,
     plot_actual_split_comparison,
     plot_multi_model_comparison,
+    plot_model_comparison_bar,
 )
 
 # Configure logging
@@ -79,12 +82,7 @@ def get_input_tensor(model_name: str, batch_size: int = 1) -> Tuple[torch.Tensor
     """
     global _dataset_iterator, _class_mapping
     
-    # Only support pretrained ImageNet models
-    supported_models = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
-    if model_name not in supported_models:
-        raise RuntimeError(
-            f"Model '{model_name}' is not supported. Supported models: {', '.join(supported_models)}"
-        )
+    validate_model(model_name)
     
     # Initialize dataset loader if not already done
     if _dataset_loader is None:
@@ -140,35 +138,51 @@ def create_sample_input(model_name: str, batch_size: int = 1) -> torch.Tensor:
     # For backward compatibility, just return the tensor
     return input_tensor
 
+# Supported models configuration
+SUPPORTED_MODELS = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
+
+MODEL_REGISTRY = {
+    'resnet18': (models.resnet18, ResNet18_Weights.DEFAULT),
+    'resnet50': (models.resnet50, ResNet50_Weights.DEFAULT),
+    'alexnet': (models.alexnet, AlexNet_Weights.DEFAULT),
+    'googlenet': (models.googlenet, GoogLeNet_Weights.DEFAULT),
+    'efficientnet_b2': (models.efficientnet_b2, EfficientNet_B2_Weights.DEFAULT),
+    'convnext_base': (models.convnext_base, ConvNeXt_Base_Weights.DEFAULT),
+}
+
 def get_model(model_name: str):
     """Get model instance by name"""
-    if model_name == 'resnet18':
-        model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
-        model.eval()
-        return model
-    if model_name == 'resnet50':
-        model = models.resnet50(weights=ResNet50_Weights.DEFAULT)
-        model.eval()
-        return model
-    if model_name == 'alexnet':
-        model = models.alexnet(weights=AlexNet_Weights.DEFAULT)
-        model.eval()
-        return model
-    if model_name == 'googlenet':
-        model = models.googlenet(weights=GoogLeNet_Weights.DEFAULT)
-        model.eval()
-        return model
-    if model_name == 'efficientnet_b2':
-        model = models.efficientnet_b2(weights=EfficientNet_B2_Weights.DEFAULT)
-        model.eval()
-        return model
-    if model_name == 'convnext_base':
-        model = models.convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT)
-        model.eval()
-        return model
-    raise ValueError(
-        f"Unknown model: {model_name}. Supported models: resnet18, resnet50, alexnet, googlenet, efficientnet_b2, convnext_base"
-    )
+    if model_name not in MODEL_REGISTRY:
+        raise ValueError(
+            f"Unknown model: {model_name}. Supported models: {', '.join(SUPPORTED_MODELS)}"
+        )
+    model_fn, weights = MODEL_REGISTRY[model_name]
+    return model_fn(weights=weights).eval()
+
+def calculate_timing_averages(timings_list: List[Dict]) -> Dict[str, float]:
+    """Calculate average timings from a list of timing dictionaries"""
+    if not timings_list:
+        return {}
+    
+    avg_edge = np.mean([t.get('edge_time', 0) for t in timings_list])
+    avg_cloud = np.mean([t.get('cloud_time', 0) for t in timings_list])
+    avg_transfer = np.mean([t.get('transfer_time', 0) for t in timings_list])
+    avg_total = avg_edge + avg_cloud + avg_transfer
+    
+    return {
+        'avg_edge_time': avg_edge,
+        'avg_cloud_time': avg_cloud,
+        'avg_transfer_time': avg_transfer,
+        'avg_total_time': avg_total,
+        'num_tests': len(timings_list),
+    }
+
+def validate_model(model_name: str) -> None:
+    """Validate that a model is supported"""
+    if model_name not in SUPPORTED_MODELS:
+        raise RuntimeError(
+            f"Model '{model_name}' is not supported. Supported models: {', '.join(SUPPORTED_MODELS)}"
+        )
 
 def test_connection(server_address: str) -> bool:
     """Test if server is reachable"""
@@ -263,13 +277,7 @@ def run_batch_processing(
     plot_path: Optional[str] = None,
 ) -> List[Dict]:
     """Run multiple batches and collect timing statistics"""
-    
-    # Ensure model is supported
-    supported_models = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
-    if model_name not in supported_models:
-        raise RuntimeError(
-            f"Model '{model_name}' is not supported. Supported models: {', '.join(supported_models)}"
-        )
+    validate_model(model_name)
     
     # Initialize dataset
     initialize_dataset_loader(batch_size)
@@ -406,14 +414,8 @@ def test_split_points(
     plot_path: Optional[str] = None,
 ) -> Dict[int, Dict]:
     """Test different split points and return performance comparison."""
-
-    supported_models = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
-    if model_name not in supported_models:
-        raise RuntimeError(
-            f"Model '{model_name}' is not supported. Supported models: {', '.join(supported_models)}"
-        )
-
-    initialize_dataset_loader(1)  # Use batch size 1 for testing
+    validate_model(model_name)
+    initialize_dataset_loader(1)
 
     model = get_model(model_name)
     dnn_surgery = DNNSurgery(model, model_name)
@@ -496,22 +498,11 @@ def test_split_points(
                 continue
 
         if timings_list:
-            avg_edge = np.mean([t.get('edge_time', 0) for t in timings_list])
-            avg_cloud = np.mean([t.get('cloud_time', 0) for t in timings_list])
-            avg_transfer = np.mean([t.get('transfer_time', 0) for t in timings_list])
-            avg_total = avg_edge + avg_cloud + avg_transfer
-
-            results[split_point] = {
-                'avg_edge_time': avg_edge,
-                'avg_cloud_time': avg_cloud,
-                'avg_transfer_time': avg_transfer,
-                'avg_total_time': avg_total,
-                'num_tests': len(timings_list),
-            }
-
+            results[split_point] = calculate_timing_averages(timings_list)
+            avg = results[split_point]
             logger.info(
-                f"  Average: Total={avg_total:.1f}ms "
-                f"(Edge={avg_edge:.1f}ms, Cloud={avg_cloud:.1f}ms, Transfer={avg_transfer:.1f}ms)"
+                f"  Average: Total={avg['avg_total_time']:.1f}ms "
+                f"(Edge={avg['avg_edge_time']:.1f}ms, Cloud={avg['avg_cloud_time']:.1f}ms, Transfer={avg['avg_transfer_time']:.1f}ms)"
             )
 
     if auto_plot and split_actual_components:
@@ -591,12 +582,6 @@ def test_all_models_single_split(
     Returns:
         Dictionary mapping model names to their timing results
     """
-    from datetime import datetime
-    from visualization import plot_model_comparison_bar
-    
-    supported_models = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
-    
-    # Initialize dataset once
     initialize_dataset_loader(1)
     
     all_model_timings = {}
@@ -605,7 +590,7 @@ def test_all_models_single_split(
     logger.info(f"TESTING ALL MODELS AT SPLIT POINT {split_point}")
     logger.info("="*80)
     
-    for model_name in supported_models:
+    for model_name in SUPPORTED_MODELS:
         logger.info(f"\n{'='*80}")
         logger.info(f"Testing model: {model_name} at split point {split_point}")
         logger.info('='*80)
@@ -751,9 +736,6 @@ def test_all_models_all_splits(
     Returns:
         Dictionary mapping model names to their test results
     """
-    supported_models = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
-    
-    # Initialize dataset once
     initialize_dataset_loader(1)
     
     all_model_results = {}
@@ -764,7 +746,7 @@ def test_all_models_all_splits(
     logger.info("Testing all models across all split points")
     logger.info("="*80)
     
-    for model_name in supported_models:
+    for model_name in SUPPORTED_MODELS:
         logger.info(f"\n{'='*80}")
         logger.info(f"Testing model: {model_name}")
         logger.info('='*80)
@@ -818,7 +800,6 @@ def test_all_models_all_splits(
             
         except Exception as e:
             logger.error(f"✗ Failed to test {model_name}: {str(e)}")
-            import traceback
             traceback.print_exc()
             continue
     
@@ -855,7 +836,6 @@ def test_all_models_all_splits(
             
         except Exception as e:
             logger.error(f"Failed to generate multi-model comparison: {str(e)}")
-            import traceback
             traceback.print_exc()
     
     # Print summary
@@ -937,12 +917,8 @@ def main():
             args.plot_save or "<none>",
         )
         
-        # Initialize dataset for supported models (ImageNet only)
-        supported_models = ['resnet18', 'alexnet', 'efficientnet_v2_l', 'convnext_base', 'vit_b_16']
-        if args.model not in supported_models:
-            logger.error(f"Model '{args.model}' is not supported")
-            logger.error(f"Supported models: {', '.join(supported_models)}")
-            sys.exit(1)
+        # Validate model is supported
+        validate_model(args.model)
 
         logger.info("Initializing ImageNet mini dataset for image inference...")
         initialize_dataset_loader(args.batch_size)
