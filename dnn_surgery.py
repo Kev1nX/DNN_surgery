@@ -98,21 +98,26 @@ class LayerProfiler:
                      layer_idx: int, layer_name: str) -> Dict:
         # Profile execution time with multiple runs for accuracy
         times = []
-        for _ in range(3):  # Multiple measurements for accuracy
-            cuda_sync()
-            start_time = time.perf_counter()
-            
-            with torch.no_grad():
-                output = layer(input_tensor)
-
-            cuda_sync()
-            end_time = time.perf_counter()
-            
-            times.append((end_time - start_time) * 1000)  # Convert to ms
+        output = None
         
-        # Use median time to avoid outliers
-        execution_time = sorted(times)[len(times)//2]
-    
+        try:
+            for _ in range(3):  # Multiple measurements for accuracy
+                cuda_sync()
+                start_time = time.perf_counter()
+                
+                with torch.no_grad():
+                    output = layer(input_tensor)
+
+                cuda_sync()
+                end_time = time.perf_counter()
+                
+                times.append((end_time - start_time) * 1000)  # Convert to ms
+            
+            # Use median time to avoid outliers
+            execution_time = sorted(times)[len(times)//2]
+        except Exception as e:
+            logger.error(f"Error profiling layer {layer_idx} ({layer_name}): {e}")
+            raise
         
         # Calculate tensor sizes
         input_size = list(input_tensor.shape)
@@ -159,10 +164,79 @@ class ModelSplitter:
             logger.debug(f"Component {i}: {layer.__class__.__name__}")
     
     def _get_model_layers(self, model: nn.Module) -> List[nn.Module]:
-        """Get model layers using the model's natural structure"""
-        # For most pretrained models, just use the direct children
-        # This preserves the model's intended structure
-        layers = list(model.children())
+        """Get model layers with intelligent grouping to respect skip connections
+        
+        This method extracts layers while keeping residual blocks and other
+        skip-connection structures together as atomic units.
+        """
+        layers = []
+        
+        def _has_skip_connection(module: nn.Module) -> bool:
+            """Detect if a module has skip connections by analyzing its structure
+            
+            A module likely has skip connections if:
+            1. It's not a Sequential (which is purely linear)
+            2. It has multiple child modules (suggesting parallel paths)
+            3. It's not a simple wrapper (like ModuleList, ModuleDict)
+            """
+            # Sequential containers are always linear, no skip connections
+            if isinstance(module, (nn.Sequential, nn.ModuleList, nn.ModuleDict)):
+                return False
+            
+            # Get child modules
+            children = list(module.children())
+            
+            # If it has 2+ children and isn't just a container, it likely has skip connections
+            # This catches ResNet blocks, attention modules, etc.
+            if len(children) >= 2:
+                return True
+                
+            return False
+        
+        def _is_atomic_layer(module: nn.Module) -> bool:
+            """Check if a module should be treated as a single atomic unit"""
+            # Basic layers that shouldn't be split further
+            atomic_types = (nn.Conv2d, nn.Linear, nn.BatchNorm2d, nn.ReLU, 
+                          nn.MaxPool2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d,
+                          nn.Dropout, nn.Flatten, nn.LayerNorm, nn.GELU,
+                          nn.BatchNorm1d, nn.ReLU6, nn.Sigmoid, nn.Tanh)
+            
+            if isinstance(module, atomic_types):
+                return True
+            
+            # Modules with skip connections are atomic
+            if _has_skip_connection(module):
+                return True
+                
+            return False
+        
+        def _flatten_sequential(seq: nn.Sequential) -> List[nn.Module]:
+            """Flatten a Sequential container, respecting skip connections"""
+            result = []
+            for child in seq.children():
+                if _is_atomic_layer(child):
+                    # Keep as single unit
+                    result.append(child)
+                elif isinstance(child, nn.Sequential):
+                    # Recursively flatten nested Sequential
+                    result.extend(_flatten_sequential(child))
+                else:
+                    # Complex module - keep as single unit
+                    result.append(child)
+            return result
+        
+        # Process top-level children
+        for child in model.children():
+            if _is_atomic_layer(child):
+                # Keep as single unit (e.g., ResNet blocks, basic layers)
+                layers.append(child)
+            elif isinstance(child, nn.Sequential):
+                # Flatten Sequential containers while respecting skip connections
+                flattened = _flatten_sequential(child)
+                layers.extend(flattened)
+            else:
+                # Complex module - keep as single unit
+                layers.append(child)
         
         return layers
         
@@ -209,6 +283,11 @@ class ModelSplitter:
                 # Check if this is a Sequential classifier (like AlexNet's classifier)
                 # The classifier Sequential may contain Dropout, Linear, etc.
                 if isinstance(layer, nn.Sequential) and len(layer) > 0 and input_tensor.dim() > 2:
+                    # First check if the Sequential already has a Flatten layer - if so, don't flatten
+                    for sublayer in layer:
+                        if isinstance(sublayer, nn.Flatten):
+                            return False  # Sequential will handle flattening itself
+                    
                     # Check if any layer in the sequential is Linear - if so, we need to flatten
                     for sublayer in layer:
                         if isinstance(sublayer, nn.Linear):
@@ -254,6 +333,11 @@ class ModelSplitter:
                 # Check if this is a Sequential classifier (like AlexNet's classifier)
                 # The classifier Sequential may contain Dropout, Linear, etc.
                 if isinstance(layer, nn.Sequential) and len(layer) > 0 and input_tensor.dim() > 2:
+                    # First check if the Sequential already has a Flatten layer - if so, don't flatten
+                    for sublayer in layer:
+                        if isinstance(sublayer, nn.Flatten):
+                            return False  # Sequential will handle flattening itself
+                    
                     # Check if any layer in the sequential is Linear - if so, we need to flatten
                     for sublayer in layer:
                         if isinstance(sublayer, nn.Linear):
@@ -295,30 +379,36 @@ class DNNSurgery:
         
         # Profile each layer
         for idx, layer in enumerate(self.splitter.layers):
-            layer_name = layer.__class__.__name__
-            if hasattr(layer, '_get_name'):
-                layer_name = layer._get_name()
-                
-            # Before profiling, handle tensor shape transitions
-            profile_input = current_tensor
-            needs_flatten = self._needs_flattening_for_layer(layer, current_tensor)
-            
-            if needs_flatten:
-                # For layers that need flattening, flatten the input for profiling
-                profile_input = torch.flatten(current_tensor, 1)
-
-            self.profiler.profile_layer(
-                layer, profile_input, idx, layer_name
-            )
-            
-            # Execute layer with the actual input (including potential flattening logic)
-            with torch.no_grad():
-                if needs_flatten:
-                    # Apply flattening for the actual execution too
-                    current_tensor = torch.flatten(current_tensor, 1)
+            try:
+                layer_name = layer.__class__.__name__
+                if hasattr(layer, '_get_name'):
+                    layer_name = layer._get_name()
                     
-                current_tensor = layer(current_tensor)
-                self.layer_outputs.append(current_tensor.detach().cpu())
+                # Before profiling, handle tensor shape transitions
+                profile_input = current_tensor
+                needs_flatten = self._needs_flattening_for_layer(layer, current_tensor)
+                
+                if needs_flatten:
+                    # For layers that need flattening, flatten the input for profiling
+                    profile_input = torch.flatten(current_tensor, 1)
+
+                self.profiler.profile_layer(
+                    layer, profile_input, idx, layer_name
+                )
+                
+                # Execute layer with the actual input (including potential flattening logic)
+                with torch.no_grad():
+                    if needs_flatten:
+                        # Apply flattening for the actual execution too
+                        current_tensor = torch.flatten(current_tensor, 1)
+                        
+                    current_tensor = layer(current_tensor)
+                    self.layer_outputs.append(current_tensor.detach().cpu())
+            except Exception as e:
+                logger.error(f"Failed to profile layer {idx} ({layer_name}): {e}")
+                logger.error(f"Input tensor shape: {current_tensor.shape}, dtype: {current_tensor.dtype}")
+                logger.error(f"Layer: {layer}")
+                raise RuntimeError(f"Profiling failed at layer {idx} ({layer_name}): {e}") from e
                 
         return self.profiler.get_profiles()
     
@@ -339,6 +429,11 @@ class DNNSurgery:
         # Check if this is a Sequential classifier (like AlexNet's classifier)
         # The classifier Sequential may contain Dropout, Linear, etc.
         if isinstance(layer, nn.Sequential) and len(layer) > 0 and input_tensor.dim() > 2:
+            # First check if the Sequential already has a Flatten layer - if so, don't flatten
+            for sublayer in layer:
+                if isinstance(sublayer, nn.Flatten):
+                    return False  # Sequential will handle flattening itself
+            
             # Check if any layer in the sequential is Linear - if so, we need to flatten
             for sublayer in layer:
                 if isinstance(sublayer, nn.Linear):
