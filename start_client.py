@@ -5,6 +5,7 @@ import logging
 import sys
 import time
 import traceback
+import warnings
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,11 @@ from torchvision.models import (
     EfficientNet_B2_Weights,
     ConvNeXt_Base_Weights,
 )
+
+# Suppress NNPACK warnings
+torch.backends.nnpack.enabled = False
+warnings.filterwarnings('ignore', message='.*NNPACK.*')
+warnings.filterwarnings('ignore', category=UserWarning, module='torch')
 
 from dataset.imagenet_loader import ImageNetMiniLoader
 from dnn_inference_client import DNNInferenceClient, resolve_plot_paths, run_distributed_inference

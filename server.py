@@ -1,5 +1,6 @@
 import grpc
 import logging
+import warnings
 from concurrent import futures
 import torch
 import torch.nn as nn
@@ -10,7 +11,11 @@ import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
 from dnn_surgery import DNNSurgery, ModelSplitter, NetworkProfiler, LayerProfiler
 from grpc_utils import proto_to_tensor, tensor_to_proto
+
+# Suppress NNPACK warnings
 torch.backends.nnpack.enabled = False
+warnings.filterwarnings('ignore', message='.*NNPACK.*')
+warnings.filterwarnings('ignore', category=UserWarning, module='torch')
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
     if torch.cuda.is_available():

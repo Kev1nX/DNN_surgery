@@ -16,6 +16,7 @@ import argparse
 import logging
 import signal
 import sys
+import warnings
 import torch
 import torchvision.models as models
 from torchvision.models import (
@@ -27,7 +28,11 @@ from torchvision.models import (
     ConvNeXt_Base_Weights,
 )
 from server import serve
+
+# Suppress NNPACK warnings
 torch.backends.nnpack.enabled = False
+warnings.filterwarnings('ignore', message='.*NNPACK.*')
+warnings.filterwarnings('ignore', category=UserWarning, module='torch')
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
