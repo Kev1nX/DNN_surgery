@@ -340,9 +340,6 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         logger.info("Successfully processed tensor %s/%s with model %s", idx + 1, batch_size, model_id)
         results[idx] = result_tensor
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     def process_tensor(
         self,
         tensor: torch.Tensor,

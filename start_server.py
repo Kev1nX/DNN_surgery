@@ -29,10 +29,7 @@ from torchvision.models import (
 )
 from server import serve
 
-# Suppress NNPACK warnings
-torch.backends.nnpack.enabled = False
-warnings.filterwarnings('ignore', message='.*NNPACK.*')
-warnings.filterwarnings('ignore', category=UserWarning, module='torch')
+warnings.filterwarnings('ignore')
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,

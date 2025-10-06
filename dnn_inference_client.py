@@ -13,7 +13,8 @@ from config import GRPC_SETTINGS
 from dnn_surgery import DNNSurgery
 from visualization import plot_actual_inference_breakdown, plot_split_timing
 from grpc_utils import proto_to_tensor, tensor_to_proto
-
+import warnings
+warnings.filterwarnings('ignore')
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,

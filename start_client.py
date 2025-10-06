@@ -24,9 +24,7 @@ from torchvision.models import (
 )
 
 # Suppress NNPACK warnings
-torch.backends.nnpack.enabled = False
-warnings.filterwarnings('ignore', message='.*NNPACK.*')
-warnings.filterwarnings('ignore', category=UserWarning, module='torch')
+warnings.filterwarnings('ignore')
 
 from dataset.imagenet_loader import ImageNetMiniLoader
 from dnn_inference_client import DNNInferenceClient, resolve_plot_paths, run_distributed_inference

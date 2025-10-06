@@ -9,7 +9,8 @@ import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
 from visualization import build_split_timing_summary, format_split_summary
-
+import warnings
+warnings.filterwarnings('ignore')
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
     if torch.cuda.is_available():

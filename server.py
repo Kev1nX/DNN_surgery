@@ -14,8 +14,7 @@ from grpc_utils import proto_to_tensor, tensor_to_proto
 
 # Suppress NNPACK warnings
 torch.backends.nnpack.enabled = False
-warnings.filterwarnings('ignore', message='.*NNPACK.*')
-warnings.filterwarnings('ignore', category=UserWarning, module='torch')
+warnings.filterwarnings('ignore')
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
     if torch.cuda.is_available():
