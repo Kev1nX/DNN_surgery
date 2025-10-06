@@ -448,9 +448,9 @@ def test_split_points(
                     model_name,
                     dnn_surgery,
                     split_point,
-                    auto_plot=auto_plot and test_idx == 0,
-                    plot_show=plot_show,
-                    plot_path=plot_path,
+                    auto_plot=False,  # Don't generate bar charts for individual split points
+                    plot_show=False,
+                    plot_path=None,
                 )
                 timings_list.append(timings)
 
@@ -568,6 +568,168 @@ def print_performance_summary(results: Dict[int, Dict]):
     print("-" * 80)
     print(f"OPTIMAL SPLIT POINT: {optimal_split} (Average time: {optimal_time:.1f}ms)")
     print("="*80)
+
+def test_all_models_single_split(
+    server_address: str,
+    split_point: int,
+    num_tests: int = 3,
+    *,
+    auto_plot: bool = True,
+    plot_show: bool = True,
+    plot_path: Optional[str] = None,
+) -> Dict[str, Dict]:
+    """Test all supported models at a single split point and compare their performance.
+    
+    Args:
+        server_address: Server address
+        split_point: Split point to test across all models
+        num_tests: Number of test runs per model
+        auto_plot: Whether to generate plots
+        plot_show: Whether to show plots interactively
+        plot_path: Path for saving the plot
+        
+    Returns:
+        Dictionary mapping model names to their timing results
+    """
+    from datetime import datetime
+    from visualization import plot_model_comparison_bar
+    
+    supported_models = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
+    
+    # Initialize dataset once
+    initialize_dataset_loader(1)
+    
+    all_model_timings = {}
+    
+    logger.info("="*80)
+    logger.info(f"TESTING ALL MODELS AT SPLIT POINT {split_point}")
+    logger.info("="*80)
+    
+    for model_name in supported_models:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Testing model: {model_name} at split point {split_point}")
+        logger.info('='*80)
+        
+        try:
+            # Get model and create DNN Surgery instance
+            model = get_model(model_name)
+            dnn_surgery = DNNSurgery(model, model_name)
+            
+            # Profile to determine number of layers
+            input_tensor, _, _ = get_input_tensor(model_name, 1)
+            dnn_surgery.profile_model(input_tensor)
+            num_layers = len(dnn_surgery.splitter.layers)
+            
+            # Validate split point
+            if split_point < 0 or split_point > num_layers:
+                logger.error(f"Invalid split point {split_point} for {model_name} (has {num_layers} layers)")
+                continue
+            
+            # Run multiple tests
+            edge_times = []
+            transfer_times = []
+            cloud_times = []
+            total_times = []
+            
+            for test_idx in range(num_tests):
+                logger.info(f"  Test run {test_idx + 1}/{num_tests}")
+                
+                try:
+                    result, timings = run_single_inference(
+                        server_address,
+                        model_name,
+                        dnn_surgery,
+                        split_point,
+                        batch_size=1,
+                        auto_plot=False,  # Don't generate individual plots
+                        plot_show=False,
+                        plot_path=None,
+                    )
+                    
+                    edge_time = timings.get("edge_time", 0.0)
+                    transfer_time = timings.get("transfer_time", 0.0)
+                    cloud_time = timings.get("cloud_time", 0.0)
+                    total_time = timings.get("total_batch_processing_time", edge_time + transfer_time + cloud_time)
+                    
+                    edge_times.append(edge_time)
+                    transfer_times.append(transfer_time)
+                    cloud_times.append(cloud_time)
+                    total_times.append(total_time)
+                    
+                    logger.info(
+                        f"    Edge: {edge_time:.2f}ms | Transfer: {transfer_time:.2f}ms | "
+                        f"Cloud: {cloud_time:.2f}ms | Total: {total_time:.2f}ms"
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"  Test failed: {str(e)}")
+                    continue
+            
+            # Calculate averages
+            if total_times:
+                avg_edge = sum(edge_times) / len(edge_times)
+                avg_transfer = sum(transfer_times) / len(transfer_times)
+                avg_cloud = sum(cloud_times) / len(cloud_times)
+                avg_total = sum(total_times) / len(total_times)
+                
+                all_model_timings[model_name] = {
+                    'edge_time': avg_edge,
+                    'transfer_time': avg_transfer,
+                    'cloud_time': avg_cloud,
+                    'total_time': avg_total,
+                    'num_tests': len(total_times),
+                }
+                
+                logger.info(f"\n{model_name} Average times:")
+                logger.info(
+                    f"  Edge: {avg_edge:.2f}ms | Transfer: {avg_transfer:.2f}ms | "
+                    f"Cloud: {avg_cloud:.2f}ms | Total: {avg_total:.2f}ms"
+                )
+            
+        except Exception as e:
+            logger.error(f"Failed to test {model_name}: {str(e)}")
+            continue
+    
+    # Print summary
+    logger.info("\n" + "="*80)
+    logger.info(f"SUMMARY - All Models at Split Point {split_point}")
+    logger.info("="*80)
+    logger.info(f"{'Model':<20} {'Total(ms)':<12} {'Edge(ms)':<11} {'Transfer(ms)':<14} {'Cloud(ms)':<12}")
+    logger.info("-" * 80)
+    
+    # Sort by total time
+    sorted_models = sorted(all_model_timings.items(), key=lambda x: x[1]['total_time'])
+    for model_name, timings in sorted_models:
+        logger.info(
+            f"{model_name:<20} {timings['total_time']:<12.1f} {timings['edge_time']:<11.1f} "
+            f"{timings['transfer_time']:<14.1f} {timings['cloud_time']:<12.1f}"
+        )
+    
+    logger.info("="*80)
+    
+    # Generate bar chart comparison
+    if auto_plot and all_model_timings:
+        try:
+            save_dir = Path(plot_path) if plot_path else Path("plots")
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            bar_chart_path = save_dir / f"all_models_split_{split_point}_{timestamp}.png"
+            
+            logger.info(f"Generating bar chart comparison: {bar_chart_path}")
+            plot_model_comparison_bar(
+                all_model_timings,
+                show=plot_show,
+                save_path=str(bar_chart_path),
+                title=f"Model Comparison at Split Point {split_point}",
+                split_point=split_point,
+            )
+            logger.info(f"Bar chart saved to: {bar_chart_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate bar chart: {str(e)}")
+    
+    return all_model_timings
 
 def test_all_models_all_splits(
     server_address: str,
@@ -736,6 +898,8 @@ def main():
                        help='Test connection to server and exit')
     parser.add_argument('--test-all-models', action='store_true',
                        help='Test all supported models across all split points and generate comparison plots')
+    parser.add_argument('--test-all-models-split', type=int, default=None,
+                       help='Test all models at a specific split point and generate a bar chart comparison (e.g., --test-all-models-split 0)')
     parser.add_argument('--use-neurosurgeon', action='store_true', default=True,
                        help='Use NeuroSurgeon optimization (default: True)')
     parser.add_argument('--no-neurosurgeon', action='store_true',
@@ -791,6 +955,20 @@ def main():
             else:
                 logger.error("Connection test failed!")
                 sys.exit(1)
+        
+        # Test all models at a single split point
+        if args.test_all_models_split is not None:
+            logger.info(f"Testing all models at split point {args.test_all_models_split}...")
+            test_all_models_single_split(
+                args.server_address,
+                args.test_all_models_split,
+                num_tests=args.num_tests,
+                auto_plot=args.auto_plot,
+                plot_show=args.plot_show,
+                plot_path=args.plot_save or "plots",
+            )
+            logger.info("All models testing complete!")
+            sys.exit(0)
         
         # Test all models across all split points
         if args.test_all_models:

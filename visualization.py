@@ -26,6 +26,7 @@ __all__ = [
     "plot_actual_inference_breakdown",
     "plot_actual_split_comparison",
     "plot_multi_model_comparison",
+    "plot_model_comparison_bar",
 ]
 
 
@@ -535,6 +536,112 @@ def plot_multi_model_comparison(
     ax.set_title(title or f"Multi-Model Comparison: {ylabel}", fontsize=14)
     ax.grid(True, which="major", linestyle=":", linewidth=0.5, alpha=0.7)
     ax.legend(loc="best", fontsize=10)
+
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+
+    return fig
+
+
+def plot_model_comparison_bar(
+    model_timings: Dict[str, Dict[str, float]],
+    *,
+    show: bool = False,
+    save_path: Optional[str] = None,
+    title: Optional[str] = None,
+    split_point: Optional[int] = None,
+) -> object:
+    """Compare total inference time across models at a single split point using a bar chart.
+
+    Args:
+        model_timings: Dictionary mapping model names to their timing metrics:
+            {
+                'model_name': {
+                    'total_time': float,
+                    'edge_time': float,
+                    'transfer_time': float,
+                    'cloud_time': float,
+                },
+                ...
+            }
+        show: Whether to display the chart interactively.
+        save_path: Optional filesystem path to persist the chart as an image.
+        title: Optional override for the chart title.
+        split_point: Split point used for the comparison (for display in title).
+
+    Returns:
+        The created ``matplotlib.figure.Figure`` instance.
+    """
+
+    if not model_timings:
+        raise ValueError("Cannot plot model comparison bar chart without timing data")
+
+    if plt is None:
+        raise ImportError(
+            "matplotlib is required to plot model comparisons. Install with 'pip install matplotlib'."
+        )
+
+    # Sort models by total time for better visualization
+    sorted_models = sorted(model_timings.items(), key=lambda x: x[1].get('total_time', 0.0))
+    model_names = [name for name, _ in sorted_models]
+    
+    # Extract timing components
+    edge_times = [timings.get('edge_time', 0.0) for _, timings in sorted_models]
+    transfer_times = [timings.get('transfer_time', 0.0) for _, timings in sorted_models]
+    cloud_times = [timings.get('cloud_time', 0.0) for _, timings in sorted_models]
+    total_times = [timings.get('total_time', 0.0) for _, timings in sorted_models]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    x = range(len(model_names))
+    width = 0.6
+
+    # Create stacked bars
+    bars_edge = ax.bar(x, edge_times, width, label='Edge', color='#ff7f0e', alpha=0.85)
+    bars_transfer = ax.bar(x, transfer_times, width, bottom=edge_times, label='Transfer', color='#d62728', alpha=0.85)
+    
+    # Calculate the bottom for cloud bars (edge + transfer)
+    cloud_bottom = [e + t for e, t in zip(edge_times, transfer_times)]
+    bars_cloud = ax.bar(x, cloud_times, width, bottom=cloud_bottom, label='Cloud', color='#2ca02c', alpha=0.85)
+
+    # Add total time annotations above each bar
+    for i, total in enumerate(total_times):
+        ax.annotate(
+            f"{total:.1f}ms",
+            xy=(i, total),
+            xytext=(0, 5),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight='bold',
+        )
+
+    ax.set_ylabel("Inference Time (ms)", fontsize=12)
+    ax.set_xlabel("Model", fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_names, rotation=45, ha='right')
+    
+    # Create title
+    if title:
+        plot_title = title
+    else:
+        if split_point is not None:
+            plot_title = f"Model Comparison at Split Point {split_point}"
+        else:
+            plot_title = "Model Comparison - Total Inference Time"
+    
+    ax.set_title(plot_title, fontsize=14, fontweight='bold')
+    ax.legend(loc='upper left', fontsize=10)
+    ax.grid(axis='y', linestyle=':', linewidth=0.5, alpha=0.7)
+
+    # Set y-axis limit with some padding
+    if total_times:
+        ax.set_ylim(0, max(total_times) * 1.15)
 
     fig.tight_layout()
 
