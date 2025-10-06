@@ -173,7 +173,7 @@ def plot_split_timing(
     ax.plot(split_points, transfer, label="Transfer", linestyle=":", color="#d62728")
 
     ax.set_xlabel("Split Point")
-    ax.set_ylabel("Latency (ms)")
+    ax.set_ylabel("Inference Time (ms)")
     ax.set_xticks(split_points)
     ax.grid(True, which="major", linestyle=":", linewidth=0.5, alpha=0.7)
     ax.legend()
