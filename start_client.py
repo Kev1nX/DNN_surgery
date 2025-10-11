@@ -34,6 +34,10 @@ from visualization import (
     plot_actual_split_comparison,
     plot_multi_model_comparison,
     plot_model_comparison_bar,
+    plot_throughput_from_timing,
+    plot_split_throughput_comparison,
+    plot_multi_model_throughput_comparison,
+    plot_model_throughput_comparison_bar,
 )
 
 # Configure logging
@@ -318,13 +322,14 @@ def run_batch_processing(
                 _, manual_actual_path = resolve_plot_paths(model_name, split_point, plot_path)
                 try:
                     manual_actual_path.parent.mkdir(parents=True, exist_ok=True)
+                    timing_data = {
+                        "edge_time": timings.get("edge_time", 0.0),
+                        "transfer_time": timings.get("transfer_time", 0.0),
+                        "cloud_time": timings.get("cloud_time", 0.0),
+                        "total_batch_processing_time": timings.get("total_batch_processing_time"),
+                    }
                     plot_actual_inference_breakdown(
-                        {
-                            "edge_time": timings.get("edge_time", 0.0),
-                            "transfer_time": timings.get("transfer_time", 0.0),
-                            "cloud_time": timings.get("cloud_time", 0.0),
-                            "total_batch_processing_time": timings.get("total_batch_processing_time"),
-                        },
+                        timing_data,
                         show=plot_show,
                         save_path=str(manual_actual_path),
                         title=f"Measured Inference Breakdown ({model_name}, split {split_point})",
@@ -332,6 +337,18 @@ def run_batch_processing(
                     manual_actual_path_resolved = str(manual_actual_path.resolve())
                     timings['actual_split_plot_path'] = manual_actual_path_resolved
                     logger.info("Measured inference chart saved to %s", manual_actual_path_resolved)
+                    
+                    # Generate companion throughput plot
+                    manual_throughput_path = manual_actual_path.with_name(
+                        manual_actual_path.stem.replace("_actual", "_throughput") + manual_actual_path.suffix
+                    )
+                    plot_throughput_from_timing(
+                        timing_data,
+                        show=plot_show,
+                        save_path=str(manual_throughput_path),
+                        title=f"Inference Throughput ({model_name}, split {split_point})",
+                    )
+                    logger.info("Throughput chart saved to %s", manual_throughput_path.resolve())
                 except ImportError as plt_error:
                     logger.warning(
                         "Auto-plot requested but matplotlib is unavailable: %s",
@@ -514,6 +531,9 @@ def test_split_points(
         comparison_path = comparison_seed_path.with_name(
             comparison_seed_path.stem.replace("_actual", "") + "_comparison" + comparison_seed_path.suffix
         )
+        throughput_comparison_path = comparison_seed_path.with_name(
+            comparison_seed_path.stem.replace("_actual", "") + "_throughput_comparison" + comparison_seed_path.suffix
+        )
         try:
             comparison_path.parent.mkdir(parents=True, exist_ok=True)
             plot_actual_split_comparison(
@@ -523,6 +543,15 @@ def test_split_points(
                 title=f"Measured Inference Timings ({model_name})",
             )
             logger.info("Split comparison line chart saved to %s", comparison_path.resolve())
+            
+            # Generate throughput comparison plot
+            plot_split_throughput_comparison(
+                split_actual_components,
+                show=plot_show,
+                save_path=str(throughput_comparison_path),
+                title=f"Inference Throughput ({model_name})",
+            )
+            logger.info("Throughput comparison chart saved to %s", throughput_comparison_path.resolve())
         except ImportError as plt_error:
             logger.warning(
                 "Auto-plot requested but matplotlib is unavailable: %s",
@@ -704,6 +733,7 @@ def test_all_models_single_split(
             
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             bar_chart_path = save_dir / f"all_models_split_{split_point}_{timestamp}.png"
+            throughput_bar_chart_path = save_dir / f"all_models_split_{split_point}_throughput_{timestamp}.png"
             
             logger.info(f"Generating bar chart comparison: {bar_chart_path}")
             plot_model_comparison_bar(
@@ -715,8 +745,19 @@ def test_all_models_single_split(
             )
             logger.info(f"Bar chart saved to: {bar_chart_path}")
             
+            # Generate throughput bar chart
+            logger.info(f"Generating throughput bar chart: {throughput_bar_chart_path}")
+            plot_model_throughput_comparison_bar(
+                all_model_timings,
+                show=plot_show,
+                save_path=str(throughput_bar_chart_path),
+                title=f"Model Throughput Comparison at Split Point {split_point}",
+                split_point=split_point,
+            )
+            logger.info(f"Throughput bar chart saved to: {throughput_bar_chart_path}")
+            
         except Exception as e:
-            logger.error(f"Failed to generate bar chart: {str(e)}")
+            logger.error(f"Failed to generate bar charts: {str(e)}")
     
     return all_model_timings
 
@@ -835,6 +876,16 @@ def test_all_models_all_splits(
                     metric=metric,
                 )
                 logger.info(f"✓ Saved {metric_name} comparison to {save_path}")
+            
+            # Generate throughput comparison plot
+            throughput_save_path = str(plot_dir / f"multi_model_throughput_comparison.png")
+            plot_multi_model_throughput_comparison(
+                all_model_timings,
+                show=plot_show,
+                save_path=throughput_save_path,
+                title="Multi-Model Throughput Comparison",
+            )
+            logger.info(f"✓ Saved throughput comparison to {throughput_save_path}")
             
             logger.info("✓ All comparison plots generated successfully")
             

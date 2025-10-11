@@ -27,6 +27,10 @@ __all__ = [
     "plot_actual_split_comparison",
     "plot_multi_model_comparison",
     "plot_model_comparison_bar",
+    "plot_throughput_from_timing",
+    "plot_split_throughput_comparison",
+    "plot_multi_model_throughput_comparison",
+    "plot_model_throughput_comparison_bar",
 ]
 
 
@@ -650,4 +654,440 @@ def plot_model_comparison_bar(
     if show:
         plt.show()
 
+    return fig
+
+
+def plot_throughput_from_timing(
+    actual_timings: Dict[str, float],
+    *,
+    show: bool = False,
+    save_path: Optional[str] = None,
+    title: Optional[str] = None,
+):
+    """Plot a bar chart showing throughput (inferences per second) calculated from timing data.
+    
+    This is the companion plot to plot_actual_inference_breakdown, showing throughput
+    instead of latency.
+    
+    Args:
+        actual_timings: Dictionary containing timing data with 'edge_time', 'transfer_time',
+            'cloud_time', and optionally 'total_batch_processing_time' in milliseconds.
+        show: Whether to display the chart interactively.
+        save_path: Optional filesystem path to persist the chart as an image.
+        title: Optional override for the chart title.
+    
+    Returns:
+        The created ``matplotlib.figure.Figure`` instance.
+    """
+    
+    if not actual_timings:
+        raise ValueError("Cannot plot throughput without timing data")
+    
+    if plt is None:
+        raise ImportError(
+            "matplotlib is required to plot throughput. Install with 'pip install matplotlib'."
+        )
+    
+    edge_time = float(actual_timings.get("edge_time", 0.0))
+    transfer_time = float(actual_timings.get("transfer_time", 0.0))
+    cloud_time = float(actual_timings.get("cloud_time", 0.0))
+    
+    total_time = actual_timings.get("total_batch_processing_time")
+    if total_time is None:
+        total_time = edge_time + transfer_time + cloud_time
+    
+    # Convert time (ms) to throughput (inferences/sec)
+    # throughput = 1000 / time_ms
+    total_throughput = 1000.0 / total_time if total_time > 0 else 0.0
+    
+    fig, ax = plt.subplots(figsize=(6, 4))
+    
+    bar = ax.bar(["Total"], [total_throughput], color="#1f77b4", alpha=0.85, width=0.5)
+    
+    ax.set_ylabel("Throughput (inferences/sec)")
+    ax.set_ylim(0, total_throughput * 1.2 if total_throughput > 0 else 1.0)
+    ax.set_title(title or "Inference Throughput")
+    ax.grid(axis="y", linestyle=":", linewidth=0.5, alpha=0.7)
+    
+    # Annotate the bar with throughput value
+    ax.annotate(
+        f"{total_throughput:.2f} inf/s",
+        xy=(bar[0].get_x() + bar[0].get_width() / 2, bar[0].get_height()),
+        xytext=(0, 6),
+        textcoords="offset points",
+        ha="center",
+        va="bottom",
+        fontweight='bold',
+    )
+    
+    # Also add the total time as secondary info
+    ax.text(
+        0.5, 0.95,
+        f"Total time: {total_time:.1f}ms",
+        transform=ax.transAxes,
+        ha='center',
+        va='top',
+        fontsize=10,
+        bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='gray', alpha=0.8)
+    )
+    
+    fig.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+    
+    return fig
+
+
+def plot_split_throughput_comparison(
+    split_component_timings: Dict[int, Dict[str, Sequence[float]]],
+    *,
+    show: bool = False,
+    save_path: Optional[str] = None,
+    title: Optional[str] = None,
+):
+    """Visualize throughput (inferences/sec) across multiple split points using a line chart.
+    
+    This is the companion plot to plot_actual_split_comparison, showing throughput
+    calculated from timing data.
+    
+    Args:
+        split_component_timings: Mapping of split point to measured timing samples.
+            Each value should be a dictionary containing timing categories (e.g.,
+            ``total``) mapped to iterables of sample values in milliseconds.
+        show: Whether to display the chart interactively.
+        save_path: Optional filesystem path to persist the chart as an image.
+        title: Optional override for the chart title.
+    
+    Returns:
+        The created ``matplotlib.figure.Figure`` instance.
+    """
+    
+    if not split_component_timings:
+        raise ValueError("Cannot plot split throughput comparison without timing data")
+    
+    if plt is None:
+        raise ImportError(
+            "matplotlib is required to plot split throughput comparisons. Install with 'pip install matplotlib'."
+        )
+    
+    # Extract and sanitize data
+    sanitized_items: List[Tuple[int, List[float]]] = []
+    for split_point, component_map in split_component_timings.items():
+        total_samples = component_map.get("total", [])
+        numeric_samples = [float(sample) for sample in total_samples if sample is not None and sample > 0]
+        if numeric_samples:
+            sanitized_items.append((split_point, numeric_samples))
+    
+    if not sanitized_items:
+        raise ValueError("No valid timing samples available for throughput comparison plot")
+    
+    sanitized_items.sort(key=lambda item: item[0])
+    split_points = [item[0] for item in sanitized_items]
+    
+    # Convert timings to throughput (inferences/sec)
+    avg_throughputs: List[float] = []
+    min_throughputs: List[float] = []
+    max_throughputs: List[float] = []
+    
+    for _, time_samples in sanitized_items:
+        # throughput = 1000 / time_ms
+        throughput_samples = [1000.0 / t for t in time_samples]
+        avg_throughputs.append(mean(throughput_samples))
+        min_throughputs.append(min(throughput_samples))
+        max_throughputs.append(max(throughput_samples))
+    
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    
+    # Plot throughput line
+    ax.plot(split_points, avg_throughputs, marker="o", linewidth=2.0, 
+            label="Throughput", color="#1f77b4")
+    
+    # Add confidence band (min/max range)
+    has_variance = any(max_t != min_t for max_t, min_t in zip(max_throughputs, min_throughputs))
+    if has_variance:
+        ax.fill_between(
+            split_points,
+            min_throughputs,
+            max_throughputs,
+            alpha=0.15,
+            color="#1f77b4",
+        )
+    
+    # Annotate key points (first, middle, last, and optimal)
+    if len(split_points) > 0:
+        key_indices = set()
+        key_indices.add(0)
+        if len(split_points) > 1:
+            key_indices.add(len(split_points) - 1)
+        if len(split_points) > 3:
+            key_indices.add(len(split_points) // 2)
+        # Add optimal point (maximum throughput)
+        max_idx = max(range(len(avg_throughputs)), key=lambda i: avg_throughputs[i])
+        key_indices.add(max_idx)
+        
+        for i in key_indices:
+            if i < len(avg_throughputs):
+                ax.annotate(
+                    f"{avg_throughputs[i]:.2f}",
+                    xy=(split_points[i], avg_throughputs[i]),
+                    xytext=(0, 8),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="none", alpha=0.7),
+                )
+    
+    ax.set_xlabel("Split Point")
+    ax.set_ylabel("Throughput (inferences/sec)")
+    ax.set_xticks(split_points)
+    ax.set_title(title or "Inference Throughput by Split Point")
+    ax.grid(True, which="major", linestyle=":", linewidth=0.5, alpha=0.7)
+    ax.legend()
+    
+    fig.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+    
+    return fig
+
+
+def plot_multi_model_throughput_comparison(
+    model_timings: Dict[str, Dict[int, Dict[str, float]]],
+    *,
+    show: bool = False,
+    save_path: Optional[str] = None,
+    title: Optional[str] = None,
+) -> object:
+    """Compare throughput performance across multiple models and split points.
+    
+    This is the companion plot to plot_multi_model_comparison, showing throughput
+    calculated from timing data.
+    
+    Args:
+        model_timings: Nested dictionary structure:
+            {
+                'model_name': {
+                    split_point: {
+                        'total_time': float (in ms),
+                        ...
+                    },
+                    ...
+                },
+                ...
+            }
+        show: Whether to display the chart interactively.
+        save_path: Optional filesystem path to persist the chart as an image.
+        title: Optional override for the chart title.
+    
+    Returns:
+        The created ``matplotlib.figure.Figure`` instance.
+    """
+    
+    if not model_timings:
+        raise ValueError("Cannot plot multi-model throughput comparison without timing data")
+    
+    if plt is None:
+        raise ImportError(
+            "matplotlib is required to plot multi-model throughput comparisons. Install with 'pip install matplotlib'."
+        )
+    
+    # Color palette for different models
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f"]
+    
+    # Markers for different models
+    markers = ["o", "s", "^", "D", "v", "p", "*", "X"]
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    for idx, (model_name, split_data) in enumerate(sorted(model_timings.items())):
+        if not split_data:
+            continue
+        
+        split_points = sorted(split_data.keys())
+        throughputs = []
+        
+        for split_point in split_points:
+            timing = split_data[split_point]
+            total_time = timing.get('total_time', 0.0)
+            # Convert time (ms) to throughput (inferences/sec)
+            throughput = 1000.0 / total_time if total_time > 0 else 0.0
+            throughputs.append(throughput)
+        
+        color = colors[idx % len(colors)]
+        marker = markers[idx % len(markers)]
+        
+        ax.plot(
+            split_points,
+            throughputs,
+            marker=marker,
+            linewidth=2.0,
+            markersize=8,
+            label=model_name,
+            color=color,
+        )
+        
+        # Add value annotations at key points (first, middle, last)
+        if len(split_points) >= 3:
+            key_indices = [0, len(split_points) // 2, -1]
+        else:
+            key_indices = range(len(split_points))
+        
+        for i in key_indices:
+            ax.annotate(
+                f"{throughputs[i]:.1f}",
+                xy=(split_points[i], throughputs[i]),
+                xytext=(0, 8),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color=color,
+            )
+    
+    ax.set_xlabel("Split Point", fontsize=12)
+    ax.set_ylabel("Throughput (inferences/sec)", fontsize=12)
+    
+    # Set x-axis ticks to show all split points
+    all_splits = sorted(set(
+        split_point
+        for split_data in model_timings.values()
+        for split_point in split_data.keys()
+    ))
+    if all_splits:
+        ax.set_xticks(all_splits)
+    
+    ax.set_title(title or "Multi-Model Throughput Comparison", fontsize=14)
+    ax.grid(True, which="major", linestyle=":", linewidth=0.5, alpha=0.7)
+    ax.legend(loc="best", fontsize=10)
+    
+    fig.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+    
+    return fig
+
+
+def plot_model_throughput_comparison_bar(
+    model_timings: Dict[str, Dict[str, float]],
+    *,
+    show: bool = False,
+    save_path: Optional[str] = None,
+    title: Optional[str] = None,
+    split_point: Optional[int] = None,
+) -> object:
+    """Compare throughput across models at a single split point using a bar chart.
+    
+    This is the companion plot to plot_model_comparison_bar, showing throughput
+    calculated from timing data.
+    
+    Args:
+        model_timings: Dictionary mapping model names to their timing metrics:
+            {
+                'model_name': {
+                    'total_time': float (in ms),
+                    ...
+                },
+                ...
+            }
+        show: Whether to display the chart interactively.
+        save_path: Optional filesystem path to persist the chart as an image.
+        title: Optional override for the chart title.
+        split_point: Split point used for the comparison (for display in title).
+    
+    Returns:
+        The created ``matplotlib.figure.Figure`` instance.
+    """
+    
+    if not model_timings:
+        raise ValueError("Cannot plot model throughput comparison bar chart without timing data")
+    
+    if plt is None:
+        raise ImportError(
+            "matplotlib is required to plot model throughput comparisons. Install with 'pip install matplotlib'."
+        )
+    
+    # Calculate throughput for each model and sort by throughput (descending)
+    model_throughputs = []
+    for model_name, timings in model_timings.items():
+        total_time = timings.get('total_time', 0.0)
+        throughput = 1000.0 / total_time if total_time > 0 else 0.0
+        model_throughputs.append((model_name, throughput, total_time))
+    
+    # Sort by throughput (highest first)
+    model_throughputs.sort(key=lambda x: x[1], reverse=True)
+    
+    model_names = [name for name, _, _ in model_throughputs]
+    throughputs = [thr for _, thr, _ in model_throughputs]
+    total_times = [time for _, _, time in model_throughputs]
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    x = range(len(model_names))
+    width = 0.6
+    
+    # Create bars
+    bars = ax.bar(x, throughputs, width, color='#1f77b4', alpha=0.85)
+    
+    # Add throughput value annotations above each bar
+    for i, (throughput, time) in enumerate(zip(throughputs, total_times)):
+        ax.annotate(
+            f"{throughput:.2f} inf/s",
+            xy=(i, throughput),
+            xytext=(0, 5),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight='bold',
+        )
+        # Add timing info below
+        ax.annotate(
+            f"({time:.1f}ms)",
+            xy=(i, throughput),
+            xytext=(0, -15),
+            textcoords="offset points",
+            ha="center",
+            va="top",
+            fontsize=8,
+            color='gray',
+        )
+    
+    ax.set_ylabel("Throughput (inferences/sec)", fontsize=12)
+    ax.set_xlabel("Model", fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_names, rotation=45, ha='right')
+    
+    # Create title
+    if title:
+        plot_title = title
+    else:
+        if split_point is not None:
+            plot_title = f"Model Throughput Comparison at Split Point {split_point}"
+        else:
+            plot_title = "Model Throughput Comparison"
+    
+    ax.set_title(plot_title, fontsize=14, fontweight='bold')
+    ax.grid(axis='y', linestyle=':', linewidth=0.5, alpha=0.7)
+    
+    # Set y-axis limit with some padding
+    if throughputs:
+        ax.set_ylim(0, max(throughputs) * 1.2)
+    
+    fig.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+    
     return fig

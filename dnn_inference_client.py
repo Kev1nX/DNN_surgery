@@ -11,7 +11,7 @@ import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
 from dnn_surgery import DNNSurgery
-from visualization import plot_actual_inference_breakdown, plot_split_timing
+from visualization import plot_actual_inference_breakdown, plot_split_timing, plot_throughput_from_timing
 from grpc_utils import proto_to_tensor, tensor_to_proto
 import warnings
 warnings.filterwarnings('ignore')
@@ -405,6 +405,21 @@ def run_distributed_inference(
                 logging.info(
                     "Measured inference plot saved to %s",
                     actual_plot_path_resolved,
+                )
+                
+                # Generate companion throughput plot
+                throughput_plot_path = actual_plot_path.with_name(
+                    actual_plot_path.stem.replace("_actual", "_throughput") + actual_plot_path.suffix
+                )
+                plot_throughput_from_timing(
+                    total_metrics,
+                    show=plot_show,
+                    save_path=str(throughput_plot_path),
+                    title=f"Inference Throughput ({model_id})",
+                )
+                logging.info(
+                    "Throughput plot saved to %s",
+                    throughput_plot_path.resolve(),
                 )
             except ImportError as plt_error:
                 logging.warning(
