@@ -819,7 +819,7 @@ def test_all_models_neurosurgeon(
             edge_times = [first_timings['edge_time']]
             transfer_times = [first_timings['transfer_time']]
             cloud_times = [first_timings['cloud_time']]
-            total_times = [first_timings['total_time']]
+            total_times = [first_timings['edge_time'] + first_timings['transfer_time'] + first_timings['cloud_time']]
             
             for test_idx in range(1, num_tests):
                 logger.info(f"Running test {test_idx + 1}/{num_tests} at optimal split {optimal_split}...")
@@ -842,10 +842,11 @@ def test_all_models_neurosurgeon(
                 edge_times.append(timings['edge_time'])
                 transfer_times.append(timings['transfer_time'])
                 cloud_times.append(timings['cloud_time'])
-                total_times.append(timings['total_time'])
+                total_time = timings['edge_time'] + timings['transfer_time'] + timings['cloud_time']
+                total_times.append(total_time)
                 
                 logger.info(
-                    f"  Test {test_idx + 1}: Total={timings['total_time']:.1f}ms "
+                    f"  Test {test_idx + 1}: Total={total_time:.1f}ms "
                     f"(Edge={timings['edge_time']:.1f}ms, Transfer={timings['transfer_time']:.1f}ms, "
                     f"Cloud={timings['cloud_time']:.1f}ms)"
                 )
