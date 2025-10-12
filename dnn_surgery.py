@@ -9,6 +9,7 @@ import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
 from visualization import build_split_timing_summary, format_split_summary
+from quantization import ModelQuantizer
 import warnings
 warnings.filterwarnings('ignore')
 def cuda_sync():
@@ -251,8 +252,16 @@ class ModelSplitter:
         self.split_point = split_point
         logger.info(f"Split point set to layer {split_point}")
         
-    def get_edge_model(self) -> Optional[nn.Module]:
-        """Get the edge part of the model using the original model's forward logic"""
+    def get_edge_model(self, quantize: bool = False, quantizer: Optional[ModelQuantizer] = None) -> Optional[nn.Module]:
+        """Get the edge part of the model using the original model's forward logic
+        
+        Args:
+            quantize: Whether to apply quantization to the edge model
+            quantizer: ModelQuantizer instance (required if quantize=True)
+            
+        Returns:
+            Edge model (optionally quantized)
+        """
         if self.split_point == 0:
             return None
             
@@ -295,10 +304,27 @@ class ModelSplitter:
                 
                 return False
                 
-        return EdgeModel(edge_layers, self.model, self.model_name)
+        edge_model = EdgeModel(edge_layers, self.model, self.model_name)
         
-    def get_cloud_model(self) -> Optional[nn.Module]:
-        """Get the cloud part of the model using the original model's forward logic"""
+        # Apply quantization if requested
+        if quantize:
+            if quantizer is None:
+                logger.warning("Quantization requested but no quantizer provided. Returning non-quantized edge model.")
+            else:
+                edge_model = quantizer.quantize_edge_model(edge_model, self.model_name)
+        
+        return edge_model
+        
+    def get_cloud_model(self, quantize: bool = False, quantizer: Optional[ModelQuantizer] = None) -> Optional[nn.Module]:
+        """Get the cloud part of the model using the original model's forward logic
+        
+        Args:
+            quantize: Whether to apply quantization to the cloud model
+            quantizer: ModelQuantizer instance (required if quantize=True)
+            
+        Returns:
+            Cloud model (optionally quantized)
+        """
         if self.split_point >= len(self.layers):
             return None
             
@@ -345,13 +371,22 @@ class ModelSplitter:
                 
                 return False
                 
-        return CloudModel(cloud_layers, self.model, self.model_name, split_point)
+        cloud_model = CloudModel(cloud_layers, self.model, self.model_name, split_point)
+        
+        # Apply quantization if requested
+        if quantize:
+            if quantizer is None:
+                logger.warning("Quantization requested but no quantizer provided. Returning non-quantized cloud model.")
+            else:
+                cloud_model = quantizer.quantize_cloud_model(cloud_model, self.model_name)
+        
+        return cloud_model
 
 
 class DNNSurgery:
     """Main class for distributed DNN inference with optimal splitting using NeuroSurgeon approach"""
     
-    def __init__(self, model: nn.Module, model_name: str = "unknown"):
+    def __init__(self, model: nn.Module, model_name: str = "unknown", enable_quantization: bool = False):
         self.model = model.eval()  # Ensure model is in eval mode
         self.model_name = model_name
         self.splitter = ModelSplitter(model, model_name)
@@ -359,8 +394,13 @@ class DNNSurgery:
         self.network_profiler = NetworkProfiler()
         self.layer_outputs: List[torch.Tensor] = []
         self.input_sample: Optional[torch.Tensor] = None
+        self.enable_quantization = enable_quantization
+        self.quantizer = ModelQuantizer() if enable_quantization else None
         
-        logger.info(f"Initialized DNNSurgery for model: {model_name}")
+        if enable_quantization:
+            logger.info(f"Initialized DNNSurgery for model: {model_name} with quantization enabled")
+        else:
+            logger.info(f"Initialized DNNSurgery for model: {model_name}")
         
     def profile_model(self, input_tensor: torch.Tensor) -> List[Dict]:
         """Profile the entire model layer by layer

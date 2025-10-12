@@ -938,6 +938,10 @@ def main():
     parser.add_argument('--use-neurosurgeon', action='store_true', default=True,
                        help='Use NeuroSurgeon optimization (default: True)')
     parser.add_argument('--no-neurosurgeon', action='store_true',
+                       help='Disable NeuroSurgeon optimization (requires --split-point)')
+    parser.add_argument('--quantize', action='store_true',
+                       help='Enable INT8 dynamic quantization for edge model (reduces memory and improves speed)')
+    parser.add_argument('--no-plot', action='store_true',
                        help='Disable NeuroSurgeon optimization')
     parser.add_argument(
         '--auto-plot',
@@ -1077,7 +1081,11 @@ def main():
             else:
                 split_point = None
                 logger.info(f"Running single inference with NeuroSurgeon optimization")
-            dnn_surgery = DNNSurgery(get_model(args.model), args.model)
+            
+            if args.quantize:
+                logger.info("Quantization enabled: Edge model will use INT8 dynamic quantization")
+            
+            dnn_surgery = DNNSurgery(get_model(args.model), args.model, enable_quantization=args.quantize)
             
             result, timings = run_single_inference(
                 args.server_address,

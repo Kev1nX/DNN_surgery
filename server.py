@@ -11,6 +11,7 @@ import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
 from dnn_surgery import DNNSurgery, ModelSplitter, NetworkProfiler, LayerProfiler
 from grpc_utils import proto_to_tensor, tensor_to_proto
+from quantization import ModelQuantizer
 
 # Suppress NNPACK warnings
 torch.backends.nnpack.enabled = False
@@ -32,7 +33,7 @@ logging.basicConfig(
 class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
     """Implements the DNNInference gRPC service for distributed DNN computation."""
     
-    def __init__(self):
+    def __init__(self, enable_quantization: bool = False):
         self.models: Dict[str, torch.nn.Module] = {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.client_profiles: Dict[str, dnn_inference_pb2.ClientProfile] = {}
@@ -45,7 +46,12 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
         # Network profiler for transfer time calculations (using same class as client)
         self.network_profiler = NetworkProfiler()
         
-        logging.info(f"Initializing DNNInferenceServicer with device: {self.device}")
+        # Quantization support
+        self.enable_quantization = enable_quantization
+        self.quantizer = ModelQuantizer() if enable_quantization else None
+        
+        quant_status = "with quantization enabled" if enable_quantization else "without quantization"
+        logging.info(f"Initializing DNNInferenceServicer with device: {self.device} {quant_status}")
         
     def MeasureBandwidth(self, request: dnn_inference_pb2.BandwidthProbeRequest,
                          context: grpc.ServicerContext) -> dnn_inference_pb2.BandwidthProbeResponse:
@@ -413,7 +419,10 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             # Create a DNN Surgery instance for this model and split point
             splitter = ModelSplitter(original_model, model_name)
             splitter.set_split_point(split_point)
-            cloud_model = splitter.get_cloud_model()
+            cloud_model = splitter.get_cloud_model(
+                quantize=self.enable_quantization,
+                quantizer=self.quantizer
+            )
             
             # Store the client's split decision
             self.client_split_points[model_name] = split_point
@@ -459,12 +468,13 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 message=error_msg
             )
             
-def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInferenceServicer]:
+def serve(port: int = 50051, max_workers: int = 10, enable_quantization: bool = False) -> tuple[grpc.Server, DNNInferenceServicer]:
     """Start the gRPC server
     
     Args:
         port: Port number to listen on
         max_workers: Maximum number of worker threads
+        enable_quantization: Whether to enable INT8 quantization for models
         
     Returns:
         Tuple of (server, servicer)
@@ -473,7 +483,7 @@ def serve(port: int = 50051, max_workers: int = 10) -> tuple[grpc.Server, DNNInf
     options = GRPC_SETTINGS.channel_options
     
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers), options=options)
-    servicer = DNNInferenceServicer()
+    servicer = DNNInferenceServicer(enable_quantization=enable_quantization)
     dnn_inference_pb2_grpc.add_DNNInferenceServicer_to_server(servicer, server)
     
     server_addr = f'0.0.0.0:{port}'

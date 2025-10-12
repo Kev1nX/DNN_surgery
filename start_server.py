@@ -56,6 +56,8 @@ def main():
                        choices=['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base', 'all'],
                        default=['all'],
                        help='Models to register (default: all)')
+    parser.add_argument('--quantize', action='store_true',
+                       help='Enable INT8 dynamic quantization for models (reduces memory and improves speed)')
     
     args = parser.parse_args()
     
@@ -65,9 +67,11 @@ def main():
     try:
         logger.info("Starting DNN Surgery Server...")
         logger.info(f"Device available: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+        if args.quantize:
+            logger.info("Quantization enabled: Models will use INT8 dynamic quantization")
         
         # Start the server
-        server, servicer = serve(port=args.port, max_workers=args.max_workers)
+        server, servicer = serve(port=args.port, max_workers=args.max_workers, enable_quantization=args.quantize)
         
         # Register models based on arguments
         models_to_register = []
