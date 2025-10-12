@@ -903,6 +903,11 @@ def test_all_models_neurosurgeon(
                 pipeline_start = time.time()
                 total_samples = 0
                 
+                # Track cumulative component times across all batches
+                cumulative_edge_time = 0.0
+                cumulative_transfer_time = 0.0
+                cumulative_cloud_time = 0.0
+                
                 # Process multiple batches with pipelining
                 for batch_idx in range(num_batches):
                     logger.info(f"Processing batch {batch_idx + 1}/{num_batches} (batch_size={batch_size})...")
@@ -914,6 +919,11 @@ def test_all_models_neurosurgeon(
                     batch_start = time.time()
                     _, timings = client.process_tensor(input_tensor, model_name)
                     batch_time = (time.time() - batch_start) * 1000
+                    
+                    # Accumulate component times (these are per-sample averages from the batch)
+                    cumulative_edge_time += timings.get('edge_time', 0) * batch_size
+                    cumulative_transfer_time += timings.get('transfer_time', 0) * batch_size
+                    cumulative_cloud_time += timings.get('cloud_time', 0) * batch_size
                     
                     total_samples += batch_size
                     
@@ -929,15 +939,23 @@ def test_all_models_neurosurgeon(
                 total_pipeline_time = (pipeline_end - pipeline_start) * 1000  # ms
                 avg_time_per_sample = total_pipeline_time / total_samples
                 
-                # Use averaged timing for fair comparison
-                edge_times.append(timings.get('edge_time', 0))
-                transfer_times.append(timings.get('transfer_time', 0))
-                cloud_times.append(timings.get('cloud_time', 0))
+                # Calculate average component times across all samples
+                avg_edge = cumulative_edge_time / total_samples
+                avg_transfer = cumulative_transfer_time / total_samples
+                avg_cloud = cumulative_cloud_time / total_samples
+                
+                # Store averaged timings for plotting
+                edge_times.append(avg_edge)
+                transfer_times.append(avg_transfer)
+                cloud_times.append(avg_cloud)
                 total_times.append(avg_time_per_sample)
                 
                 logger.info(
                     f"Pipeline completed: {total_samples} samples in {total_pipeline_time:.1f}ms "
                     f"({avg_time_per_sample:.1f}ms/sample, {1000.0/avg_time_per_sample:.2f} samples/sec)"
+                )
+                logger.info(
+                    f"  Average component times: Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms"
                 )
             else:
                 # Standard sequential processing (no pipelining)
