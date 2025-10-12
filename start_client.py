@@ -20,7 +20,7 @@ from torchvision.models import (
     ResNet50_Weights,
     GoogLeNet_Weights,
     EfficientNet_B2_Weights,
-    ConvNeXt_Base_Weights,
+    MobileNet_V3_Large_Weights,
 )
 
 # Suppress NNPACK warnings
@@ -147,7 +147,7 @@ def create_sample_input(model_name: str, batch_size: int = 1) -> torch.Tensor:
     return input_tensor
 
 # Supported models configuration
-SUPPORTED_MODELS = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
+SUPPORTED_MODELS = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'mobilenet_v3_large']
 
 MODEL_REGISTRY = {
     'resnet18': (models.resnet18, ResNet18_Weights.DEFAULT),
@@ -155,7 +155,7 @@ MODEL_REGISTRY = {
     'alexnet': (models.alexnet, AlexNet_Weights.DEFAULT),
     'googlenet': (models.googlenet, GoogLeNet_Weights.DEFAULT),
     'efficientnet_b2': (models.efficientnet_b2, EfficientNet_B2_Weights.DEFAULT),
-    'convnext_base': (models.convnext_base, ConvNeXt_Base_Weights.DEFAULT),
+    'mobilenet_v3_large': (models.mobilenet_v3_large, MobileNet_V3_Large_Weights.DEFAULT),
 }
 
 def get_model(model_name: str):
@@ -915,9 +915,9 @@ def main():
                        help='Server address in format HOST:PORT (e.g., 192.168.1.100:50051)')
     parser.add_argument(
         '--model',
-        choices=['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base'],
+        choices=['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'mobilenet_v3_large'],
         default='resnet18',
-        help='Model to use for inference (default: resnet18). Supported: resnet18, resnet50, alexnet, googlenet, efficientnet_b2, convnext_base',
+        help='Model to use for inference (default: resnet18). Supported: resnet18, resnet50, alexnet, googlenet, efficientnet_b2, mobilenet_v3_large',
     )
     parser.add_argument('--split-point', type=int, default=None,
                        help='Split point for model partitioning (default: None - use NeuroSurgeon optimization)')

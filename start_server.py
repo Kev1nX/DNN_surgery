@@ -25,7 +25,7 @@ from torchvision.models import (
     ResNet50_Weights,
     GoogLeNet_Weights,
     EfficientNet_B2_Weights,
-    ConvNeXt_Base_Weights,
+    MobileNet_V3_Large_Weights,
 )
 from server import serve
 
@@ -53,7 +53,7 @@ def main():
     parser.add_argument('--max-workers', type=int, default=10,
                        help='Maximum number of worker threads (default: 10)')
     parser.add_argument('--models', nargs='+', 
-                       choices=['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base', 'all'],
+                       choices=['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'mobilenet_v3_large', 'all'],
                        default=['all'],
                        help='Models to register (default: all)')
     parser.add_argument('--quantize', action='store_true',
@@ -77,7 +77,7 @@ def main():
         models_to_register = []
         
         if 'all' in args.models:
-            models_to_register = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'convnext_base']
+            models_to_register = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'mobilenet_v3_large']
         else:
             models_to_register = args.models
             
@@ -115,11 +115,11 @@ def main():
                     servicer.register_model('efficientnet_b2', model)
                     logger.info("EfficientNet-B2 (pretrained) registered successfully")
                     
-                elif model_name == 'convnext_base':
-                    model = models.convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT)
+                elif model_name == 'mobilenet_v3_large':
+                    model = models.mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT)
                     model.eval()
-                    servicer.register_model('convnext_base', model)
-                    logger.info("ConvNeXt-Base (pretrained) registered successfully")
+                    servicer.register_model('mobilenet_v3_large', model)
+                    logger.info("MobileNetV3-Large (pretrained) registered successfully")
                     
             except Exception as e:
                 logger.error(f"Failed to register {model_name}: {str(e)}")
