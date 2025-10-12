@@ -136,17 +136,6 @@ def get_input_tensor(model_name: str, batch_size: int = 1) -> Tuple[torch.Tensor
         logger.error(f"Error loading images: {str(e)}")
         raise RuntimeError(f"Failed to load ImageNet images: {str(e)}")
 
-def create_sample_input(model_name: str, batch_size: int = 1) -> torch.Tensor:
-    """Create input tensor using ImageNet mini dataset images
-    
-    This function only uses ImageNet images - no random tensors
-    """
-    # Get images - will raise exception if fails
-    input_tensor, labels, class_names = get_input_tensor(model_name, batch_size)
-    
-    # For backward compatibility, just return the tensor
-    return input_tensor
-
 # Supported models configuration
 SUPPORTED_MODELS = ['resnet18', 'resnet50', 'alexnet', 'googlenet', 'efficientnet_b2', 'mobilenet_v3_large']
 
@@ -423,7 +412,6 @@ def run_batch_processing(
                           f"Confidence={conf:.3f} {correct}")
     
     return all_timings
-
 
 def test_split_points(
     server_address: str,
@@ -874,47 +862,103 @@ def test_all_models_neurosurgeon(
             cloud_times = [first_timings.get('cloud_time', 0)]
             total_times = [first_timings.get('edge_time', 0) + first_timings.get('transfer_time', 0) + first_timings.get('cloud_time', 0)]
             
-            for test_idx in range(1, num_tests):
-                logger.info(f"Running test {test_idx + 1}/{num_tests} at optimal split {optimal_split}...")
+            # Handle pipelining with higher concurrency and batch processing
+            if use_pipelining:
+                logger.info(f"Using pipelining with {num_batches} batches of size {batch_size}")
                 
-                # Get fresh input tensor with appropriate batch size
-                input_tensor, _, _ = get_input_tensor(model_name, batch_size)
+                # Set up client with pipelining support
+                dnn_surgery.splitter.set_split_point(optimal_split)
+                edge_model = dnn_surgery.splitter.get_edge_model()
                 
-                # Run with the determined configuration
+                # Create client with higher max_inflight_requests for pipelining
+                max_concurrent = min(num_batches * batch_size, 16)  # Allow up to 16 concurrent requests
+                
                 if use_early_split and exit_config is not None:
-                    # Continue using early exit
-                    _, timings = run_distributed_inference_with_early_exit(
-                        model_name,
-                        input_tensor,
-                        dnn_surgery,
-                        exit_config=exit_config,
-                        split_point=optimal_split,
+                    client = EarlyExitInferenceClient(
                         server_address=server_address,
+                        dnn_surgery=dnn_surgery,
+                        edge_model=edge_model,
+                        exit_config=exit_config,
+                        max_inflight_requests=max_concurrent,
                     )
                 else:
-                    # Standard inference with optimal split point
-                    _, timings = run_distributed_inference(
-                        model_name,
-                        input_tensor,
-                        dnn_surgery,
-                        split_point=optimal_split,
-                        server_address=server_address,
-                        auto_plot=False,
-                        plot_show=False,
-                        plot_path=None,
+                    client = DNNInferenceClient(
+                        server_address,
+                        edge_model,
+                        max_inflight_requests=max_concurrent,
                     )
                 
-                edge_times.append(timings['edge_time'])
-                transfer_times.append(timings['transfer_time'])
-                cloud_times.append(timings['cloud_time'])
-                total_time = timings['edge_time'] + timings['transfer_time'] + timings['cloud_time']
-                total_times.append(total_time)
+                logger.info(f"Client configured with max_inflight_requests={max_concurrent}")
                 
-                logger.info(
-                    f"  Test {test_idx + 1}: Total={total_time:.1f}ms "
-                    f"(Edge={timings['edge_time']:.1f}ms, Transfer={timings['transfer_time']:.1f}ms, "
-                    f"Cloud={timings['cloud_time']:.1f}ms)"
-                )
+                # Process multiple batches with pipelining
+                for batch_idx in range(num_batches):
+                    logger.info(f"Processing batch {batch_idx + 1}/{num_batches} (batch_size={batch_size})...")
+                    
+                    # Get fresh input tensor
+                    input_tensor, _, _ = get_input_tensor(model_name, batch_size)
+                    
+                    # Process with pipelining-enabled client
+                    start_time = time.time()
+                    _, timings = client.process_tensor(input_tensor, model_name)
+                    batch_time = (time.time() - start_time) * 1000
+                    
+                    # Extract per-sample averages for batched processing
+                    edge_time = timings.get('edge_time', 0)
+                    transfer_time = timings.get('transfer_time', 0)
+                    cloud_time = timings.get('cloud_time', 0)
+                    
+                    edge_times.append(edge_time)
+                    transfer_times.append(transfer_time)
+                    cloud_times.append(cloud_time)
+                    total_times.append(edge_time + transfer_time + cloud_time)
+                    
+                    logger.info(
+                        f"  Batch {batch_idx + 1}: Total={batch_time:.1f}ms "
+                        f"(Avg per sample: Edge={edge_time:.1f}ms, Transfer={transfer_time:.1f}ms, Cloud={cloud_time:.1f}ms)"
+                    )
+            else:
+                # Standard sequential processing (no pipelining)
+                for test_idx in range(1, num_tests):
+                    logger.info(f"Running test {test_idx + 1}/{num_tests} at optimal split {optimal_split}...")
+                    
+                    # Get fresh input tensor with appropriate batch size
+                    input_tensor, _, _ = get_input_tensor(model_name, batch_size)
+                    
+                    # Run with the determined configuration
+                    if use_early_split and exit_config is not None:
+                        # Continue using early exit
+                        _, timings = run_distributed_inference_with_early_exit(
+                            model_name,
+                            input_tensor,
+                            dnn_surgery,
+                            exit_config=exit_config,
+                            split_point=optimal_split,
+                            server_address=server_address,
+                        )
+                    else:
+                        # Standard inference with optimal split point
+                        _, timings = run_distributed_inference(
+                            model_name,
+                            input_tensor,
+                            dnn_surgery,
+                            split_point=optimal_split,
+                            server_address=server_address,
+                            auto_plot=False,
+                            plot_show=False,
+                            plot_path=None,
+                        )
+                    
+                    edge_times.append(timings['edge_time'])
+                    transfer_times.append(timings['transfer_time'])
+                    cloud_times.append(timings['cloud_time'])
+                    total_time = timings['edge_time'] + timings['transfer_time'] + timings['cloud_time']
+                    total_times.append(total_time)
+                    
+                    logger.info(
+                        f"  Test {test_idx + 1}: Total={total_time:.1f}ms "
+                        f"(Edge={timings['edge_time']:.1f}ms, Transfer={timings['transfer_time']:.1f}ms, "
+                        f"Cloud={timings['cloud_time']:.1f}ms)"
+                    )
             
             # Calculate averages
             avg_edge = np.mean(edge_times)
