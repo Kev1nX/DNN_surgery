@@ -856,11 +856,20 @@ def test_all_models_neurosurgeon(
                 optimal_split = first_timings.get('split_point')
                 logger.info(f"NeuroSurgeon determined optimal split point: {optimal_split}")
             
-            # Run additional tests at the optimal split point
-            edge_times = [first_timings.get('edge_time', 0)]
-            transfer_times = [first_timings.get('transfer_time', 0)]
-            cloud_times = [first_timings.get('cloud_time', 0)]
-            total_times = [first_timings.get('edge_time', 0) + first_timings.get('transfer_time', 0) + first_timings.get('cloud_time', 0)]
+            # Initialize timing lists
+            # For pipelining, we'll measure differently (wall-clock throughput)
+            # For non-pipelining, we'll collect individual test measurements
+            edge_times = []
+            transfer_times = []
+            cloud_times = []
+            total_times = []
+            
+            if not use_pipelining:
+                # Include first_timings only for non-pipelined tests
+                edge_times.append(first_timings.get('edge_time', 0))
+                transfer_times.append(first_timings.get('transfer_time', 0))
+                cloud_times.append(first_timings.get('cloud_time', 0))
+                total_times.append(first_timings.get('edge_time', 0) + first_timings.get('transfer_time', 0) + first_timings.get('cloud_time', 0))
             
             # Handle pipelining with higher concurrency and batch processing
             if use_pipelining:
@@ -890,6 +899,10 @@ def test_all_models_neurosurgeon(
                 
                 logger.info(f"Client configured with max_inflight_requests={max_concurrent}")
                 
+                # Measure total wall-clock time for pipelined processing
+                pipeline_start = time.time()
+                total_samples = 0
+                
                 # Process multiple batches with pipelining
                 for batch_idx in range(num_batches):
                     logger.info(f"Processing batch {batch_idx + 1}/{num_batches} (batch_size={batch_size})...")
@@ -898,24 +911,34 @@ def test_all_models_neurosurgeon(
                     input_tensor, _, _ = get_input_tensor(model_name, batch_size)
                     
                     # Process with pipelining-enabled client
-                    start_time = time.time()
+                    batch_start = time.time()
                     _, timings = client.process_tensor(input_tensor, model_name)
-                    batch_time = (time.time() - start_time) * 1000
+                    batch_time = (time.time() - batch_start) * 1000
                     
-                    # Extract per-sample averages for batched processing
-                    edge_time = timings.get('edge_time', 0)
-                    transfer_time = timings.get('transfer_time', 0)
-                    cloud_time = timings.get('cloud_time', 0)
-                    
-                    edge_times.append(edge_time)
-                    transfer_times.append(transfer_time)
-                    cloud_times.append(cloud_time)
-                    total_times.append(edge_time + transfer_time + cloud_time)
+                    total_samples += batch_size
                     
                     logger.info(
-                        f"  Batch {batch_idx + 1}: Total={batch_time:.1f}ms "
-                        f"(Avg per sample: Edge={edge_time:.1f}ms, Transfer={transfer_time:.1f}ms, Cloud={cloud_time:.1f}ms)"
+                        f"  Batch {batch_idx + 1}: Batch time={batch_time:.1f}ms "
+                        f"(Per-sample avg: Edge={timings.get('edge_time', 0):.1f}ms, "
+                        f"Transfer={timings.get('transfer_time', 0):.1f}ms, "
+                        f"Cloud={timings.get('cloud_time', 0):.1f}ms)"
                     )
+                
+                # Calculate effective throughput from total pipeline time
+                pipeline_end = time.time()
+                total_pipeline_time = (pipeline_end - pipeline_start) * 1000  # ms
+                avg_time_per_sample = total_pipeline_time / total_samples
+                
+                # Use averaged timing for fair comparison
+                edge_times.append(timings.get('edge_time', 0))
+                transfer_times.append(timings.get('transfer_time', 0))
+                cloud_times.append(timings.get('cloud_time', 0))
+                total_times.append(avg_time_per_sample)
+                
+                logger.info(
+                    f"Pipeline completed: {total_samples} samples in {total_pipeline_time:.1f}ms "
+                    f"({avg_time_per_sample:.1f}ms/sample, {1000.0/avg_time_per_sample:.2f} samples/sec)"
+                )
             else:
                 # Standard sequential processing (no pipelining)
                 for test_idx in range(1, num_tests):
@@ -961,10 +984,10 @@ def test_all_models_neurosurgeon(
                     )
             
             # Calculate averages
-            avg_edge = np.mean(edge_times)
-            avg_transfer = np.mean(transfer_times)
-            avg_cloud = np.mean(cloud_times)
-            avg_total = np.mean(total_times)
+            avg_edge = np.mean(edge_times) if edge_times else 0.0
+            avg_transfer = np.mean(transfer_times) if transfer_times else 0.0
+            avg_cloud = np.mean(cloud_times) if cloud_times else 0.0
+            avg_total = np.mean(total_times) if total_times else 0.0
             
             all_model_timings[model_name] = {
                 'optimal_split': optimal_split,
@@ -972,12 +995,18 @@ def test_all_models_neurosurgeon(
                 'transfer_time': avg_transfer,
                 'cloud_time': avg_cloud,
                 'total_time': avg_total,
-                'num_tests': num_tests,
+                'num_tests': len(total_times) if total_times else 0,
+                'throughput': 1000.0 / avg_total if avg_total > 0 else 0.0,  # inferences per second
             }
             
             logger.info(f"✓ {model_name} completed:")
             logger.info(f"  Optimal split: {optimal_split}")
-            logger.info(f"  Average total time: {avg_total:.1f}ms (Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms)")
+            if use_pipelining:
+                throughput = 1000.0 / avg_total if avg_total > 0 else 0.0
+                logger.info(f"  Pipelined throughput: {throughput:.2f} inf/s ({avg_total:.1f}ms per sample)")
+                logger.info(f"  Component times: Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms")
+            else:
+                logger.info(f"  Average total time: {avg_total:.1f}ms (Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms)")
             
         except Exception as e:
             logger.error(f"Failed to test {model_name}: {str(e)}")
