@@ -744,35 +744,58 @@ def test_all_models_single_split(
     
     return all_model_timings
 
+def _calculate_batch_accuracy(result: torch.Tensor, true_labels: torch.Tensor, batch_idx: int) -> Tuple[int, int]:
+    """Helper function to calculate accuracy for a batch of predictions
+    
+    Args:
+        result: Model output tensor (logits)
+        true_labels: Ground truth labels
+        batch_idx: Batch index for logging (1-indexed)
+        
+    Returns:
+        Tuple of (correct_predictions, total_samples)
+    """
+    correct = 0
+    total = 0
+    
+    if result.dim() == 2:
+        probs = torch.softmax(result, dim=1)
+        _, predicted = probs.max(1)
+        for i in range(len(predicted)):
+            pred_class = predicted[i].item()
+            true_class = true_labels[i].item()
+            if pred_class == true_class:
+                correct += 1
+            total += 1
+            logger.debug(f"  Batch {batch_idx}, Sample {i}: Predicted={pred_class}, True={true_class} ({'✓' if pred_class == true_class else '✗'})")
+    
+    return correct, total
+
 def test_all_models_neurosurgeon(
     server_address: str,
-    num_tests: int = 3,
+    num_batches: int = 3,
     *,
     auto_plot: bool = True,
     plot_show: bool = True,
     plot_path: Optional[str] = None,
     enable_quantization: bool = False,
     use_early_split: bool = False,
-    use_pipelining: bool = False,
     batch_size: int = 1,
-    num_batches: int = 1,
 ) -> Dict[str, Dict]:
     """Test all supported models using NeuroSurgeon-determined optimal split points.
     
     This function runs each model with NeuroSurgeon optimization to find the optimal
-    split point, then performs multiple test runs at that optimal split point.
+    split point, then performs multiple batch inferences for stable measurements.
     
     Args:
         server_address: Server address
-        num_tests: Number of test runs per model at optimal split
+        num_batches: Number of batches to run per model for stable measurements (default: 3)
         auto_plot: Whether to generate plots
         plot_show: Whether to show plots interactively
         plot_path: Path for saving the plot
         enable_quantization: Whether to enable INT8 quantization for models
         use_early_split: Whether to enable early exit with intermediate classifiers
-        use_pipelining: Whether to enable pipelined execution with batching
-        batch_size: Batch size for inference (used with pipelining)
-        num_batches: Number of batches to process (used with pipelining)
+        batch_size: Batch size for each inference run (default: 1)
         
     Returns:
         Dictionary mapping model names to their optimal split timing results
@@ -787,8 +810,6 @@ def test_all_models_neurosurgeon(
         config_parts.append("Quantization")
     if use_early_split:
         config_parts.append("Early Exit")
-    if use_pipelining:
-        config_parts.append("Pipelining")
     
     config_desc = " + ".join(config_parts) if config_parts else "Standard"
     
@@ -799,8 +820,7 @@ def test_all_models_neurosurgeon(
         logger.info("Quantization: ENABLED (INT8 dynamic quantization)")
     if use_early_split:
         logger.info("Early Exit: ENABLED (intermediate classifiers with confidence threshold)")
-    if use_pipelining:
-        logger.info(f"Pipelining: ENABLED (batch_size={batch_size}, num_batches={num_batches})")
+    logger.info(f"Running {num_batches} batch(es) per model (batch_size={batch_size}) for stable measurements")
     logger.info("="*80)
     
     for model_name in SUPPORTED_MODELS:
@@ -813,209 +833,86 @@ def test_all_models_neurosurgeon(
             model = get_model(model_name)
             dnn_surgery = DNNSurgery(model, model_name, enable_quantization=enable_quantization)
             
-            # Get input tensor with appropriate batch size
-            input_tensor, _, _ = get_input_tensor(model_name, batch_size)
-            
             # Configure early exit if requested
             exit_config = None
             if use_early_split:
-                # Use early exit inference with intermediate classifiers
                 logger.info(f"Using early exit configuration with intermediate classifiers")
                 exit_config = EarlyExitConfig(
                     enabled=True,
                     confidence_threshold=0.9,
                     max_exits=3,  # Limit to 3 early exit points
                 )
-                
-                # Run first test with early exit
-                result, first_timings = run_distributed_inference_with_early_exit(
-                    model_name,
-                    input_tensor,
-                    dnn_surgery,
-                    exit_config=exit_config,
-                    split_point=None,  # Let NeuroSurgeon decide split, but enable early exits
-                    server_address=server_address,
-                )
-                
-                optimal_split = first_timings.get('split_point')
-                logger.info(f"Early exit configuration with optimal split point: {optimal_split}")
             else:
-                # Let NeuroSurgeon determine optimal split
                 logger.info(f"Running NeuroSurgeon optimization for {model_name}...")
-                result, first_timings = run_distributed_inference(
-                    model_name,
-                    input_tensor,
-                    dnn_surgery,
-                    split_point=None,  # Let NeuroSurgeon decide
-                    server_address=server_address,
-                    auto_plot=False,  # Don't plot individual runs
-                    plot_show=False,
-                    plot_path=None,
-                )
-                
-                optimal_split = first_timings.get('split_point')
-                logger.info(f"NeuroSurgeon determined optimal split point: {optimal_split}")
             
-            # Initialize timing lists
-            # For pipelining, we'll measure differently (wall-clock throughput)
-            # For non-pipelining, we'll collect individual test measurements
+            # Initialize timing lists and accuracy tracking
             edge_times = []
             transfer_times = []
             cloud_times = []
             total_times = []
+            correct_predictions = 0
+            total_samples = 0
+            early_exit_counts = []
+            early_exit_rates = []
+            optimal_split = None
             
-            if not use_pipelining:
-                # Include first_timings only for non-pipelined tests
-                edge_times.append(first_timings.get('edge_time', 0))
-                transfer_times.append(first_timings.get('transfer_time', 0))
-                cloud_times.append(first_timings.get('cloud_time', 0))
-                total_times.append(first_timings.get('edge_time', 0) + first_timings.get('transfer_time', 0) + first_timings.get('cloud_time', 0))
-            
-            # Handle pipelining with higher concurrency and batch processing
-            if use_pipelining:
-                logger.info(f"Using pipelining with {num_batches} batches of size {batch_size}")
+            # Run all batches for stable measurements
+            logger.info(f"Running {num_batches} batch(es) for stable measurements...")
+            for batch_idx in range(num_batches):
+                # Get fresh input for each batch
+                input_tensor, true_labels, class_names = get_input_tensor(model_name, batch_size)
                 
-                # Set up client with pipelining support
-                dnn_surgery.splitter.set_split_point(optimal_split)
-                edge_model = dnn_surgery.splitter.get_edge_model()
+                # Determine split point: None for first batch (NeuroSurgeon optimization), reuse optimal_split for subsequent batches
+                current_split = None if batch_idx == 0 else optimal_split
                 
-                # Create client with higher max_inflight_requests for pipelining
-                max_concurrent = min(num_batches * batch_size, 16)  # Allow up to 16 concurrent requests
-                
-                if use_early_split and exit_config is not None:
-                    client = EarlyExitInferenceClient(
-                        server_address=server_address,
-                        dnn_surgery=dnn_surgery,
-                        edge_model=edge_model,
+                if use_early_split:
+                    result, timings = run_distributed_inference_with_early_exit(
+                        model_name,
+                        input_tensor,
+                        dnn_surgery,
                         exit_config=exit_config,
-                        max_inflight_requests=max_concurrent,
+                        split_point=current_split,  # None for first batch, then reuse optimal split
+                        server_address=server_address,
                     )
+                    early_exit_counts.append(timings.get('early_exit_count', 0))
+                    early_exit_rates.append(timings.get('early_exit_rate', 0.0))
                 else:
-                    client = DNNInferenceClient(
-                        server_address,
-                        edge_model,
-                        max_inflight_requests=max_concurrent,
+                    result, timings = run_distributed_inference(
+                        model_name,
+                        input_tensor,
+                        dnn_surgery,
+                        split_point=current_split,
+                        server_address=server_address,
+                        auto_plot=False,
+                        plot_show=False,
+                        plot_path=None,
                     )
                 
-                logger.info(f"Client configured with max_inflight_requests={max_concurrent}")
+                # Store optimal split from first batch
+                if batch_idx == 0:
+                    optimal_split = timings.get('split_point')
+                    logger.info(f"{'Early exit configuration' if use_early_split else 'NeuroSurgeon'} determined optimal split point: {optimal_split}")
                 
-                # Measure total wall-clock time for pipelined processing
-                pipeline_start = time.time()
-                total_samples = 0
+                # Collect timing metrics
+                edge_times.append(timings.get('edge_time', 0))
+                transfer_times.append(timings.get('transfer_time', 0))
+                cloud_times.append(timings.get('cloud_time', 0))
+                total_times.append(timings.get('edge_time', 0) + timings.get('transfer_time', 0) + timings.get('cloud_time', 0))
                 
-                # Track cumulative component times across all batches
-                cumulative_edge_time = 0.0
-                cumulative_transfer_time = 0.0
-                cumulative_cloud_time = 0.0
+                # Calculate accuracy for this batch
+                batch_correct, batch_total = _calculate_batch_accuracy(result, true_labels, batch_idx + 1)
+                correct_predictions += batch_correct
+                total_samples += batch_total
                 
-                # Process multiple batches with pipelining
-                for batch_idx in range(num_batches):
-                    logger.info(f"Processing batch {batch_idx + 1}/{num_batches} (batch_size={batch_size})...")
-                    
-                    # Get fresh input tensor
-                    input_tensor, _, _ = get_input_tensor(model_name, batch_size)
-                    
-                    # Process with pipelining-enabled client
-                    batch_start = time.time()
-                    _, timings = client.process_tensor(input_tensor, model_name)
-                    batch_time = (time.time() - batch_start) * 1000
-                    
-                    # Accumulate component times (these are per-sample averages from the batch)
-                    cumulative_edge_time += timings.get('edge_time', 0) * batch_size
-                    cumulative_transfer_time += timings.get('transfer_time', 0) * batch_size
-                    cumulative_cloud_time += timings.get('cloud_time', 0) * batch_size
-                    
-                    total_samples += batch_size
-                    
-                    logger.info(
-                        f"  Batch {batch_idx + 1}: Batch time={batch_time:.1f}ms "
-                        f"(Per-sample avg: Edge={timings.get('edge_time', 0):.1f}ms, "
-                        f"Transfer={timings.get('transfer_time', 0):.1f}ms, "
-                        f"Cloud={timings.get('cloud_time', 0):.1f}ms)"
-                    )
-                
-                # Calculate effective throughput from total pipeline time
-                pipeline_end = time.time()
-                total_pipeline_time = (pipeline_end - pipeline_start) * 1000  # ms
-                wall_clock_avg = total_pipeline_time / total_samples
-                
-                # Calculate average component times across all samples
-                avg_edge = cumulative_edge_time / total_samples
-                avg_transfer = cumulative_transfer_time / total_samples
-                avg_cloud = cumulative_cloud_time / total_samples
-                
-                # For visualization: use sum of components (matches stacked bars)
-                # This represents the actual work done, not wall-clock time
-                component_sum = avg_edge + avg_transfer + avg_cloud
-                
-                # Store averaged timings for plotting
-                edge_times.append(avg_edge)
-                transfer_times.append(avg_transfer)
-                cloud_times.append(avg_cloud)
-                total_times.append(component_sum)  # Use component sum for bar chart label
-                
-                # Calculate throughput from wall-clock time (shows pipelining benefit)
-                throughput = 1000.0 / wall_clock_avg
-                
-                logger.info(
-                    f"Pipeline completed: {total_samples} samples in {total_pipeline_time:.1f}ms "
-                    f"(Wall-clock: {wall_clock_avg:.1f}ms/sample, Throughput: {throughput:.2f} samples/sec)"
-                )
-                logger.info(
-                    f"  Component times: Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms"
-                )
-                logger.info(
-                    f"  Component sum: {component_sum:.1f}ms (vs wall-clock: {wall_clock_avg:.1f}ms, speedup: {component_sum/wall_clock_avg:.2f}x)"
-                )
-            else:
-                # Standard sequential processing (no pipelining)
-                for test_idx in range(1, num_tests):
-                    logger.info(f"Running test {test_idx + 1}/{num_tests} at optimal split {optimal_split}...")
-                    
-                    # Get fresh input tensor with appropriate batch size
-                    input_tensor, _, _ = get_input_tensor(model_name, batch_size)
-                    
-                    # Run with the determined configuration
-                    if use_early_split and exit_config is not None:
-                        # Continue using early exit
-                        _, timings = run_distributed_inference_with_early_exit(
-                            model_name,
-                            input_tensor,
-                            dnn_surgery,
-                            exit_config=exit_config,
-                            split_point=optimal_split,
-                            server_address=server_address,
-                        )
-                    else:
-                        # Standard inference with optimal split point
-                        _, timings = run_distributed_inference(
-                            model_name,
-                            input_tensor,
-                            dnn_surgery,
-                            split_point=optimal_split,
-                            server_address=server_address,
-                            auto_plot=False,
-                            plot_show=False,
-                            plot_path=None,
-                        )
-                    
-                    edge_times.append(timings['edge_time'])
-                    transfer_times.append(timings['transfer_time'])
-                    cloud_times.append(timings['cloud_time'])
-                    total_time = timings['edge_time'] + timings['transfer_time'] + timings['cloud_time']
-                    total_times.append(total_time)
-                    
-                    logger.info(
-                        f"  Test {test_idx + 1}: Total={total_time:.1f}ms "
-                        f"(Edge={timings['edge_time']:.1f}ms, Transfer={timings['transfer_time']:.1f}ms, "
-                        f"Cloud={timings['cloud_time']:.1f}ms)"
-                    )
-            
-            # Calculate averages
+                logger.info(f"  Batch {batch_idx + 1}/{num_batches}: Total={total_times[-1]:.1f}ms (Edge={edge_times[-1]:.1f}ms, Transfer={transfer_times[-1]:.1f}ms, Cloud={cloud_times[-1]:.1f}ms)")
+        
+            # Calculate averages and statistics
             avg_edge = np.mean(edge_times) if edge_times else 0.0
             avg_transfer = np.mean(transfer_times) if transfer_times else 0.0
             avg_cloud = np.mean(cloud_times) if cloud_times else 0.0
             avg_total = np.mean(total_times) if total_times else 0.0
+            std_total = np.std(total_times) if len(total_times) > 1 else 0.0
+            accuracy = (correct_predictions / total_samples * 100) if total_samples > 0 else 0.0
             
             all_model_timings[model_name] = {
                 'optimal_split': optimal_split,
@@ -1023,18 +920,31 @@ def test_all_models_neurosurgeon(
                 'transfer_time': avg_transfer,
                 'cloud_time': avg_cloud,
                 'total_time': avg_total,
-                'num_tests': len(total_times) if total_times else 0,
+                'std_total_time': std_total,
+                'num_batches': len(total_times) if total_times else 0,
                 'throughput': 1000.0 / avg_total if avg_total > 0 else 0.0,  # inferences per second
+                'accuracy': accuracy,
+                'correct_predictions': correct_predictions,
+                'total_samples': total_samples,
             }
+            
+            # Add early exit statistics if enabled
+            if use_early_split and early_exit_counts:
+                all_model_timings[model_name]['avg_early_exit_count'] = np.mean(early_exit_counts)
+                all_model_timings[model_name]['avg_early_exit_rate'] = np.mean(early_exit_rates)
             
             logger.info(f"✓ {model_name} completed:")
             logger.info(f"  Optimal split: {optimal_split}")
-            if use_pipelining:
-                throughput = 1000.0 / avg_total if avg_total > 0 else 0.0
-                logger.info(f"  Pipelined throughput: {throughput:.2f} inf/s ({avg_total:.1f}ms per sample)")
-                logger.info(f"  Component times: Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms")
+            if batch_size > 1:
+                logger.info(f"  Batch size: {batch_size} samples per test")
+                logger.info(f"  Average time per batch: {avg_total:.1f}ms ± {std_total:.1f}ms")
+                logger.info(f"  Average time per sample: {avg_total/batch_size:.1f}ms")
+                logger.info(f"  Timing breakdown: Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms")
             else:
-                logger.info(f"  Average total time: {avg_total:.1f}ms (Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms)")
+                logger.info(f"  Average total time: {avg_total:.1f}ms ± {std_total:.1f}ms (Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms)")
+            logger.info(f"  Accuracy: {accuracy:.2f}% ({correct_predictions}/{total_samples} correct)")
+            if use_early_split and early_exit_counts:
+                logger.info(f"  Early exit rate: {np.mean(early_exit_rates)*100:.1f}% (avg {np.mean(early_exit_counts):.1f} exits per batch)")
             
         except Exception as e:
             logger.error(f"Failed to test {model_name}: {str(e)}")
@@ -1046,17 +956,16 @@ def test_all_models_neurosurgeon(
     logger.info("\n" + "="*80)
     logger.info(f"NEUROSURGEON OPTIMIZATION SUMMARY ({config_desc})")
     logger.info("="*80)
-    logger.info(f"{'Model':<20} {'Optimal Split':<15} {'Total(ms)':<12} {'Edge(ms)':<11} {'Transfer(ms)':<14} {'Cloud(ms)':<12}")
+    logger.info(f"{'Model':<20} {'Split':<7} {'Total(ms)':<13} {'Std(ms)':<10} {'Accuracy':<10} {'Batches':<8}")
     logger.info("-" * 80)
     
     # Sort by total time
     sorted_models = sorted(all_model_timings.items(), key=lambda x: x[1]['total_time'])
     for model_name, timings in sorted_models:
         logger.info(
-            f"{model_name:<20} {timings['optimal_split']:<15} {timings['total_time']:<12.1f} "
-            f"{timings['edge_time']:<11.1f} {timings['transfer_time']:<14.1f} {timings['cloud_time']:<12.1f}"
+            f"{model_name:<20} {timings['optimal_split']:<7} {timings['total_time']:<13.1f} "
+            f"{timings.get('std_total_time', 0):<10.1f} {timings.get('accuracy', 0):<9.1f}% {timings['num_batches']:<8}"
         )
-    
     logger.info("="*80)
     
     # Generate comparison plots
@@ -1073,8 +982,6 @@ def test_all_models_neurosurgeon(
                 filename_suffix.append("quantized")
             if use_early_split:
                 filename_suffix.append("earlyexit")
-            if use_pipelining:
-                filename_suffix.append(f"pipelined_bs{batch_size}_nb{num_batches}")
             
             suffix_str = "_" + "_".join(filename_suffix) if filename_suffix else ""
             
@@ -1271,12 +1178,12 @@ def main():
                        help='Split point for model partitioning (default: None - use NeuroSurgeon optimization)')
     parser.add_argument('--batch-size', type=int, default=1,
                        help='Batch size for inference (default: 1)')
-    parser.add_argument('--num-batches', type=int, default=1,
-                       help='Number of batches to process (default: 1)')
+    parser.add_argument('--num-batches', type=int, default=3,
+                       help='Number of batches to process for stable measurements (default: 3)')
     parser.add_argument('--test-splits', type=str,
                        help='Comma-separated split points to test (e.g., "0,1,2,3,4") - overrides NeuroSurgeon')
     parser.add_argument('--num-tests', type=int, default=3,
-                       help='Number of tests per split point (default: 3)')
+                       help='Number of tests per split point when testing specific splits (default: 3)')
     parser.add_argument('--test-connection', action='store_true',
                        help='Test connection to server and exit')
     parser.add_argument('--test-all-models', action='store_true',
@@ -1289,8 +1196,6 @@ def main():
                        help='Enable INT8 quantization when testing all models with NeuroSurgeon')
     parser.add_argument('--neurosurgeon-early-split', action='store_true',
                        help='Enable early exit with intermediate classifiers (confidence-based exits at shallow layers)')
-    parser.add_argument('--neurosurgeon-pipelining', action='store_true',
-                       help='Enable pipelined execution when testing all models with NeuroSurgeon')
     parser.add_argument('--use-neurosurgeon', action='store_true', default=True,
                        help='Use NeuroSurgeon optimization (default: True)')
     parser.add_argument('--no-neurosurgeon', action='store_true',
@@ -1366,15 +1271,13 @@ def main():
             logger.info("Testing all models with NeuroSurgeon optimization...")
             test_all_models_neurosurgeon(
                 args.server_address,
-                num_tests=args.num_tests,
+                num_batches=args.num_batches,
                 auto_plot=args.auto_plot,
                 plot_show=args.plot_show,
                 plot_path=args.plot_save or "plots",
                 enable_quantization=args.neurosurgeon_quantize,
                 use_early_split=args.neurosurgeon_early_split,
-                use_pipelining=args.neurosurgeon_pipelining,
                 batch_size=args.batch_size,
-                num_batches=args.num_batches,
             )
             logger.info("NeuroSurgeon testing complete!")
             sys.exit(0)
