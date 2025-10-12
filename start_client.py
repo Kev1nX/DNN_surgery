@@ -441,10 +441,6 @@ def test_split_points(
     model = get_model(model_name)
     dnn_surgery = DNNSurgery(model, model_name)
 
-    input_tensor, _, _ = get_input_tensor(model_name, 1)
-    logger.info("Profiling model layers...")
-    dnn_surgery.profile_model(input_tensor)
-
     results: Dict[int, Dict] = {}
 
     def _init_component_buckets() -> Dict[str, List[float]]:
@@ -633,9 +629,7 @@ def test_all_models_single_split(
             model = get_model(model_name)
             dnn_surgery = DNNSurgery(model, model_name)
             
-            # Profile to determine number of layers
-            input_tensor, _, _ = get_input_tensor(model_name, 1)
-            dnn_surgery.profile_model(input_tensor)
+            # Get number of layers
             num_layers = len(dnn_surgery.splitter.layers)
             
             # Validate split point
@@ -761,6 +755,179 @@ def test_all_models_single_split(
     
     return all_model_timings
 
+def test_all_models_neurosurgeon(
+    server_address: str,
+    num_tests: int = 3,
+    *,
+    auto_plot: bool = True,
+    plot_show: bool = True,
+    plot_path: Optional[str] = None,
+) -> Dict[str, Dict]:
+    """Test all supported models using NeuroSurgeon-determined optimal split points.
+    
+    This function runs each model with NeuroSurgeon optimization to find the optimal
+    split point, then performs multiple test runs at that optimal split point.
+    
+    Args:
+        server_address: Server address
+        num_tests: Number of test runs per model at optimal split
+        auto_plot: Whether to generate plots
+        plot_show: Whether to show plots interactively
+        plot_path: Path for saving the plot
+        
+    Returns:
+        Dictionary mapping model names to their optimal split timing results
+    """
+    initialize_dataset_loader(1)
+    
+    all_model_timings = {}
+    
+    logger.info("="*80)
+    logger.info("TESTING ALL MODELS WITH NEUROSURGEON OPTIMIZATION")
+    logger.info("="*80)
+    
+    for model_name in SUPPORTED_MODELS:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Testing model: {model_name} with NeuroSurgeon")
+        logger.info('='*80)
+        
+        try:
+            # Get model and create DNN Surgery instance
+            model = get_model(model_name)
+            dnn_surgery = DNNSurgery(model, model_name)
+            
+            # Get input tensor
+            input_tensor, _, _ = get_input_tensor(model_name, 1)
+            
+            # First run: Let NeuroSurgeon determine optimal split
+            logger.info(f"Running NeuroSurgeon optimization for {model_name}...")
+            result, first_timings = run_distributed_inference(
+                model_name,
+                input_tensor,
+                dnn_surgery,
+                split_point=None,  # Let NeuroSurgeon decide
+                server_address=server_address,
+                auto_plot=False,  # Don't plot individual runs
+                plot_show=False,
+                plot_path=None,
+            )
+            
+            optimal_split = first_timings.get('split_point')
+            logger.info(f"NeuroSurgeon determined optimal split point: {optimal_split}")
+            
+            # Run additional tests at the optimal split point
+            edge_times = [first_timings['edge_time']]
+            transfer_times = [first_timings['transfer_time']]
+            cloud_times = [first_timings['cloud_time']]
+            total_times = [first_timings['total_time']]
+            
+            for test_idx in range(1, num_tests):
+                logger.info(f"Running test {test_idx + 1}/{num_tests} at optimal split {optimal_split}...")
+                
+                # Get fresh input tensor
+                input_tensor, _, _ = get_input_tensor(model_name, 1)
+                
+                # Run with the determined optimal split point
+                _, timings = run_distributed_inference(
+                    model_name,
+                    input_tensor,
+                    dnn_surgery,
+                    split_point=optimal_split,
+                    server_address=server_address,
+                    auto_plot=False,
+                    plot_show=False,
+                    plot_path=None,
+                )
+                
+                edge_times.append(timings['edge_time'])
+                transfer_times.append(timings['transfer_time'])
+                cloud_times.append(timings['cloud_time'])
+                total_times.append(timings['total_time'])
+                
+                logger.info(
+                    f"  Test {test_idx + 1}: Total={timings['total_time']:.1f}ms "
+                    f"(Edge={timings['edge_time']:.1f}ms, Transfer={timings['transfer_time']:.1f}ms, "
+                    f"Cloud={timings['cloud_time']:.1f}ms)"
+                )
+            
+            # Calculate averages
+            avg_edge = np.mean(edge_times)
+            avg_transfer = np.mean(transfer_times)
+            avg_cloud = np.mean(cloud_times)
+            avg_total = np.mean(total_times)
+            
+            all_model_timings[model_name] = {
+                'optimal_split': optimal_split,
+                'edge_time': avg_edge,
+                'transfer_time': avg_transfer,
+                'cloud_time': avg_cloud,
+                'total_time': avg_total,
+                'num_tests': num_tests,
+            }
+            
+            logger.info(f"✓ {model_name} completed:")
+            logger.info(f"  Optimal split: {optimal_split}")
+            logger.info(f"  Average total time: {avg_total:.1f}ms (Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms)")
+            
+        except Exception as e:
+            logger.error(f"Failed to test {model_name}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Print summary
+    logger.info("\n" + "="*80)
+    logger.info("NEUROSURGEON OPTIMIZATION SUMMARY")
+    logger.info("="*80)
+    logger.info(f"{'Model':<20} {'Optimal Split':<15} {'Total(ms)':<12} {'Edge(ms)':<11} {'Transfer(ms)':<14} {'Cloud(ms)':<12}")
+    logger.info("-" * 80)
+    
+    # Sort by total time
+    sorted_models = sorted(all_model_timings.items(), key=lambda x: x[1]['total_time'])
+    for model_name, timings in sorted_models:
+        logger.info(
+            f"{model_name:<20} {timings['optimal_split']:<15} {timings['total_time']:<12.1f} "
+            f"{timings['edge_time']:<11.1f} {timings['transfer_time']:<14.1f} {timings['cloud_time']:<12.1f}"
+        )
+    
+    logger.info("="*80)
+    
+    # Generate comparison plots
+    if auto_plot and all_model_timings:
+        try:
+            save_dir = Path(plot_path) if plot_path else Path("plots")
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            bar_chart_path = save_dir / f"all_models_neurosurgeon_{timestamp}.png"
+            throughput_bar_chart_path = save_dir / f"all_models_neurosurgeon_throughput_{timestamp}.png"
+            
+            logger.info(f"Generating NeuroSurgeon comparison bar chart: {bar_chart_path}")
+            plot_model_comparison_bar(
+                all_model_timings,
+                show=plot_show,
+                save_path=str(bar_chart_path),
+                title="All Models - NeuroSurgeon Optimal Split Comparison",
+            )
+            logger.info(f"✓ Bar chart saved to {bar_chart_path.resolve()}")
+            
+            # Generate throughput comparison
+            logger.info(f"Generating throughput comparison bar chart: {throughput_bar_chart_path}")
+            plot_model_throughput_comparison_bar(
+                all_model_timings,
+                show=plot_show,
+                save_path=str(throughput_bar_chart_path),
+                title="All Models - NeuroSurgeon Throughput Comparison",
+            )
+            logger.info(f"✓ Throughput bar chart saved to {throughput_bar_chart_path.resolve()}")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate comparison plots: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    return all_model_timings
+
 def test_all_models_all_splits(
     server_address: str,
     num_tests: int = 3,
@@ -801,9 +968,7 @@ def test_all_models_all_splits(
             model = get_model(model_name)
             dnn_surgery = DNNSurgery(model, model_name)
             
-            # Profile to determine number of layers
-            input_tensor, _, _ = get_input_tensor(model_name, 1)
-            dnn_surgery.profile_model(input_tensor)
+            # Get number of layers
             num_layers = len(dnn_surgery.splitter.layers)
             
             # Test all split points for this model
@@ -935,6 +1100,8 @@ def main():
                        help='Test all supported models across all split points and generate comparison plots')
     parser.add_argument('--test-all-models-split', type=int, default=None,
                        help='Test all models at a specific split point and generate a bar chart comparison (e.g., --test-all-models-split 0)')
+    parser.add_argument('--test-all-models-neurosurgeon', action='store_true',
+                       help='Test all models using NeuroSurgeon-determined optimal split points and generate comparison plots')
     parser.add_argument('--use-neurosurgeon', action='store_true', default=True,
                        help='Use NeuroSurgeon optimization (default: True)')
     parser.add_argument('--no-neurosurgeon', action='store_true',
@@ -1003,6 +1170,19 @@ def main():
                 plot_path=args.plot_save or "plots",
             )
             logger.info("All models testing complete!")
+            sys.exit(0)
+        
+        # Test all models with NeuroSurgeon optimization
+        if args.test_all_models_neurosurgeon:
+            logger.info("Testing all models with NeuroSurgeon optimization...")
+            test_all_models_neurosurgeon(
+                args.server_address,
+                num_tests=args.num_tests,
+                auto_plot=args.auto_plot,
+                plot_show=args.plot_show,
+                plot_path=args.plot_save or "plots",
+            )
+            logger.info("NeuroSurgeon testing complete!")
             sys.exit(0)
         
         # Test all models across all split points

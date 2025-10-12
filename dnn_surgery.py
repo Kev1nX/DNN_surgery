@@ -91,63 +91,7 @@ class NetworkProfiler:
         return dict(self._transfer_cache)
 
 
-class LayerProfiler:
-    def __init__(self):
-        self.profiles = []
-        
-    def profile_layer(self, layer: nn.Module, input_tensor: torch.Tensor, 
-                     layer_idx: int, layer_name: str) -> Dict:
-        # Profile execution time with multiple runs for accuracy
-        times = []
-        output = None
-        
-        try:
-            for _ in range(3):  # Multiple measurements for accuracy
-                cuda_sync()
-                start_time = time.perf_counter()
-                
-                with torch.no_grad():
-                    output = layer(input_tensor)
 
-                cuda_sync()
-                end_time = time.perf_counter()
-                
-                times.append((end_time - start_time) * 1000)  # Convert to ms
-            
-            # Use median time to avoid outliers
-            execution_time = sorted(times)[len(times)//2]
-        except Exception as e:
-            logger.error(f"Error profiling layer {layer_idx} ({layer_name}): {e}")
-            raise
-        
-        # Calculate tensor sizes
-        input_size = list(input_tensor.shape)
-        output_size = list(output.shape)
-        data_transfer_size = output.numel() * output.element_size()  # bytes
-        
-        profile = {
-            'layer_idx': layer_idx,
-            'layer_name': layer_name,
-            'execution_time': execution_time,
-            'input_size': input_size,
-            'output_size': output_size,
-            'data_transfer_size': data_transfer_size,
-            'computation_complexity': output.numel()  # Simple complexity measure
-        }
-        
-        self.profiles.append(profile)
-        logger.info(f"Layer {layer_idx} ({layer_name}): {execution_time:.2f}ms, "
-                   f"Output shape: {output.shape}")
-        
-        return profile
-        
-    def get_profiles(self) -> List[Dict]:
-        """Get all collected profiles"""
-        return self.profiles
-        
-    def clear_profiles(self):
-        """Clear all collected profiles"""
-        self.profiles = []
 
 class ModelSplitter:
     """Handles splitting models between edge and cloud execution using model's natural structure"""
@@ -390,10 +334,7 @@ class DNNSurgery:
         self.model = model.eval()  # Ensure model is in eval mode
         self.model_name = model_name
         self.splitter = ModelSplitter(model, model_name)
-        self.profiler = LayerProfiler()
         self.network_profiler = NetworkProfiler()
-        self.layer_outputs: List[torch.Tensor] = []
-        self.input_sample: Optional[torch.Tensor] = None
         self.enable_quantization = enable_quantization
         self.quantizer = ModelQuantizer() if enable_quantization else None
         
@@ -401,85 +342,6 @@ class DNNSurgery:
             logger.info(f"Initialized DNNSurgery for model: {model_name} with quantization enabled")
         else:
             logger.info(f"Initialized DNNSurgery for model: {model_name}")
-        
-    def profile_model(self, input_tensor: torch.Tensor) -> List[Dict]:
-        """Profile the entire model layer by layer
-        
-        Args:
-            input_tensor: Input tensor for profiling
-        Returns:
-            List of layer profiles
-        """
-        logger.info(f"Starting model profiling with input shape: {input_tensor.shape}")
-        
-        self.profiler.clear_profiles()
-        self.layer_outputs = []
-        self.input_sample = input_tensor.detach().cpu()
-        current_tensor = input_tensor
-        
-        # Profile each layer
-        for idx, layer in enumerate(self.splitter.layers):
-            try:
-                layer_name = layer.__class__.__name__
-                if hasattr(layer, '_get_name'):
-                    layer_name = layer._get_name()
-                    
-                # Before profiling, handle tensor shape transitions
-                profile_input = current_tensor
-                needs_flatten = self._needs_flattening_for_layer(layer, current_tensor)
-                
-                if needs_flatten:
-                    # For layers that need flattening, flatten the input for profiling
-                    profile_input = torch.flatten(current_tensor, 1)
-
-                self.profiler.profile_layer(
-                    layer, profile_input, idx, layer_name
-                )
-                
-                # Execute layer with the actual input (including potential flattening logic)
-                with torch.no_grad():
-                    if needs_flatten:
-                        # Apply flattening for the actual execution too
-                        current_tensor = torch.flatten(current_tensor, 1)
-                        
-                    current_tensor = layer(current_tensor)
-                    self.layer_outputs.append(current_tensor.detach().cpu())
-            except Exception as e:
-                logger.error(f"Failed to profile layer {idx} ({layer_name}): {e}")
-                logger.error(f"Input tensor shape: {current_tensor.shape}, dtype: {current_tensor.dtype}")
-                logger.error(f"Layer: {layer}")
-                raise RuntimeError(f"Profiling failed at layer {idx} ({layer_name}): {e}") from e
-                
-        return self.profiler.get_profiles()
-    
-    def _needs_flattening_for_layer(self, layer: nn.Module, input_tensor: torch.Tensor) -> bool:
-        """Check if we need to flatten the input before applying this layer
-        
-        Args:
-            layer: The layer to check
-            input_tensor: The input tensor
-            
-        Returns:
-            True if flattening is needed, False otherwise
-        """
-        # Check if this is a Linear layer expecting 2D input but receiving >2D input
-        if isinstance(layer, nn.Linear) and input_tensor.dim() > 2:
-            return True
-            
-        # Check if this is a Sequential classifier (like AlexNet's classifier)
-        # The classifier Sequential may contain Dropout, Linear, etc.
-        if isinstance(layer, nn.Sequential) and len(layer) > 0 and input_tensor.dim() > 2:
-            # First check if the Sequential already has a Flatten layer - if so, don't flatten
-            for sublayer in layer:
-                if isinstance(sublayer, nn.Flatten):
-                    return False  # Sequential will handle flattening itself
-            
-            # Check if any layer in the sequential is Linear - if so, we need to flatten
-            for sublayer in layer:
-                if isinstance(sublayer, nn.Linear):
-                    return True
-        
-        return False
     
     def get_split_layer_names(self) -> List[str]:
         """Get layer names for all possible split points
@@ -502,156 +364,98 @@ class DNNSurgery:
         return layer_names
     
     def find_optimal_split(self, input_tensor: torch.Tensor, server_address: str) -> Tuple[int, Dict]:
-        """Find optimal split point using client-side calculation with server execution times
+        """Find optimal split point by measuring actual inference at each split point
         
         Args:
-            input_tensor: Input tensor for profiling
-            server_address: Server address for network profiling
+            input_tensor: Input tensor for inference
+            server_address: Server address
             
         Returns:
             Tuple of (optimal_split_point, timing_analysis)
         """
-        logger.info("=== CLIENT-DECIDES ARCHITECTURE ===")
-        logger.info("Step 1: Profiling model layers on client...")
+        # Import here to avoid circular dependency
+        from dnn_inference_client import DNNInferenceClient
         
-        # Step 1: Profile the model layers on CLIENT
-        client_layer_profiles = self.profile_model(input_tensor)
+        num_splits = len(self.splitter.layers) + 1
+        logger.info(f"=== Finding Optimal Split Point ===")
+        logger.info(f"Testing {num_splits} split points (0 to {num_splits - 1})")
         
-        # Step 2: Get SERVER-SIDE execution times via gRPC (no split recommendation)
-        logger.info("Step 2: Requesting server-side execution times...")
-        server_layer_profiles = self._get_server_profile(input_tensor, client_layer_profiles, server_address)
+        split_analysis = {}
         
-        if server_layer_profiles is None:
-            logger.warning("Failed to get server execution times. Using client times as fallback.")
-            server_layer_profiles = client_layer_profiles
+        # Test each split point by running actual inference
+        for split_point in range(num_splits):
+            logger.info(f"Testing split point {split_point}/{num_splits - 1}...")
+            
+            # Configure split point
+            self.splitter.set_split_point(split_point)
+            
+            # Get edge model
+            edge_model = self.splitter.get_edge_model(
+                quantize=self.enable_quantization,
+                quantizer=self.quantizer
+            )
+            
+            # Create client
+            client = DNNInferenceClient(server_address, edge_model)
+            
+            # Check if cloud processing is needed
+            requires_cloud = self.splitter.get_cloud_model() is not None
+            
+            # Configure server with this split point
+            self._send_split_decision_to_server(split_point, server_address)
+            
+            # Run inference and measure
+            try:
+                _, timings = client.process_tensor(input_tensor, self.model_name, requires_cloud)
+                
+                edge_time = timings.get('edge_time', 0.0)
+                transfer_time = timings.get('transfer_time', 0.0)
+                cloud_time = timings.get('cloud_time', 0.0)
+                total_time = edge_time + transfer_time + cloud_time
+                
+                split_analysis[split_point] = {
+                    'edge_time': edge_time,
+                    'transfer_time': transfer_time,
+                    'cloud_time': cloud_time,
+                    'total_time': total_time
+                }
+                
+                logger.info(f"  Split {split_point}: Total={total_time:.1f}ms (Edge={edge_time:.1f}ms, "
+                          f"Transfer={transfer_time:.1f}ms, Cloud={cloud_time:.1f}ms)")
+                
+            except Exception as e:
+                logger.error(f"Failed to test split point {split_point}: {e}")
+                split_analysis[split_point] = {
+                    'edge_time': 0.0,
+                    'transfer_time': 0.0,
+                    'cloud_time': 0.0,
+                    'total_time': float('inf')
+                }
         
-        # Step 3: CLIENT calculates optimal split point using direct transfer measurements
-        logger.info("Step 3: Client calculating optimal split point with live transfer probes...")
-        optimal_split, split_analysis = self._calculate_optimal_split_client_side(
-            client_layer_profiles, server_layer_profiles, input_tensor, server_address
-        )
+        # Find optimal split point
+        optimal_split = min(split_analysis.keys(), key=lambda k: split_analysis[k]['total_time'])
+        min_time = split_analysis[optimal_split]['total_time']
         
-        # Step 4: Send optimal split decision back to server
-        logger.info(f"Step 4: Sending split decision to server: split_point={optimal_split}")
-        split_config_success = self._send_split_decision_to_server(optimal_split, server_address)
+        logger.info(f"=== Optimal Split Point Found ===")
+        logger.info(f"Optimal split: {optimal_split} with total time: {min_time:.1f}ms")
         
-        if not split_config_success:
-            logger.error("Failed to configure server with split decision!")
-        else:
-            logger.info("Server successfully configured with client's split decision")
+        # Configure server with optimal split
+        self._send_split_decision_to_server(optimal_split, server_address)
         
+        # Build summary
         split_summary = build_split_timing_summary(split_analysis, self.get_split_layer_names())
 
         return optimal_split, {
             'optimal_split': optimal_split,
-            'min_total_time': split_analysis[optimal_split]['total_time'],
-            'transfer_measurements_ms': self.network_profiler.get_cached_measurements(),
-            'client_profiles': client_layer_profiles,
-            'server_profiles': server_layer_profiles,
+            'min_total_time': min_time,
             'all_splits': split_analysis,
             'split_summary': split_summary,
             'split_summary_table': format_split_summary(split_summary, sort_by_total_time=False),
             'layer_names': self.get_split_layer_names(),
-            'recommended_by_server': False,
-            'split_config_success': split_config_success
+            'split_config_success': True
         }
 
-    def _get_server_profile(self, input_tensor: torch.Tensor, profile, server_address: str) -> Optional[List[Dict]]:
-        """Get server-side execution times via gRPC (NO split recommendation)
-        
-        Args:
-            input_tensor: Input tensor for profiling
-            server_address: Server address
-            
-        Returns:
-            List of server layer profiles, or None if failed
-        """
-        try:
-            # Create gRPC channel with larger message size limits
-            channel = grpc.insecure_channel(
-                server_address, options=GRPC_SETTINGS.channel_options
-            )
-            stub = dnn_inference_pb2_grpc.DNNInferenceStub(channel)
-            
-            # Create profiling request
-            client_profile = self.create_client_profile(input_tensor, profile)
-            request = dnn_inference_pb2.ProfilingRequest(
-                profile=client_profile,
-                client_id="profiling_client"
-            )
-            
-            logger.info("Sending profiling request to server...")
-            response = stub.SendProfilingData(request)
-            
-            if response.success:
-                logger.info("Server profiling completed successfully")
-                
-                # Parse server execution times from response
-                server_profiles = self._parse_server_response(response.updated_split_config)
-                if server_profiles:
-                    logger.info(f"Successfully received {len(server_profiles)} server execution times")
-                    return server_profiles
-                else:
-                    logger.warning("Failed to parse server execution times")
-                    return None
-            else:
-                logger.error(f"Server profiling failed: {response.message}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Failed to get server profiling: {str(e)}")
-            return None
 
-    def _calculate_optimal_split_client_side(self, client_profiles: List[Dict], 
-                                           server_profiles: List[Dict], 
-                                           input_tensor: torch.Tensor,
-                                           server_address: str) -> Tuple[int, Dict]:
-        """Calculate optimal split point on client side using server execution times
-        
-        Args:
-            client_profiles: Client-side layer profiling data
-            server_profiles: Server-side layer profiling data  
-            input_tensor: Input tensor
-            server_address: Server address for transfer probes
-            
-        Returns:
-            Tuple of (optimal_split_point, all_split_analysis)
-        """
-        logger.info("=== Client-Side Split Point Analysis ===")
-        logger.info("Transfer probes will use real tensors captured during profiling")
-        logger.info(f"{'Split':<5} {'Client':<8} {'Server':<8} {'Transfer':<10} {'Total':<8} {'Description'}")
-        logger.info("-" * 75)
-        
-        split_analysis = {}
-        min_total_time = float('inf')
-        optimal_split = 0
-        
-        # Ensure server profiles have the right data transfer sizes from client profiles
-        for i, server_profile in enumerate(server_profiles):
-            if i < len(client_profiles):
-                server_profile['data_transfer_size'] = client_profiles[i]['data_transfer_size']
-        
-        for split_point in range(len(self.splitter.layers) + 1):
-            timing = self._calculate_split_timing(
-                client_profiles, server_profiles, split_point, input_tensor, server_address
-            )
-            split_analysis[split_point] = timing
-            
-            desc = f"Split after layer {split_point}"
-            
-            total_transfer = timing['input_transfer_time'] + timing['output_transfer_time']
-            
-            logger.info(f"{split_point:<5} {timing['client_time']:<8.1f} {timing['server_time']:<8.1f} "
-                       f"{total_transfer:<10.1f} {timing['total_time']:<8.1f} {desc}")
-            
-            if timing['total_time'] < min_total_time:
-                min_total_time = timing['total_time']
-                optimal_split = split_point
-        
-        logger.info("-" * 75)
-        logger.info(f"OPTIMAL SPLIT: {optimal_split} with total time: {min_total_time:.2f}ms")
-        
-        return optimal_split, split_analysis
 
     def _send_split_decision_to_server(self, split_point: int, server_address: str) -> bool:
         """Send the client's split decision to the server
@@ -690,170 +494,5 @@ class DNNSurgery:
             logger.error(f"Failed to send split decision to server: {str(e)}")
             return False
     
-    def _parse_server_response(self, config_string: str) -> Optional[List[Dict]]:
-        """Parse server profiling data from the response string (NO split point recommendation)
-        
-        Args:
-            config_string: Configuration string from server response
-            
-        Returns:
-            List of server layer profiles, or None if parsing failed
-        """
-        try:
-            # Parse the config string: "server_profile:time1,time2,time3..."
-            if not config_string.startswith('server_profile:'):
-                logger.warning("Invalid server response format - expected 'server_profile:' prefix")
-                return None
-            
-            server_profile_part = config_string.split(':', 1)[1]
-            
-            if not server_profile_part:
-                logger.warning("No server profile data found in response")
-                return None
-            
-            # Parse the comma-separated execution times
-            server_times = [float(t.strip()) for t in server_profile_part.split(',')]
-            logger.info(f"Parsed server execution times: {server_times}")
-            
-            # Convert to the same format as client profiles
-            server_profiles = []
-            for i, execution_time in enumerate(server_times):
-                profile = {
-                    'layer_idx': i,
-                    'layer_name': f'Layer_{i}',  # We don't have layer names from server
-                    'execution_time': execution_time,
-                    'input_size': [],  # Not needed for timing calculation
-                    'output_size': [],  # Not needed for timing calculation
-                    'data_transfer_size': 0,  # Will be filled from client profiles
-                    'computation_complexity': 0  # Not needed
-                }
-                server_profiles.append(profile)
-            
-            logger.info(f"Parsed {len(server_profiles)} server layer profiles")
-            return server_profiles
-            
-        except Exception as e:
-            logger.error(f"Failed to parse server profile response: {str(e)}")
-            return None
-    
-    def _calculate_split_timing(self, client_profiles: List[Dict], 
-                               server_profiles: List[Dict], 
-                               split_point: int, 
-                               input_tensor: torch.Tensor,
-                               server_address: str) -> Dict:
-        """Calculate timing for a specific split point using actual client and server profiles
-        
-        Args:
-            client_profiles: List of client-side layer profiling data
-            server_profiles: List of server-side layer profiling data
-            split_point: Split point to analyze
-            input_tensor: Input tensor
-            
-        Returns:
-            Dictionary with timing breakdown
-        """
-        # Client execution time (layers 0 to split_point-1) using CLIENT measurements
-        client_time = sum(client_profiles[i]['execution_time'] for i in range(min(split_point, len(client_profiles))))
-        
-        # Server execution time (layers split_point to end) using SERVER measurements
-        server_time = sum(server_profiles[i]['execution_time'] for i in range(split_point, len(server_profiles)))
-        
-        # Calculate data transfer sizes (same as before)
-        if split_point == 0:
-            # All on server - transfer original input
-            input_transfer_size = input_tensor.numel() * input_tensor.element_size()
-        elif split_point >= len(client_profiles):
-            # All on client - no intermediate transfer, but need to send final result back
-            input_transfer_size = 0
-        else:
-            # Transfer intermediate result - use client profile since that's where data comes from
-            input_transfer_size = client_profiles[split_point - 1]['data_transfer_size']
-        
-        # Output transfer size (final result back to client) - use server profile for final output size
-        if split_point >= len(server_profiles):
-            # All on client - no server output to transfer back
-            output_transfer_size = 0
-        else:
-            # Transfer final server output back to client
-            output_transfer_size = server_profiles[-1]['data_transfer_size']
-        
-        # Measure transfer times using actual tensors
-        input_transfer_time = 0.0
-        output_transfer_time = 0.0
 
-        input_tensor_sample: Optional[torch.Tensor] = None
-        if split_point == 0:
-            input_tensor_sample = self.input_sample
-        elif 0 < split_point < len(self.layer_outputs):
-            input_tensor_sample = self.layer_outputs[split_point - 1]
-
-        if input_tensor_sample is not None:
-            input_transfer_time = self.network_profiler.measure_tensor_transfer(
-                input_tensor_sample, server_address
-            )
-
-        if split_point < len(self.layer_outputs) and self.layer_outputs:
-            output_tensor_sample = self.layer_outputs[-1]
-            output_transfer_time = self.network_profiler.measure_tensor_transfer(
-                output_tensor_sample, server_address
-            )
-        
-        # Total time = Client Execution + Input Transfer + Server Execution + Output Transfer
-        total_time = client_time + input_transfer_time + server_time + output_transfer_time
-        
-        # Log detailed calculation for debugging
-        logger.debug(f"Split {split_point} timing calculation (with server profiles):")
-        logger.debug(f"  Client layers: 0 to {split_point-1 if split_point > 0 else 'none'}")
-        logger.debug(f"  Server layers: {split_point} to {len(server_profiles)-1 if split_point < len(server_profiles) else 'none'}")
-        logger.debug(f"  Client time: {client_time:.2f}ms (measured on client)")
-        logger.debug(f"  Server time: {server_time:.2f}ms (measured on server)")
-        logger.debug(f"  Input transfer: {input_transfer_size} bytes -> {input_transfer_time:.2f}ms")
-        logger.debug(f"  Output transfer: {output_transfer_size} bytes -> {output_transfer_time:.2f}ms")
-        logger.debug(f"  Total time: {total_time:.2f}ms")
-        
-        return {
-            'split_point': split_point,
-            'client_time': client_time,
-            'server_time': server_time,
-            'input_transfer_time': input_transfer_time,
-            'output_transfer_time': output_transfer_time,
-            'input_transfer_size': input_transfer_size,
-            'output_transfer_size': output_transfer_size,
-            'total_time': total_time
-        }
-        
-    def create_client_profile(self, input_tensor, profile) -> dnn_inference_pb2.ClientProfile:
-        """Create a protobuf ClientProfile message
-        
-        Args:
-            input_tensor: Input tensor used for profiling
-            
-        Returns:
-            ClientProfile protobuf message
-        """
-        # Run profiling
-        layer_profiles = profile
-        
-        # Create layer profile messages
-        layer_metrics = []
-        for profile in layer_profiles:
-            layer_metric = dnn_inference_pb2.LayerProfile(
-                layer_idx=profile['layer_idx'],
-                layer_name=profile['layer_name'],
-                execution_time=profile['execution_time'],
-                input_size=profile['input_size'],
-                output_size=profile['output_size'],
-                data_transfer_size=profile['data_transfer_size']
-            )
-            layer_metrics.append(layer_metric)
-        
-        # Create client profile (simplified structure)
-        client_profile = dnn_inference_pb2.ClientProfile(
-            model_name=self.model_name,
-            layer_metrics=layer_metrics,
-            input_size=list(input_tensor.shape),
-            total_layers=len(layer_profiles)
-        )
-        
-        return client_profile
 
