@@ -766,6 +766,8 @@ def test_all_models_neurosurgeon(
     enable_quantization: bool = False,
     use_early_split: bool = False,
     use_pipelining: bool = False,
+    batch_size: int = 1,
+    num_batches: int = 1,
 ) -> Dict[str, Dict]:
     """Test all supported models using NeuroSurgeon-determined optimal split points.
     
@@ -780,12 +782,14 @@ def test_all_models_neurosurgeon(
         plot_path: Path for saving the plot
         enable_quantization: Whether to enable INT8 quantization for models
         use_early_split: Whether to enable early exit with intermediate classifiers
-        use_pipelining: Whether to enable pipelined execution (not implemented yet)
+        use_pipelining: Whether to enable pipelined execution with batching
+        batch_size: Batch size for inference (used with pipelining)
+        num_batches: Number of batches to process (used with pipelining)
         
     Returns:
         Dictionary mapping model names to their optimal split timing results
     """
-    initialize_dataset_loader(1)
+    initialize_dataset_loader(batch_size)
     
     all_model_timings = {}
     
@@ -808,7 +812,7 @@ def test_all_models_neurosurgeon(
     if use_early_split:
         logger.info("Early Exit: ENABLED (intermediate classifiers with confidence threshold)")
     if use_pipelining:
-        logger.info("Pipelining: ENABLED (pipelined execution)")
+        logger.info(f"Pipelining: ENABLED (batch_size={batch_size}, num_batches={num_batches})")
     logger.info("="*80)
     
     for model_name in SUPPORTED_MODELS:
@@ -821,8 +825,8 @@ def test_all_models_neurosurgeon(
             model = get_model(model_name)
             dnn_surgery = DNNSurgery(model, model_name, enable_quantization=enable_quantization)
             
-            # Get input tensor
-            input_tensor, _, _ = get_input_tensor(model_name, 1)
+            # Get input tensor with appropriate batch size
+            input_tensor, _, _ = get_input_tensor(model_name, batch_size)
             
             # Configure early exit if requested
             exit_config = None
@@ -873,8 +877,8 @@ def test_all_models_neurosurgeon(
             for test_idx in range(1, num_tests):
                 logger.info(f"Running test {test_idx + 1}/{num_tests} at optimal split {optimal_split}...")
                 
-                # Get fresh input tensor
-                input_tensor, _, _ = get_input_tensor(model_name, 1)
+                # Get fresh input tensor with appropriate batch size
+                input_tensor, _, _ = get_input_tensor(model_name, batch_size)
                 
                 # Run with the determined configuration
                 if use_early_split and exit_config is not None:
@@ -969,7 +973,7 @@ def test_all_models_neurosurgeon(
             if use_early_split:
                 filename_suffix.append("earlyexit")
             if use_pipelining:
-                filename_suffix.append("pipelined")
+                filename_suffix.append(f"pipelined_bs{batch_size}_nb{num_batches}")
             
             suffix_str = "_" + "_".join(filename_suffix) if filename_suffix else ""
             
@@ -1268,6 +1272,8 @@ def main():
                 enable_quantization=args.neurosurgeon_quantize,
                 use_early_split=args.neurosurgeon_early_split,
                 use_pipelining=args.neurosurgeon_pipelining,
+                batch_size=args.batch_size,
+                num_batches=args.num_batches,
             )
             logger.info("NeuroSurgeon testing complete!")
             sys.exit(0)
