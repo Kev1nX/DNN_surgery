@@ -937,25 +937,35 @@ def test_all_models_neurosurgeon(
                 # Calculate effective throughput from total pipeline time
                 pipeline_end = time.time()
                 total_pipeline_time = (pipeline_end - pipeline_start) * 1000  # ms
-                avg_time_per_sample = total_pipeline_time / total_samples
+                wall_clock_avg = total_pipeline_time / total_samples
                 
                 # Calculate average component times across all samples
                 avg_edge = cumulative_edge_time / total_samples
                 avg_transfer = cumulative_transfer_time / total_samples
                 avg_cloud = cumulative_cloud_time / total_samples
                 
+                # For visualization: use sum of components (matches stacked bars)
+                # This represents the actual work done, not wall-clock time
+                component_sum = avg_edge + avg_transfer + avg_cloud
+                
                 # Store averaged timings for plotting
                 edge_times.append(avg_edge)
                 transfer_times.append(avg_transfer)
                 cloud_times.append(avg_cloud)
-                total_times.append(avg_time_per_sample)
+                total_times.append(component_sum)  # Use component sum for bar chart label
+                
+                # Calculate throughput from wall-clock time (shows pipelining benefit)
+                throughput = 1000.0 / wall_clock_avg
                 
                 logger.info(
                     f"Pipeline completed: {total_samples} samples in {total_pipeline_time:.1f}ms "
-                    f"({avg_time_per_sample:.1f}ms/sample, {1000.0/avg_time_per_sample:.2f} samples/sec)"
+                    f"(Wall-clock: {wall_clock_avg:.1f}ms/sample, Throughput: {throughput:.2f} samples/sec)"
                 )
                 logger.info(
-                    f"  Average component times: Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms"
+                    f"  Component times: Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms"
+                )
+                logger.info(
+                    f"  Component sum: {component_sum:.1f}ms (vs wall-clock: {wall_clock_avg:.1f}ms, speedup: {component_sum/wall_clock_avg:.2f}x)"
                 )
             else:
                 # Standard sequential processing (no pipelining)
