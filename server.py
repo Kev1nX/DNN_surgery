@@ -9,7 +9,7 @@ from typing import Dict, Optional, List, Tuple
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
-from dnn_surgery import DNNSurgery, ModelSplitter, NetworkProfiler, LayerProfiler
+from dnn_surgery import DNNSurgery, ModelSplitter, NetworkProfiler
 from grpc_utils import proto_to_tensor, tensor_to_proto
 from quantization import ModelQuantizer
 
