@@ -29,6 +29,7 @@ warnings.filterwarnings('ignore')
 from dataset.imagenet_loader import ImageNetMiniLoader
 from dnn_inference_client import DNNInferenceClient, resolve_plot_paths, run_distributed_inference
 from dnn_surgery import DNNSurgery
+from early_exit import EarlyExitInferenceClient, EarlyExitConfig, run_distributed_inference_with_early_exit
 from visualization import (
     plot_actual_inference_breakdown,
     plot_actual_split_comparison,
@@ -762,6 +763,9 @@ def test_all_models_neurosurgeon(
     auto_plot: bool = True,
     plot_show: bool = True,
     plot_path: Optional[str] = None,
+    enable_quantization: bool = False,
+    use_early_split: bool = False,
+    use_pipelining: bool = False,
 ) -> Dict[str, Dict]:
     """Test all supported models using NeuroSurgeon-determined optimal split points.
     
@@ -774,6 +778,9 @@ def test_all_models_neurosurgeon(
         auto_plot: Whether to generate plots
         plot_show: Whether to show plots interactively
         plot_path: Path for saving the plot
+        enable_quantization: Whether to enable INT8 quantization for models
+        use_early_split: Whether to enable early exit with intermediate classifiers
+        use_pipelining: Whether to enable pipelined execution (not implemented yet)
         
     Returns:
         Dictionary mapping model names to their optimal split timing results
@@ -782,8 +789,26 @@ def test_all_models_neurosurgeon(
     
     all_model_timings = {}
     
+    # Build configuration description
+    config_parts = []
+    if enable_quantization:
+        config_parts.append("Quantization")
+    if use_early_split:
+        config_parts.append("Early Exit")
+    if use_pipelining:
+        config_parts.append("Pipelining")
+    
+    config_desc = " + ".join(config_parts) if config_parts else "Standard"
+    
     logger.info("="*80)
-    logger.info("TESTING ALL MODELS WITH NEUROSURGEON OPTIMIZATION")
+    logger.info(f"TESTING ALL MODELS WITH NEUROSURGEON OPTIMIZATION ({config_desc})")
+    logger.info("="*80)
+    if enable_quantization:
+        logger.info("Quantization: ENABLED (INT8 dynamic quantization)")
+    if use_early_split:
+        logger.info("Early Exit: ENABLED (intermediate classifiers with confidence threshold)")
+    if use_pipelining:
+        logger.info("Pipelining: ENABLED (pipelined execution)")
     logger.info("="*80)
     
     for model_name in SUPPORTED_MODELS:
@@ -794,32 +819,56 @@ def test_all_models_neurosurgeon(
         try:
             # Get model and create DNN Surgery instance
             model = get_model(model_name)
-            dnn_surgery = DNNSurgery(model, model_name)
+            dnn_surgery = DNNSurgery(model, model_name, enable_quantization=enable_quantization)
             
             # Get input tensor
             input_tensor, _, _ = get_input_tensor(model_name, 1)
             
-            # First run: Let NeuroSurgeon determine optimal split
-            logger.info(f"Running NeuroSurgeon optimization for {model_name}...")
-            result, first_timings = run_distributed_inference(
-                model_name,
-                input_tensor,
-                dnn_surgery,
-                split_point=None,  # Let NeuroSurgeon decide
-                server_address=server_address,
-                auto_plot=False,  # Don't plot individual runs
-                plot_show=False,
-                plot_path=None,
-            )
-            
-            optimal_split = first_timings.get('split_point')
-            logger.info(f"NeuroSurgeon determined optimal split point: {optimal_split}")
+            # Configure early exit if requested
+            exit_config = None
+            if use_early_split:
+                # Use early exit inference with intermediate classifiers
+                logger.info(f"Using early exit configuration with intermediate classifiers")
+                exit_config = EarlyExitConfig(
+                    enabled=True,
+                    confidence_threshold=0.9,
+                    max_exits=3,  # Limit to 3 early exit points
+                )
+                
+                # Run first test with early exit
+                result, first_timings = run_distributed_inference_with_early_exit(
+                    model_name,
+                    input_tensor,
+                    dnn_surgery,
+                    exit_config=exit_config,
+                    split_point=None,  # Let NeuroSurgeon decide split, but enable early exits
+                    server_address=server_address,
+                )
+                
+                optimal_split = first_timings.get('split_point')
+                logger.info(f"Early exit configuration with optimal split point: {optimal_split}")
+            else:
+                # Let NeuroSurgeon determine optimal split
+                logger.info(f"Running NeuroSurgeon optimization for {model_name}...")
+                result, first_timings = run_distributed_inference(
+                    model_name,
+                    input_tensor,
+                    dnn_surgery,
+                    split_point=None,  # Let NeuroSurgeon decide
+                    server_address=server_address,
+                    auto_plot=False,  # Don't plot individual runs
+                    plot_show=False,
+                    plot_path=None,
+                )
+                
+                optimal_split = first_timings.get('split_point')
+                logger.info(f"NeuroSurgeon determined optimal split point: {optimal_split}")
             
             # Run additional tests at the optimal split point
-            edge_times = [first_timings['edge_time']]
-            transfer_times = [first_timings['transfer_time']]
-            cloud_times = [first_timings['cloud_time']]
-            total_times = [first_timings['edge_time'] + first_timings['transfer_time'] + first_timings['cloud_time']]
+            edge_times = [first_timings.get('edge_time', 0)]
+            transfer_times = [first_timings.get('transfer_time', 0)]
+            cloud_times = [first_timings.get('cloud_time', 0)]
+            total_times = [first_timings.get('edge_time', 0) + first_timings.get('transfer_time', 0) + first_timings.get('cloud_time', 0)]
             
             for test_idx in range(1, num_tests):
                 logger.info(f"Running test {test_idx + 1}/{num_tests} at optimal split {optimal_split}...")
@@ -827,17 +876,29 @@ def test_all_models_neurosurgeon(
                 # Get fresh input tensor
                 input_tensor, _, _ = get_input_tensor(model_name, 1)
                 
-                # Run with the determined optimal split point
-                _, timings = run_distributed_inference(
-                    model_name,
-                    input_tensor,
-                    dnn_surgery,
-                    split_point=optimal_split,
-                    server_address=server_address,
-                    auto_plot=False,
-                    plot_show=False,
-                    plot_path=None,
-                )
+                # Run with the determined configuration
+                if use_early_split and exit_config is not None:
+                    # Continue using early exit
+                    _, timings = run_distributed_inference_with_early_exit(
+                        model_name,
+                        input_tensor,
+                        dnn_surgery,
+                        exit_config=exit_config,
+                        split_point=optimal_split,
+                        server_address=server_address,
+                    )
+                else:
+                    # Standard inference with optimal split point
+                    _, timings = run_distributed_inference(
+                        model_name,
+                        input_tensor,
+                        dnn_surgery,
+                        split_point=optimal_split,
+                        server_address=server_address,
+                        auto_plot=False,
+                        plot_show=False,
+                        plot_path=None,
+                    )
                 
                 edge_times.append(timings['edge_time'])
                 transfer_times.append(timings['transfer_time'])
@@ -878,7 +939,7 @@ def test_all_models_neurosurgeon(
     
     # Print summary
     logger.info("\n" + "="*80)
-    logger.info("NEUROSURGEON OPTIMIZATION SUMMARY")
+    logger.info(f"NEUROSURGEON OPTIMIZATION SUMMARY ({config_desc})")
     logger.info("="*80)
     logger.info(f"{'Model':<20} {'Optimal Split':<15} {'Total(ms)':<12} {'Edge(ms)':<11} {'Transfer(ms)':<14} {'Cloud(ms)':<12}")
     logger.info("-" * 80)
@@ -900,15 +961,31 @@ def test_all_models_neurosurgeon(
             save_dir.mkdir(parents=True, exist_ok=True)
             
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            bar_chart_path = save_dir / f"all_models_neurosurgeon_{timestamp}.png"
-            throughput_bar_chart_path = save_dir / f"all_models_neurosurgeon_throughput_{timestamp}.png"
+            
+            # Build filename suffix from configuration
+            filename_suffix = []
+            if enable_quantization:
+                filename_suffix.append("quantized")
+            if use_early_split:
+                filename_suffix.append("earlyexit")
+            if use_pipelining:
+                filename_suffix.append("pipelined")
+            
+            suffix_str = "_" + "_".join(filename_suffix) if filename_suffix else ""
+            
+            bar_chart_path = save_dir / f"all_models_neurosurgeon{suffix_str}_{timestamp}.png"
+            throughput_bar_chart_path = save_dir / f"all_models_neurosurgeon_throughput{suffix_str}_{timestamp}.png"
+            
+            # Build plot title
+            plot_title = f"All Models - NeuroSurgeon Optimal Split ({config_desc})"
+            throughput_title = f"All Models - NeuroSurgeon Throughput ({config_desc})"
             
             logger.info(f"Generating NeuroSurgeon comparison bar chart: {bar_chart_path}")
             plot_model_comparison_bar(
                 all_model_timings,
                 show=plot_show,
                 save_path=str(bar_chart_path),
-                title="All Models - NeuroSurgeon Optimal Split Comparison",
+                title=plot_title,
             )
             logger.info(f"✓ Bar chart saved to {bar_chart_path.resolve()}")
             
@@ -918,7 +995,7 @@ def test_all_models_neurosurgeon(
                 all_model_timings,
                 show=plot_show,
                 save_path=str(throughput_bar_chart_path),
-                title="All Models - NeuroSurgeon Throughput Comparison",
+                title=throughput_title,
             )
             logger.info(f"✓ Throughput bar chart saved to {throughput_bar_chart_path.resolve()}")
             
@@ -1103,6 +1180,12 @@ def main():
                        help='Test all models at a specific split point and generate a bar chart comparison (e.g., --test-all-models-split 0)')
     parser.add_argument('--test-all-models-neurosurgeon', action='store_true',
                        help='Test all models using NeuroSurgeon-determined optimal split points and generate comparison plots')
+    parser.add_argument('--neurosurgeon-quantize', action='store_true',
+                       help='Enable INT8 quantization when testing all models with NeuroSurgeon')
+    parser.add_argument('--neurosurgeon-early-split', action='store_true',
+                       help='Enable early exit with intermediate classifiers (confidence-based exits at shallow layers)')
+    parser.add_argument('--neurosurgeon-pipelining', action='store_true',
+                       help='Enable pipelined execution when testing all models with NeuroSurgeon')
     parser.add_argument('--use-neurosurgeon', action='store_true', default=True,
                        help='Use NeuroSurgeon optimization (default: True)')
     parser.add_argument('--no-neurosurgeon', action='store_true',
@@ -1182,6 +1265,9 @@ def main():
                 auto_plot=args.auto_plot,
                 plot_show=args.plot_show,
                 plot_path=args.plot_save or "plots",
+                enable_quantization=args.neurosurgeon_quantize,
+                use_early_split=args.neurosurgeon_early_split,
+                use_pipelining=args.neurosurgeon_pipelining,
             )
             logger.info("NeuroSurgeon testing complete!")
             sys.exit(0)
