@@ -403,8 +403,8 @@ def plot_actual_split_comparison(
                 color=color,
             )
 
-        # Only annotate key points to avoid clutter (first, middle, last, and optimal)
-        if len(split_points) > 0:
+        # Only annotate key points for the total component to avoid clutter
+        if component == "total" and len(split_points) > 0:
             key_indices = set()
             # Always show first and last
             key_indices.add(0)
@@ -414,7 +414,7 @@ def plot_actual_split_comparison(
             if len(split_points) > 3:
                 key_indices.add(len(split_points) // 2)
             # Add optimal point (minimum) for total component
-            if component == "total" and averages:
+            if averages:
                 min_idx = min(range(len(averages)), key=lambda i: averages[i] if not math.isnan(averages[i]) else float('inf'))
                 key_indices.add(min_idx)
             
