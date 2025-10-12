@@ -481,6 +481,26 @@ class DNNSurgery:
         
         return False
     
+    def get_split_layer_names(self) -> List[str]:
+        """Get layer names for all possible split points
+        
+        Returns:
+            List of layer names where index i corresponds to split point i
+            Split point 0 = "Input" (all on cloud)
+            Split point i = layer name after which the split occurs
+            Split point len(layers) = "Output" (all on edge)
+        """
+        layer_names = ["Input"]  # Split point 0
+        
+        for layer in self.splitter.layers:
+            layer_name = layer.__class__.__name__
+            if hasattr(layer, '_get_name'):
+                layer_name = layer._get_name()
+            layer_names.append(layer_name)
+        
+        layer_names.append("Output")  # Split point after last layer
+        return layer_names
+    
     def find_optimal_split(self, input_tensor: torch.Tensor, server_address: str) -> Tuple[int, Dict]:
         """Find optimal split point using client-side calculation with server execution times
         
@@ -520,7 +540,7 @@ class DNNSurgery:
         else:
             logger.info("Server successfully configured with client's split decision")
         
-        split_summary = build_split_timing_summary(split_analysis)
+        split_summary = build_split_timing_summary(split_analysis, self.get_split_layer_names())
 
         return optimal_split, {
             'optimal_split': optimal_split,
@@ -531,6 +551,7 @@ class DNNSurgery:
             'all_splits': split_analysis,
             'split_summary': split_summary,
             'split_summary_table': format_split_summary(split_summary, sort_by_total_time=False),
+            'layer_names': self.get_split_layer_names(),
             'recommended_by_server': False,
             'split_config_success': split_config_success
         }

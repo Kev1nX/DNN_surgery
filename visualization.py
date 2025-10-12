@@ -46,6 +46,7 @@ class SplitTimingSummary:
     total_time_ms: float
     input_bytes: int
     output_bytes: int
+    layer_name: str = ""
 
     @property
     def transfer_time_ms(self) -> float:
@@ -54,7 +55,8 @@ class SplitTimingSummary:
 
 
 def build_split_timing_summary(
-    split_analysis: Dict[int, Dict[str, float]]
+    split_analysis: Dict[int, Dict[str, float]],
+    layer_names: Optional[List[str]] = None
 ) -> List[SplitTimingSummary]:
     """Convert a raw ``split_analysis`` mapping into structured summaries.
 
@@ -62,6 +64,7 @@ def build_split_timing_summary(
         split_analysis: Mapping returned by ``DNNSurgery.find_optimal_split`` where
             each key is a split point and each value contains timing and transfer
             metadata.
+        layer_names: Optional list of layer names for each split point.
 
     Returns:
         A list of :class:`SplitTimingSummary` sorted by split point.
@@ -70,6 +73,12 @@ def build_split_timing_summary(
     summaries: List[SplitTimingSummary] = []
     for split_point in sorted(split_analysis.keys()):
         metrics = split_analysis[split_point]
+        
+        # Get layer name for this split point
+        layer_name = ""
+        if layer_names and 0 <= split_point < len(layer_names):
+            layer_name = layer_names[split_point]
+        
         summaries.append(
             SplitTimingSummary(
                 split_point=split_point,
@@ -80,6 +89,7 @@ def build_split_timing_summary(
                 total_time_ms=float(metrics.get("total_time", 0.0)),
                 input_bytes=int(metrics.get("input_transfer_size", 0)),
                 output_bytes=int(metrics.get("output_transfer_size", 0)),
+                layer_name=layer_name,
             )
         )
 
@@ -165,20 +175,40 @@ def plot_split_timing(
         )
 
     split_points = [s.split_point for s in summaries]
+    layer_names = [s.layer_name for s in summaries]
     client = [s.client_time_ms for s in summaries]
     server = [s.server_time_ms for s in summaries]
     transfer = [s.transfer_time_ms for s in summaries]
     total = [s.total_time_ms for s in summaries]
 
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+    fig, ax = plt.subplots(figsize=(10, 5))  # Slightly wider for layer names
     ax.plot(split_points, total, label="Total", color="#1f77b4", linewidth=2.0)
     ax.plot(split_points, client, label="Client", linestyle="--", color="#ff7f0e")
     ax.plot(split_points, server, label="Server", linestyle="--", color="#2ca02c")
     ax.plot(split_points, transfer, label="Transfer", linestyle=":", color="#d62728")
 
-    ax.set_xlabel("Split Point")
+    ax.set_xlabel("Split Point (Layer)")
     ax.set_ylabel("Inference Time (ms)")
     ax.set_xticks(split_points)
+    
+    # Use layer names as x-axis labels if available, otherwise use split point numbers
+    if any(layer_names):  # Check if we have non-empty layer names
+        # Create labels that show both split point and layer name
+        x_labels = []
+        for i, (split_pt, layer_name) in enumerate(zip(split_points, layer_names)):
+            if layer_name:
+                # Shorten long layer names
+                if len(layer_name) > 12:
+                    short_name = layer_name[:9] + "..."
+                else:
+                    short_name = layer_name
+                x_labels.append(f"{split_pt}\n{short_name}")
+            else:
+                x_labels.append(str(split_pt))
+        ax.set_xticklabels(x_labels, rotation=45, ha='right')
+    else:
+        ax.set_xticklabels([str(sp) for sp in split_points])
+    
     ax.grid(True, which="major", linestyle=":", linewidth=0.5, alpha=0.7)
     ax.legend()
     ax.set_title(title or "Split Timing Breakdown")
