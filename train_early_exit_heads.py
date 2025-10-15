@@ -77,8 +77,8 @@ class EarlyExitTrainer:
         with torch.no_grad():  # No gradients for backbone
             activation = input_tensor
             for idx, layer in enumerate(layers):
-                # Handle flattening if needed
-                if self.dnn_surgery.splitter._needs_flattening(layer, activation):
+                # Handle flattening if needed (check if going from conv to linear)
+                if self._needs_flattening(layer, activation):
                     activation = torch.flatten(activation, 1)
                 activation = layer(activation)
                 
@@ -87,6 +87,26 @@ class EarlyExitTrainer:
                     features[idx] = activation.detach().clone()
         
         return features
+    
+    def _needs_flattening(self, layer: nn.Module, input_tensor: torch.Tensor) -> bool:
+        """Check if input needs flattening before passing through layer."""
+        # If transitioning from convolutional (4D) to linear layer, need to flatten
+        if isinstance(layer, nn.Linear) and input_tensor.dim() > 2:
+            return True
+        
+        # Check if this is a Sequential containing Linear layers
+        if isinstance(layer, nn.Sequential) and len(layer) > 0 and input_tensor.dim() > 2:
+            # Check if Sequential already has a Flatten layer
+            for sublayer in layer:
+                if isinstance(sublayer, nn.Flatten):
+                    return False  # Sequential will handle flattening itself
+            
+            # Check if any layer in the sequential is Linear
+            for sublayer in layer:
+                if isinstance(sublayer, nn.Linear):
+                    return True
+        
+        return False
 
     def train_heads(
         self,
