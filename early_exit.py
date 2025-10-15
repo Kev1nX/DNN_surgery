@@ -419,8 +419,21 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         if torch.isinf(result_tensor).any():
             raise ValueError("Received tensor contains infinite values")
 
-        transfer_time = total_time * 0.2
-        cloud_time = total_time - transfer_time
+        # Get actual server timing from response (matches standard client behavior)
+        server_exec_time = getattr(response, 'server_execution_time_ms', 0.0)
+        server_total_time = getattr(response, 'server_total_time_ms', 0.0)
+
+        if server_total_time <= 0:
+            # Fall back to execution time if total time is unavailable
+            server_total_time = server_exec_time
+
+        if server_exec_time <= 0:
+            # Ensure we at least report non-negative execution time
+            server_exec_time = max(server_total_time, 0.0)
+
+        # Calculate transfer time as the difference between total round-trip and server-reported time
+        transfer_time = max(total_time - server_total_time, 0.0) if server_total_time > 0 else max(total_time - server_exec_time, 0.0)
+        cloud_time = max(server_exec_time, 0.0)
 
         sample_metrics['transfer_time'] = transfer_time
         sample_metrics['cloud_time'] = cloud_time
@@ -431,8 +444,10 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         self.transfer_times.append(transfer_time)
         self.cloud_times.append(cloud_time)
 
-        logger.info("Cloud processing time: %.2fms", cloud_time)
-        logger.info("Transfer time: %.2fms", transfer_time)
+        logger.info("Cloud processing time (server reported): %.2fms", cloud_time)
+        logger.info("Transfer time (measured): %.2fms", transfer_time)
+        if server_total_time > 0:
+            logger.info("Server total handling time: %.2fms", server_total_time)
         logger.info("Total time: %.2fms", total_time)
         logger.info("Output tensor stats - Shape: %s", result_tensor.shape)
 
