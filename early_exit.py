@@ -723,7 +723,9 @@ def run_distributed_inference_with_early_exit(
     exit_config = exit_config or EarlyExitConfig()
 
     if split_point is None:
-        if exit_config.enabled and exit_config.exit_points:
+        if exit_config.enabled:
+            # Use early exit profiling when early exit is enabled (regardless of explicit exit points)
+            logger.info("Early exit enabled - using early exit profiling to find optimal split")
             optimal_split, analysis = find_optimal_split_with_early_exit(
                 dnn_surgery, input_tensor, server_address, exit_config
             )
@@ -731,6 +733,8 @@ def run_distributed_inference_with_early_exit(
             logger.info("NeuroSurgeon optimal split point (with early exits): %s", split_point)
             logger.info("Predicted total time: %.2fms", analysis['min_total_time'])
         else:
+            # Standard profiling without early exits
+            logger.info("Early exit disabled - using standard profiling")
             optimal_split, analysis = dnn_surgery.find_optimal_split(input_tensor, server_address)
             split_point = optimal_split
             logger.info("NeuroSurgeon optimal split point: %s", split_point)
