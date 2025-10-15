@@ -755,68 +755,42 @@ def test_all_models_single_split(
     
     logger.info("="*80)
     
-    # Generate bar chart comparison
+    # Generate comparison plots
     if auto_plot and all_model_timings:
-        try:
-            save_dir = Path(plot_path) if plot_path else Path("plots")
-            save_dir.mkdir(parents=True, exist_ok=True)
-            
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            bar_chart_path = save_dir / f"all_models_split_{split_point}_{timestamp}.png"
-            throughput_bar_chart_path = save_dir / f"all_models_split_{split_point}_throughput_{timestamp}.png"
-            
-            logger.info(f"Generating bar chart comparison: {bar_chart_path}")
-            plot_model_comparison_bar(
-                all_model_timings,
-                show=plot_show,
-                save_path=str(bar_chart_path),
-                title=f"Model Comparison at Split Point {split_point}",
-                split_point=split_point,
-            )
-            logger.info(f"Bar chart saved to: {bar_chart_path}")
-            
-            # Generate throughput bar chart
-            logger.info(f"Generating throughput bar chart: {throughput_bar_chart_path}")
-            plot_model_throughput_comparison_bar(
-                all_model_timings,
-                show=plot_show,
-                save_path=str(throughput_bar_chart_path),
-                title=f"Model Throughput Comparison at Split Point {split_point}",
-                split_point=split_point,
-            )
-            logger.info(f"Throughput bar chart saved to: {throughput_bar_chart_path}")
-            
-        except Exception as e:
-            logger.error(f"Failed to generate bar charts: {str(e)}")
+        _save_comparison_plots(
+            Path(plot_path or "plots"), all_model_timings, 
+            f"Model Comparison at Split {split_point}", f"all_models_split_{split_point}", plot_show
+        )
     
     return all_model_timings
 
 def _calculate_batch_accuracy(result: torch.Tensor, true_labels: torch.Tensor, batch_idx: int) -> Tuple[int, int]:
-    """Helper function to calculate accuracy for a batch of predictions
-    
-    Args:
-        result: Model output tensor (logits)
-        true_labels: Ground truth labels
-        batch_idx: Batch index for logging (1-indexed)
-        
-    Returns:
-        Tuple of (correct_predictions, total_samples)
-    """
-    correct = 0
-    total = 0
-    
-    if result.dim() == 2:
-        probs = torch.softmax(result, dim=1)
-        _, predicted = probs.max(1)
-        for i in range(len(predicted)):
-            pred_class = predicted[i].item()
-            true_class = true_labels[i].item()
-            if pred_class == true_class:
-                correct += 1
-            total += 1
-            logger.debug(f"  Batch {batch_idx}, Sample {i}: Predicted={pred_class}, True={true_class} ({'✓' if pred_class == true_class else '✗'})")
-    
+    """Calculate accuracy for a batch of predictions"""
+    if result.dim() != 2:
+        return 0, 0
+    probs = torch.softmax(result, dim=1)
+    _, predicted = probs.max(1)
+    correct = (predicted == true_labels).sum().item()
+    total = len(true_labels)
+    logger.debug(f"Batch {batch_idx}: {correct}/{total} correct")
     return correct, total
+
+def _save_comparison_plots(plot_dir: Path, model_timings: Dict, title_prefix: str, filename_prefix: str, 
+                          show: bool = True, timestamp: str = None) -> None:
+    """Helper to save bar chart and throughput plots"""
+    timestamp = timestamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        
+        bar_path = plot_dir / f"{filename_prefix}_{timestamp}.png"
+        throughput_path = plot_dir / f"{filename_prefix}_throughput_{timestamp}.png"
+        
+        plot_model_comparison_bar(model_timings, show=show, save_path=str(bar_path), title=title_prefix)
+        plot_model_throughput_comparison_bar(model_timings, show=show, save_path=str(throughput_path), 
+                                            title=f"{title_prefix} - Throughput")
+        logger.info(f"✓ Charts saved: {bar_path.name}, {throughput_path.name}")
+    except Exception as e:
+        logger.error(f"Plot generation failed: {e}")
 
 def test_all_models_neurosurgeon(
     server_address: str,
@@ -980,18 +954,11 @@ def test_all_models_neurosurgeon(
                 all_model_timings[model_name]['avg_early_exit_count'] = np.mean(early_exit_counts)
                 all_model_timings[model_name]['avg_early_exit_rate'] = np.mean(early_exit_rates)
             
-            logger.info(f"✓ {model_name} completed:")
-            logger.info(f"  Optimal split: {optimal_split}")
-            if batch_size > 1:
-                logger.info(f"  Batch size: {batch_size} samples per test")
-                logger.info(f"  Average time per batch: {avg_total:.1f}ms ± {std_total:.1f}ms")
-                logger.info(f"  Average time per sample: {avg_total/batch_size:.1f}ms")
-                logger.info(f"  Timing breakdown: Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms")
-            else:
-                logger.info(f"  Average total time: {avg_total:.1f}ms ± {std_total:.1f}ms (Edge={avg_edge:.1f}ms, Transfer={avg_transfer:.1f}ms, Cloud={avg_cloud:.1f}ms)")
-            logger.info(f"  Accuracy: {accuracy:.2f}% ({correct_predictions}/{total_samples} correct)")
+            # Simplified logging
+            logger.info(f"✓ {model_name}: split={optimal_split}, time={avg_total:.1f}±{std_total:.1f}ms, "
+                       f"accuracy={accuracy:.1f}%, breakdown: E={avg_edge:.1f} T={avg_transfer:.1f} C={avg_cloud:.1f}ms")
             if use_early_split and early_exit_counts:
-                logger.info(f"  Early exit rate: {np.mean(early_exit_rates)*100:.1f}% (avg {np.mean(early_exit_counts):.1f} exits per batch)")
+                logger.info(f"  Early exits: {np.mean(early_exit_rates)*100:.1f}% (avg {np.mean(early_exit_counts):.1f}/batch)")
             
         except Exception as e:
             logger.error(f"Failed to test {model_name}: {str(e)}")
@@ -1050,51 +1017,12 @@ def test_all_models_neurosurgeon(
     
     # Generate comparison plots
     if auto_plot and all_model_timings:
-        try:
-            save_dir = Path(plot_path) if plot_path else Path("plots")
-            save_dir.mkdir(parents=True, exist_ok=True)
-            
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            
-            # Build filename suffix from configuration
-            filename_suffix = []
-            if enable_quantization:
-                filename_suffix.append("quantized")
-            if use_early_split:
-                filename_suffix.append("earlyexit")
-            
-            suffix_str = "_" + "_".join(filename_suffix) if filename_suffix else ""
-            
-            bar_chart_path = save_dir / f"all_models_neurosurgeon{suffix_str}_{timestamp}.png"
-            throughput_bar_chart_path = save_dir / f"all_models_neurosurgeon_throughput{suffix_str}_{timestamp}.png"
-            
-            # Build plot title
-            plot_title = f"All Models - NeuroSurgeon Optimal Split ({config_desc})"
-            throughput_title = f"All Models - NeuroSurgeon Throughput ({config_desc})"
-            
-            logger.info(f"Generating NeuroSurgeon comparison bar chart: {bar_chart_path}")
-            plot_model_comparison_bar(
-                all_model_timings,
-                show=plot_show,
-                save_path=str(bar_chart_path),
-                title=plot_title,
-            )
-            logger.info(f"✓ Bar chart saved to {bar_chart_path.resolve()}")
-            
-            # Generate throughput comparison
-            logger.info(f"Generating throughput comparison bar chart: {throughput_bar_chart_path}")
-            plot_model_throughput_comparison_bar(
-                all_model_timings,
-                show=plot_show,
-                save_path=str(throughput_bar_chart_path),
-                title=throughput_title,
-            )
-            logger.info(f"✓ Throughput bar chart saved to {throughput_bar_chart_path.resolve()}")
-            
-        except Exception as e:
-            logger.error(f"Failed to generate comparison plots: {str(e)}")
-            import traceback
-            traceback.print_exc()
+        suffix = "_".join(filter(None, ["quantized" if enable_quantization else "", "earlyexit" if use_early_split else ""]))
+        suffix = f"_{suffix}" if suffix else ""
+        _save_comparison_plots(
+            Path(plot_path or "plots"), all_model_timings,
+            f"NeuroSurgeon Optimal Split ({config_desc})", f"all_models_neurosurgeon{suffix}", plot_show
+        )
     
     return all_model_timings
 
@@ -1463,83 +1391,38 @@ def main():
             
             dnn_surgery = DNNSurgery(get_model(args.model), args.model, enable_quantization=args.quantize)
             
-            # Use early exit if requested
+            # Run inference (with or without early exit)
             if args.neurosurgeon_early_split:
-                exit_config = EarlyExitConfig(
-                    enabled=True,
-                    confidence_threshold=0.7,  # Exit at first opportunity
-                    max_exits=3,
-                )
-                
+                exit_config = EarlyExitConfig(enabled=True, confidence_threshold=0.7, max_exits=3)
                 input_tensor, true_labels, class_names = get_input_tensor(args.model, args.batch_size)
                 result, timings = run_distributed_inference_with_early_exit(
-                    args.model,
-                    input_tensor,
-                    dnn_surgery,
-                    exit_config=exit_config,
-                    split_point=split_point,
-                    server_address=args.server_address,
+                    args.model, input_tensor, dnn_surgery, exit_config=exit_config,
+                    split_point=split_point, server_address=args.server_address
                 )
-                
-                # Add true label info
                 timings['true_labels'] = true_labels.tolist()
                 timings['class_names'] = class_names
                 
-                # Generate plots if auto-plot is enabled
+                # Generate plot for early exit
                 if args.auto_plot:
-                    from datetime import datetime
-                    from pathlib import Path
-                    
-                    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-                    split_label = f"split-{timings.get('split_point', 'unknown')}"
-                    
-                    if args.plot_save is None:
-                        base_dir = Path("plots")
-                        base_name = f"{args.model}_{split_label}_early_exit_{timestamp}"
-                        actual_plot_path = base_dir / f"{base_name}_actual.png"
-                    else:
-                        destination = Path(args.plot_save)
-                        if destination.suffix:
-                            actual_plot_path = destination
-                        else:
-                            base_dir = destination
-                            base_name = f"{args.model}_{split_label}_early_exit_{timestamp}"
-                            actual_plot_path = base_dir / f"{base_name}_actual.png"
-                    
-                    # Generate the inference breakdown plot
                     try:
-                        actual_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                        plot_path = Path(args.plot_save or "plots")
+                        if not plot_path.suffix:
+                            plot_path = plot_path / f"{args.model}_split{timings.get('split_point', 'X')}_earlyexit_{datetime.now():%Y%m%d-%H%M%S}.png"
+                        plot_path.parent.mkdir(parents=True, exist_ok=True)
                         
-                        total_metrics = {
-                            "edge_time": timings.get("edge_time", 0.0),
-                            "transfer_time": timings.get("transfer_time", 0.0),
-                            "cloud_time": timings.get("cloud_time", 0.0),
-                            "total_batch_processing_time": timings.get("total_batch_processing_time"),
-                        }
-                        
-                        from visualization import plot_actual_inference_breakdown
                         plot_actual_inference_breakdown(
-                            total_metrics,
-                            show=args.plot_show,
-                            save_path=str(actual_plot_path),
-                            title=f"Measured Inference Breakdown - Early Exit ({args.model})",
+                            {k: timings.get(k, 0) for k in ['edge_time', 'transfer_time', 'cloud_time', 'total_batch_processing_time']},
+                            show=args.plot_show, save_path=str(plot_path),
+                            title=f"Early Exit Inference - {args.model}"
                         )
-                        
-                        timings['actual_split_plot_path'] = str(actual_plot_path.resolve())
-                        logger.info(f"Measured inference plot saved to {actual_plot_path.resolve()}")
-                        
-                    except Exception as plot_error:
-                        logger.error(f"Failed to generate plot: {plot_error}")
+                        timings['actual_split_plot_path'] = str(plot_path.resolve())
+                        logger.info(f"Plot saved to {plot_path}")
+                    except Exception as e:
+                        logger.error(f"Plot failed: {e}")
             else:
                 result, timings = run_single_inference(
-                    args.server_address,
-                    args.model,
-                    dnn_surgery,
-                    split_point,
-                    args.batch_size,
-                    auto_plot=args.auto_plot,
-                    plot_show=args.plot_show,
-                    plot_path=args.plot_save,
+                    args.server_address, args.model, dnn_surgery, split_point, args.batch_size,
+                    auto_plot=args.auto_plot, plot_show=args.plot_show, plot_path=args.plot_save
                 )
             
             total_time = timings.get('edge_time', 0) + timings.get('cloud_time', 0) + timings.get('transfer_time', 0)
