@@ -281,6 +281,7 @@ def run_batch_processing(
     auto_plot: bool = True,
     plot_show: bool = True,
     plot_path: Optional[str] = None,
+    use_early_exit: bool = False,
 ) -> List[Dict]:
     """Run multiple batches and collect timing statistics"""
     validate_model(model_name)
@@ -291,6 +292,16 @@ def run_batch_processing(
     model = get_model(model_name)
     dnn_surgery = DNNSurgery(model, model_name)
     
+    # Setup early exit if requested
+    exit_config = None
+    if use_early_exit:
+        logger.info("Early exit enabled for batch processing")
+        exit_config = EarlyExitConfig(
+            enabled=True,
+            confidence_threshold=0.0,  # Exit at first opportunity
+            max_exits=3,
+        )
+    
     if split_point is not None:
         dnn_surgery.splitter.set_split_point(split_point)
         edge_model = dnn_surgery.splitter.get_edge_model()
@@ -298,7 +309,8 @@ def run_batch_processing(
         logger.info(f"Using manual split point: {split_point}")
     else:
         # Use NeuroSurgeon for first batch, then reuse the optimal split
-        logger.info("Using NeuroSurgeon optimization for batch processing")
+        config_msg = "NeuroSurgeon optimization" + (" with early exit" if use_early_exit else "")
+        logger.info(f"Using {config_msg} for batch processing")
     
     all_timings = []
     optimal_split_found = None
@@ -357,33 +369,60 @@ def run_batch_processing(
                 should_plot = False
         else:
             # Use NeuroSurgeon (either find optimal or reuse)
-            if optimal_split_found is not None:
-                # Reuse previously found optimal split
-                result, timings = run_distributed_inference(
-                    model_name,
-                    input_tensor,
-                    dnn_surgery,
-                    optimal_split_found,
-                    server_address,
-                    auto_plot=False,
-                    plot_show=plot_show,
-                    plot_path=plot_path,
-                )
+            if use_early_exit:
+                # Use early exit version
+                if optimal_split_found is not None:
+                    # Reuse previously found optimal split
+                    result, timings = run_distributed_inference_with_early_exit(
+                        model_name,
+                        input_tensor,
+                        dnn_surgery,
+                        exit_config=exit_config,
+                        split_point=optimal_split_found,
+                        server_address=server_address,
+                    )
+                else:
+                    # Find optimal split for first batch (with early exit profiling)
+                    result, timings = run_distributed_inference_with_early_exit(
+                        model_name,
+                        input_tensor,
+                        dnn_surgery,
+                        exit_config=exit_config,
+                        split_point=None,
+                        server_address=server_address,
+                    )
+                    optimal_split_found = timings.get('split_point', 2)
+                    should_plot = False
+                    logger.info(f"Found optimal split point with early exit: {optimal_split_found} (will reuse for remaining batches)")
             else:
-                # Find optimal split for first batch
-                result, timings = run_distributed_inference(
-                    model_name,
-                    input_tensor,
-                    dnn_surgery,
-                    None,
-                    server_address,
-                    auto_plot=should_plot,
-                    plot_show=plot_show,
-                    plot_path=plot_path,
-                )
-                optimal_split_found = timings.get('split_point', 2)
-                should_plot = False
-                logger.info(f"Found optimal split point: {optimal_split_found} (will reuse for remaining batches)")
+                # Standard inference without early exit
+                if optimal_split_found is not None:
+                    # Reuse previously found optimal split
+                    result, timings = run_distributed_inference(
+                        model_name,
+                        input_tensor,
+                        dnn_surgery,
+                        optimal_split_found,
+                        server_address,
+                        auto_plot=False,
+                        plot_show=plot_show,
+                        plot_path=plot_path,
+                    )
+                else:
+                    # Find optimal split for first batch
+                    result, timings = run_distributed_inference(
+                        model_name,
+                        input_tensor,
+                        dnn_surgery,
+                        None,
+                        server_address,
+                        auto_plot=should_plot,
+                        plot_show=plot_show,
+                        plot_path=plot_path,
+                    )
+                    optimal_split_found = timings.get('split_point', 2)
+                    should_plot = False
+                    logger.info(f"Found optimal split point: {optimal_split_found} (will reuse for remaining batches)")
         predicted_plot_path = timings.get('predicted_split_plot_path')
         actual_plot_path = timings.get('actual_split_plot_path')
         if predicted_plot_path:
@@ -1358,6 +1397,9 @@ def main():
             
             split_point = args.split_point if args.no_neurosurgeon else None
             
+            if args.neurosurgeon_early_split:
+                logger.info("Early exit enabled for batch processing")
+            
             timings_list = run_batch_processing(
                 args.server_address,
                 args.model,
@@ -1367,16 +1409,19 @@ def main():
                 auto_plot=args.auto_plot,
                 plot_show=args.plot_show,
                 plot_path=args.plot_save,
+                use_early_exit=args.neurosurgeon_early_split,
             )
             
             # Print batch summary
             avg_total = np.mean([t.get('total_wall_time', 0) for t in timings_list])
             logger.info(f"Batch processing completed. Average time per batch: {avg_total:.1f}ms")
             
-            # Calculate accuracy since we always have true labels
+            # Calculate accuracy and early exit stats
             if timings_list:
                 total_correct = 0
                 total_samples = 0
+                early_exit_counts = []
+                early_exit_rates = []
                 
                 for timing in timings_list:
                     true_labels = timing['true_labels']
@@ -1386,10 +1431,20 @@ def main():
                         if true_label == pred_class:
                             total_correct += 1
                         total_samples += 1
+                    
+                    # Collect early exit stats if available
+                    if 'early_exit_count' in timing:
+                        early_exit_counts.append(timing.get('early_exit_count', 0))
+                        early_exit_rates.append(timing.get('early_exit_rate', 0.0))
                 
                 if total_samples > 0:
                     accuracy = (total_correct / total_samples) * 100
                     logger.info(f"Overall accuracy: {accuracy:.2f}% ({total_correct}/{total_samples})")
+                
+                # Show early exit summary if available
+                if early_exit_counts and args.neurosurgeon_early_split:
+                    avg_exit_rate = np.mean(early_exit_rates) * 100
+                    logger.info(f"Average early exit rate: {avg_exit_rate:.1f}% (avg {np.mean(early_exit_counts):.1f} exits per batch)")
             
         # Run single inference
         else:
