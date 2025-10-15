@@ -1,10 +1,3 @@
-"""Optional early-exit inference utilities for DNN_surgery.
-
-This module introduces an alternative inference client that can terminate
-processing early on the edge device when intermediate classifiers are
-confident enough. The original `DNNInferenceClient` remains untouched so the
-baseline behaviour is preserved.
-"""
 
 from __future__ import annotations
 
@@ -111,8 +104,6 @@ class EarlyExitHead(nn.Module):
         else:
             self.pool = None
             in_features = x.shape[1]
-
-        # Use pretrained classifier if available (RECOMMENDED)
         if self.pretrained_classifier is not None:
             # Get expected input features for the classifier
             if isinstance(self.pretrained_classifier, nn.Linear):
@@ -186,15 +177,6 @@ class EarlyExitInferenceClient(DNNInferenceClient):
 
         self.num_classes = self._infer_num_classes()
         self.exit_points = self._determine_exit_points()
-        
-        if not self.exit_points:
-            logger.warning(
-                "Early exit enabled but NO exit points detected! "
-                "Edge model has %s layers. Check your split point configuration.",
-                len(self.edge_model.layers) if self.edge_model and hasattr(self.edge_model, 'layers') else 0
-            )
-        else:
-            logger.info(f"Early exit enabled: detected {len(self.exit_points)} exit points at layers: {self.exit_points}")
         
         # Extract the pretrained classifier from the base model
         pretrained_classifier = self._extract_classifier()
@@ -277,7 +259,6 @@ class EarlyExitInferenceClient(DNNInferenceClient):
             return explicit
 
         if self.edge_model is None or not hasattr(self.edge_model, "layers"):
-            logger.warning("No edge model or layers attribute - cannot determine exit points")
             return []
 
         num_layers = len(self.edge_model.layers)
@@ -298,9 +279,6 @@ class EarlyExitInferenceClient(DNNInferenceClient):
             
             spacing = max(1, num_layers // (max_exits + 1))
             candidate_indices = [spacing * (i + 1) for i in range(max_exits) if spacing * (i + 1) < num_layers]
-            logger.info(f"No residual blocks found in {num_layers} layers, using evenly-spaced exits: {candidate_indices}")
-        else:
-            logger.info(f"Found {len(candidate_indices)} residual blocks at indices: {candidate_indices}")
 
         if self.exit_config.max_exits is not None:
             candidate_indices = candidate_indices[: self.exit_config.max_exits]
@@ -428,16 +406,6 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         logger.debug(f"  Total round-trip time: {total_time:.2f}ms")
         logger.debug(f"  Server exec time (from response): {server_exec_time:.2f}ms")
         logger.debug(f"  Server total time (from response): {server_total_time:.2f}ms")
-
-        if server_total_time <= 0:
-            # Fall back to execution time if total time is unavailable
-            logger.warning("Server total time not provided, falling back to exec time")
-            server_total_time = server_exec_time
-
-        if server_exec_time <= 0:
-            # Ensure we at least report non-negative execution time
-            logger.warning("Server exec time not provided, using total time")
-            server_exec_time = max(server_total_time, 0.0)
 
         # Calculate transfer time as the difference between total round-trip and server-reported time
         transfer_time = max(total_time - server_total_time, 0.0) if server_total_time > 0 else max(total_time - server_exec_time, 0.0)
@@ -661,100 +629,92 @@ def find_optimal_split_with_early_exit(
     server_address: str,
     exit_config: EarlyExitConfig,
 ) -> Tuple[int, Dict]:
-    """Find optimal split point accounting for early exit behavior.
+    """Find optimal split point for baseline inference (without early exits).
+    
+    Early exits are used opportunistically during inference, but the split point
+    is optimized for the case when confidence is NOT high enough to exit early.
+    This ensures good performance regardless of whether early exits trigger.
+    
+    Important: Split point must be at least 1 so there are edge layers for exit heads.
 
     Args:
         dnn_surgery: DNNSurgery instance with the model to split.
         input_tensor: Input tensor for profiling.
         server_address: Server address for distributed inference.
-        exit_config: Early exit configuration.
+        exit_config: Early exit configuration (not used for split selection).
 
     Returns:
         Tuple of (optimal_split_point, timing_analysis).
     """
-    num_splits = len(dnn_surgery.splitter.layers) + 1
-    logger.info("=== Finding Optimal Split Point with Early Exits ===")
+    from dnn_inference_client import DNNInferenceClient
     
-    # Skip split point 0 for early exit profiling since edge model would be empty (no layers for exit heads)
+    num_splits = len(dnn_surgery.splitter.layers) + 1
+    logger.info("=== Finding Optimal Split Point (Baseline without Early Exits) ===")
+    logger.info("Early exits will be used opportunistically at runtime, but split point optimized for baseline case")
+    
+    # CRITICAL: Skip split point 0 - early exits require edge layers
     min_split = 1
-    logger.info("Testing %s split points (%s to %s) - skipping split point 0 (requires edge layers for early exits)", 
-                num_splits - min_split, min_split, num_splits - 1)
-
+    logger.info(f"Testing {num_splits - min_split} split points ({min_split} to {num_splits - 1}) - skipping split point 0 (no edge layers for exit heads)")
+    
     split_analysis = {}
-
+    
+    # Profile each valid split point WITHOUT early exits
     for split_point in range(min_split, num_splits):
-        logger.info("Testing split point %s/%s with early exits...", split_point, num_splits - 1)
-
+        logger.info(f"Testing split point {split_point}/{num_splits - 1} (baseline)...")
+        
         dnn_surgery.splitter.set_split_point(split_point)
         edge_model = dnn_surgery.splitter.get_edge_model(
             quantize=dnn_surgery.enable_quantization,
             quantizer=dnn_surgery.quantizer,
         )
-
-        client = EarlyExitInferenceClient(
-            server_address=server_address,
-            dnn_surgery=dnn_surgery,
-            edge_model=edge_model,
-            exit_config=exit_config,
-        )
-
+        
+        # Use standard client WITHOUT early exits
+        client = DNNInferenceClient(server_address, edge_model)
         requires_cloud = dnn_surgery.splitter.get_cloud_model() is not None
         dnn_surgery._send_split_decision_to_server(split_point, server_address)  # pylint: disable=protected-access
-
+        
         try:
             _, timings = client.process_tensor(input_tensor, dnn_surgery.model_name, requires_cloud)
-
+            
             edge_time = timings.get('edge_time', 0.0)
             transfer_time = timings.get('transfer_time', 0.0)
             cloud_time = timings.get('cloud_time', 0.0)
             total_time = edge_time + transfer_time + cloud_time
-            early_exit_count = timings.get('early_exit_count', 0)
-            early_exit_rate = timings.get('early_exit_rate', 0.0)
-
+            
             split_analysis[split_point] = {
                 'edge_time': edge_time,
                 'transfer_time': transfer_time,
                 'cloud_time': cloud_time,
                 'total_time': total_time,
-                'early_exit_count': early_exit_count,
-                'early_exit_rate': early_exit_rate,
             }
-
-            logger.info(
-                "  Split %s: Total=%.1fms (Edge=%.1fms, Transfer=%.1fms, Cloud=%.1fms) "
-                "Early exits: %s (%.1f%%)",
-                split_point,
-                total_time,
-                edge_time,
-                transfer_time,
-                cloud_time,
-                early_exit_count,
-                early_exit_rate * 100,
-            )
-
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.error("Failed to test split point %s: %s", split_point, exc)
+            
+            logger.info(f"  Split {split_point}: Total={total_time:.1f}ms (Edge={edge_time:.1f}ms, "
+                       f"Transfer={transfer_time:.1f}ms, Cloud={cloud_time:.1f}ms)")
+            
+        except Exception as exc:
+            logger.error(f"Failed to test split point {split_point}: {exc}")
             split_analysis[split_point] = {
                 'edge_time': 0.0,
                 'transfer_time': 0.0,
                 'cloud_time': 0.0,
                 'total_time': float('inf'),
-                'early_exit_count': 0,
-                'early_exit_rate': 0.0,
             }
-
+    
+    # Find optimal split among valid candidates
     optimal_split = min(split_analysis.keys(), key=lambda k: split_analysis[k]['total_time'])
     min_time = split_analysis[optimal_split]['total_time']
-
-    logger.info("=== Optimal Split Point with Early Exits Found ===")
-    logger.info("Optimal split: %s with total time: %.1fms", optimal_split, min_time)
-
+    
+    logger.info("=== Baseline Optimal Split Point Found ===")
+    logger.info(f"Optimal split: {optimal_split} with baseline time: {min_time:.1f}ms")
+    logger.info("Early exits will be attempted at runtime as an optimization")
+    
+    # Configure server with optimal split
     dnn_surgery._send_split_decision_to_server(optimal_split, server_address)  # pylint: disable=protected-access
-
+    
     from visualization import build_split_timing_summary, format_split_summary
-
+    
     split_summary = build_split_timing_summary(split_analysis, dnn_surgery.get_split_layer_names())
-
+    
     return optimal_split, {
         'optimal_split': optimal_split,
         'min_total_time': min_time,
