@@ -1410,15 +1410,28 @@ def main():
                             plot_path = plot_path / f"{args.model}_split{timings.get('split_point', 'X')}_earlyexit_{datetime.now():%Y%m%d-%H%M%S}.png"
                         plot_path.parent.mkdir(parents=True, exist_ok=True)
                         
+                        # Prepare timing data for plotting
+                        plot_data = {
+                            'edge_time': timings.get('edge_time', 0),
+                            'transfer_time': timings.get('transfer_time', 0),
+                            'cloud_time': timings.get('cloud_time', 0),
+                            'total_batch_processing_time': timings.get('total_batch_processing_time', 0)
+                        }
+                        
+                        logger.info(f"Generating early exit plot with data: {plot_data}")
+                        
                         plot_actual_inference_breakdown(
-                            {k: timings.get(k, 0) for k in ['edge_time', 'transfer_time', 'cloud_time', 'total_batch_processing_time']},
-                            show=args.plot_show, save_path=str(plot_path),
+                            plot_data,
+                            show=args.plot_show, 
+                            save_path=str(plot_path),
                             title=f"Early Exit Inference - {args.model}"
                         )
                         timings['actual_split_plot_path'] = str(plot_path.resolve())
-                        logger.info(f"Plot saved to {plot_path}")
+                        logger.info(f"✓ Early exit plot saved to {plot_path}")
                     except Exception as e:
-                        logger.error(f"Plot failed: {e}")
+                        logger.error(f"✗ Early exit plot failed: {e}")
+                        import traceback
+                        traceback.print_exc()
             else:
                 result, timings = run_single_inference(
                     args.server_address, args.model, dnn_surgery, split_point, args.batch_size,
