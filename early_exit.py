@@ -622,11 +622,15 @@ def find_optimal_split_with_early_exit(
     """
     num_splits = len(dnn_surgery.splitter.layers) + 1
     logger.info("=== Finding Optimal Split Point with Early Exits ===")
-    logger.info("Testing %s split points (0 to %s)", num_splits, num_splits - 1)
+    
+    # Skip split point 0 for early exit profiling since edge model would be empty (no layers for exit heads)
+    min_split = 1
+    logger.info("Testing %s split points (%s to %s) - skipping split point 0 (requires edge layers for early exits)", 
+                num_splits - min_split, min_split, num_splits - 1)
 
     split_analysis = {}
 
-    for split_point in range(num_splits):
+    for split_point in range(min_split, num_splits):
         logger.info("Testing split point %s/%s with early exits...", split_point, num_splits - 1)
 
         dnn_surgery.splitter.set_split_point(split_point)
