@@ -51,7 +51,7 @@ class EarlyExitConfig:
     """
 
     enabled: bool = True
-    confidence_threshold: float = 0.5  # Lower threshold - 50% confidence to exit
+    confidence_threshold: float = 0  # Lower threshold - 0% confidence to exit
     exit_points: Optional[List[int]] = None
     per_layer_thresholds: Dict[int, float] = field(default_factory=dict)
     max_exits: Optional[int] = None
@@ -186,7 +186,15 @@ class EarlyExitInferenceClient(DNNInferenceClient):
 
         self.num_classes = self._infer_num_classes()
         self.exit_points = self._determine_exit_points()
-        logger.info(f"Early exit enabled: detected {len(self.exit_points)} exit points at layers: {self.exit_points}")
+        
+        if not self.exit_points:
+            logger.warning(
+                "Early exit enabled but NO exit points detected! "
+                "Edge model has %s layers. Check your split point configuration.",
+                len(self.edge_model.layers) if self.edge_model and hasattr(self.edge_model, 'layers') else 0
+            )
+        else:
+            logger.info(f"Early exit enabled: detected {len(self.exit_points)} exit points at layers: {self.exit_points}")
         
         # Extract the pretrained classifier from the base model
         pretrained_classifier = self._extract_classifier()
@@ -265,11 +273,15 @@ class EarlyExitInferenceClient(DNNInferenceClient):
             explicit = [idx for idx in self.exit_config.exit_points if self.edge_model and idx < len(self.edge_model.layers)]
             if self.exit_config.max_exits is not None:
                 return explicit[: self.exit_config.max_exits]
+            logger.info(f"Using explicit exit points: {explicit}")
             return explicit
 
         if self.edge_model is None or not hasattr(self.edge_model, "layers"):
             logger.warning("No edge model or layers attribute - cannot determine exit points")
             return []
+
+        num_layers = len(self.edge_model.layers)
+        logger.info(f"Edge model has {num_layers} layers, determining exit points...")
 
         # Try to find residual blocks first
         candidate_indices = [
@@ -278,15 +290,21 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         
         # If no residual blocks found, use evenly spaced layers as fallback
         if not candidate_indices:
-            num_layers = len(self.edge_model.layers)
             max_exits = self.exit_config.max_exits or 3
             # Place exits at 25%, 50%, 75% of the network
+            if num_layers == 0:
+                logger.warning(f"Edge model has 0 layers - cannot place exit points!")
+                return []
+            
             spacing = max(1, num_layers // (max_exits + 1))
             candidate_indices = [spacing * (i + 1) for i in range(max_exits) if spacing * (i + 1) < num_layers]
-            logger.info(f"No residual blocks found, using evenly-spaced exits: {candidate_indices}")
+            logger.info(f"No residual blocks found in {num_layers} layers, using evenly-spaced exits: {candidate_indices}")
+        else:
+            logger.info(f"Found {len(candidate_indices)} residual blocks at indices: {candidate_indices}")
 
         if self.exit_config.max_exits is not None:
             candidate_indices = candidate_indices[: self.exit_config.max_exits]
+            logger.info(f"Limited to {self.exit_config.max_exits} exits: {candidate_indices}")
 
         return candidate_indices
 
@@ -436,7 +454,11 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         model_id: str,
         requires_cloud_processing: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        if not self.exit_config.enabled or not self.exit_heads:
+        if not self.exit_config.enabled:
+            return super().process_tensor(tensor, model_id, requires_cloud_processing)
+        
+        if not self.exit_heads:
+            logger.warning("Early exit enabled but no exit heads available - falling back to standard processing")
             return super().process_tensor(tensor, model_id, requires_cloud_processing)
 
         batch_size = tensor.shape[0]

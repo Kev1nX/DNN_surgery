@@ -847,7 +847,7 @@ def test_all_models_neurosurgeon(
                 logger.info(f"Using early exit configuration with intermediate classifiers")
                 exit_config = EarlyExitConfig(
                     enabled=True,
-                    confidence_threshold=0.9,
+                    confidence_threshold=0.0,  # Lower threshold - 0% confidence to exit (always exit at first opportunity)
                     max_exits=3,  # Limit to 3 early exit points
                 )
             else:
