@@ -1397,41 +1397,11 @@ def main():
                 input_tensor, true_labels, class_names = get_input_tensor(args.model, args.batch_size)
                 result, timings = run_distributed_inference_with_early_exit(
                     args.model, input_tensor, dnn_surgery, exit_config=exit_config,
-                    split_point=split_point, server_address=args.server_address
+                    split_point=split_point, server_address=args.server_address,
+                    auto_plot=args.auto_plot, plot_show=args.plot_show, plot_path=args.plot_save
                 )
                 timings['true_labels'] = true_labels.tolist()
                 timings['class_names'] = class_names
-                
-                # Generate plot for early exit
-                if args.auto_plot:
-                    try:
-                        plot_path = Path(args.plot_save or "plots")
-                        if not plot_path.suffix:
-                            plot_path = plot_path / f"{args.model}_split{timings.get('split_point', 'X')}_earlyexit_{datetime.now():%Y%m%d-%H%M%S}.png"
-                        plot_path.parent.mkdir(parents=True, exist_ok=True)
-                        
-                        # Prepare timing data for plotting
-                        plot_data = {
-                            'edge_time': timings.get('edge_time', 0),
-                            'transfer_time': timings.get('transfer_time', 0),
-                            'cloud_time': timings.get('cloud_time', 0),
-                            'total_batch_processing_time': timings.get('total_batch_processing_time', 0)
-                        }
-                        
-                        logger.info(f"Generating early exit plot with data: {plot_data}")
-                        
-                        plot_actual_inference_breakdown(
-                            plot_data,
-                            show=args.plot_show, 
-                            save_path=str(plot_path),
-                            title=f"Early Exit Inference - {args.model}"
-                        )
-                        timings['actual_split_plot_path'] = str(plot_path.resolve())
-                        logger.info(f"✓ Early exit plot saved to {plot_path}")
-                    except Exception as e:
-                        logger.error(f"✗ Early exit plot failed: {e}")
-                        import traceback
-                        traceback.print_exc()
             else:
                 result, timings = run_single_inference(
                     args.server_address, args.model, dnn_surgery, split_point, args.batch_size,

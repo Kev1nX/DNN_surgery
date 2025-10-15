@@ -773,8 +773,27 @@ def run_distributed_inference_with_early_exit(
     exit_config: Optional[EarlyExitConfig] = None,
     split_point: Optional[int] = None,
     server_address: str = 'localhost:50051',
+    *,
+    auto_plot: bool = True,
+    plot_show: bool = True,
+    plot_path: Optional[str] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Run distributed inference with optional early exits on the edge."""
+    """Run distributed inference with optional early exits on the edge.
+    
+    Args:
+        model_id: Model identifier
+        input_tensor: Input tensor
+        dnn_surgery: DNNSurgery instance for model splitting
+        exit_config: Early exit configuration
+        split_point: Optional manual split point (if None, will use NeuroSurgeon optimization)
+        server_address: Server address
+        auto_plot: Whether to automatically generate plots (default: True)
+        plot_show: Whether to display plots interactively (default: True)
+        plot_path: Optional path to save plots (default: None, uses "plots/" directory)
+        
+    Returns:
+        Tuple of (result tensor, timing dictionary)
+    """
 
     exit_config = exit_config or EarlyExitConfig()
 
@@ -823,5 +842,36 @@ def run_distributed_inference_with_early_exit(
 
     if exit_config.enabled:
         timings.update(client.get_exit_statistics())
+
+    # Generate plot if auto_plot is enabled
+    if auto_plot:
+        try:
+            from dnn_inference_client import resolve_plot_paths
+            from visualization import plot_actual_inference_breakdown
+            
+            _, actual_plot_path = resolve_plot_paths(model_id, split_point, plot_path)
+            # Add earlyexit suffix to distinguish from normal inference
+            actual_plot_path = actual_plot_path.with_name(actual_plot_path.stem + "_earlyexit" + actual_plot_path.suffix)
+            actual_plot_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            total_metrics = {
+                'edge_time': timings.get('edge_time', 0),
+                'transfer_time': timings.get('transfer_time', 0),
+                'cloud_time': timings.get('cloud_time', 0),
+                'total_batch_processing_time': timings.get('total_batch_processing_time', 0),
+            }
+            
+            plot_actual_inference_breakdown(
+                total_metrics,
+                show=plot_show,
+                save_path=str(actual_plot_path),
+                title=f"Measured Inference Breakdown - Early Exit ({model_id})"
+            )
+            timings['actual_split_plot_path'] = str(actual_plot_path.resolve())
+            logger.info(f"Early exit plot saved to {actual_plot_path}")
+        except ImportError as plt_error:
+            logger.warning(f"Auto-plot requested but dependencies unavailable: {plt_error}")
+        except Exception as e:
+            logger.error(f"Plot generation failed: {e}")
 
     return result, timings
