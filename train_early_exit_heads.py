@@ -16,7 +16,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset.imagenet_loader import initialize_dataset_loader, get_dataloader
+from dataset.imagenet_loader import ImageNetMiniLoader
 from dnn_surgery import DNNSurgery
 from early_exit import EarlyExitHead, _is_residual_block
 
@@ -256,9 +256,9 @@ def main():
     
     # Initialize dataset
     logger.info("Loading ImageNet mini dataset...")
-    initialize_dataset_loader(batch_size=args.batch_size)
-    train_loader = get_dataloader(split='train', batch_size=args.batch_size, shuffle=True)
-    val_loader = get_dataloader(split='val', batch_size=args.batch_size, shuffle=False)
+    dataset_loader = ImageNetMiniLoader(batch_size=args.batch_size, num_workers=4)
+    train_loader, _ = dataset_loader.get_loader(train=True)
+    val_loader, _ = dataset_loader.get_loader(train=False)
     
     # Load model
     logger.info(f"Loading pretrained {args.model}...")
