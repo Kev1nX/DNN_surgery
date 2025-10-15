@@ -51,7 +51,7 @@ class EarlyExitConfig:
     """
 
     enabled: bool = True
-    confidence_threshold: float = 0.7
+    confidence_threshold: float = 0.5  # Lower threshold - 50% confidence to exit
     exit_points: Optional[List[int]] = None
     per_layer_thresholds: Dict[int, float] = field(default_factory=dict)
     max_exits: Optional[int] = None
@@ -160,6 +160,7 @@ class EarlyExitInferenceClient(DNNInferenceClient):
 
         self.num_classes = self._infer_num_classes()
         self.exit_points = self._determine_exit_points()
+        logger.info(f"Early exit enabled: detected {len(self.exit_points)} exit points at layers: {self.exit_points}")
         
         # Extract the pretrained classifier from the base model
         pretrained_classifier = self._extract_classifier()
@@ -177,6 +178,7 @@ class EarlyExitInferenceClient(DNNInferenceClient):
             idx: self.exit_config.per_layer_thresholds.get(idx, self.exit_config.confidence_threshold)
             for idx in self.exit_points
         }
+        logger.info(f"Exit thresholds: {self.exit_thresholds}")
         self._load_head_weights()
 
     # ------------------------------------------------------------------
@@ -240,11 +242,22 @@ class EarlyExitInferenceClient(DNNInferenceClient):
             return explicit
 
         if self.edge_model is None or not hasattr(self.edge_model, "layers"):
+            logger.warning("No edge model or layers attribute - cannot determine exit points")
             return []
 
+        # Try to find residual blocks first
         candidate_indices = [
             idx for idx, layer in enumerate(self.edge_model.layers) if _is_residual_block(layer)
         ]
+        
+        # If no residual blocks found, use evenly spaced layers as fallback
+        if not candidate_indices:
+            num_layers = len(self.edge_model.layers)
+            max_exits = self.exit_config.max_exits or 3
+            # Place exits at 25%, 50%, 75% of the network
+            spacing = max(1, num_layers // (max_exits + 1))
+            candidate_indices = [spacing * (i + 1) for i in range(max_exits) if spacing * (i + 1) < num_layers]
+            logger.info(f"No residual blocks found, using evenly-spaced exits: {candidate_indices}")
 
         if self.exit_config.max_exits is not None:
             candidate_indices = candidate_indices[: self.exit_config.max_exits]
@@ -303,8 +316,10 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                 confidence_value = confidence.item()
                 threshold = self.exit_thresholds.get(idx, self.exit_config.confidence_threshold)
 
-                logger.debug(
-                    "Exit candidate at layer %s: confidence=%.4f threshold=%.4f", idx, confidence_value, threshold
+                # Log every exit check with INFO level to see what's happening
+                logger.info(
+                    "Exit candidate at layer %s: confidence=%.4f threshold=%.4f prediction=%s", 
+                    idx, confidence_value, threshold, prediction.item()
                 )
 
                 if confidence_value >= threshold:
