@@ -164,7 +164,7 @@ class EarlyExitInferenceClient(DNNInferenceClient):
             idx: self.exit_config.per_layer_thresholds.get(idx, self.exit_config.confidence_threshold)
             for idx in self.exit_points
         }
-        self._maybe_load_head_weights()
+        self._load_head_weights()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -202,7 +202,7 @@ class EarlyExitInferenceClient(DNNInferenceClient):
 
         return candidate_indices
 
-    def _maybe_load_head_weights(self) -> None:
+    def _load_head_weights(self) -> None:
         if not self.exit_config.head_state_dicts:
             return
 
@@ -470,6 +470,113 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         }
 
 
+def find_optimal_split_with_early_exit(
+    dnn_surgery: DNNSurgery,
+    input_tensor: torch.Tensor,
+    server_address: str,
+    exit_config: EarlyExitConfig,
+) -> Tuple[int, Dict]:
+    """Find optimal split point accounting for early exit behavior.
+
+    Args:
+        dnn_surgery: DNNSurgery instance with the model to split.
+        input_tensor: Input tensor for profiling.
+        server_address: Server address for distributed inference.
+        exit_config: Early exit configuration.
+
+    Returns:
+        Tuple of (optimal_split_point, timing_analysis).
+    """
+    num_splits = len(dnn_surgery.splitter.layers) + 1
+    logger.info("=== Finding Optimal Split Point with Early Exits ===")
+    logger.info("Testing %s split points (0 to %s)", num_splits, num_splits - 1)
+
+    split_analysis = {}
+
+    for split_point in range(num_splits):
+        logger.info("Testing split point %s/%s with early exits...", split_point, num_splits - 1)
+
+        dnn_surgery.splitter.set_split_point(split_point)
+        edge_model = dnn_surgery.splitter.get_edge_model(
+            quantize=dnn_surgery.enable_quantization,
+            quantizer=dnn_surgery.quantizer,
+        )
+
+        client = EarlyExitInferenceClient(
+            server_address=server_address,
+            dnn_surgery=dnn_surgery,
+            edge_model=edge_model,
+            exit_config=exit_config,
+        )
+
+        requires_cloud = dnn_surgery.splitter.get_cloud_model() is not None
+        dnn_surgery._send_split_decision_to_server(split_point, server_address)  # pylint: disable=protected-access
+
+        try:
+            _, timings = client.process_tensor(input_tensor, dnn_surgery.model_name, requires_cloud)
+
+            edge_time = timings.get('edge_time', 0.0)
+            transfer_time = timings.get('transfer_time', 0.0)
+            cloud_time = timings.get('cloud_time', 0.0)
+            total_time = edge_time + transfer_time + cloud_time
+            early_exit_count = timings.get('early_exit_count', 0)
+            early_exit_rate = timings.get('early_exit_rate', 0.0)
+
+            split_analysis[split_point] = {
+                'edge_time': edge_time,
+                'transfer_time': transfer_time,
+                'cloud_time': cloud_time,
+                'total_time': total_time,
+                'early_exit_count': early_exit_count,
+                'early_exit_rate': early_exit_rate,
+            }
+
+            logger.info(
+                "  Split %s: Total=%.1fms (Edge=%.1fms, Transfer=%.1fms, Cloud=%.1fms) "
+                "Early exits: %s (%.1f%%)",
+                split_point,
+                total_time,
+                edge_time,
+                transfer_time,
+                cloud_time,
+                early_exit_count,
+                early_exit_rate * 100,
+            )
+
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Failed to test split point %s: %s", split_point, exc)
+            split_analysis[split_point] = {
+                'edge_time': 0.0,
+                'transfer_time': 0.0,
+                'cloud_time': 0.0,
+                'total_time': float('inf'),
+                'early_exit_count': 0,
+                'early_exit_rate': 0.0,
+            }
+
+    optimal_split = min(split_analysis.keys(), key=lambda k: split_analysis[k]['total_time'])
+    min_time = split_analysis[optimal_split]['total_time']
+
+    logger.info("=== Optimal Split Point with Early Exits Found ===")
+    logger.info("Optimal split: %s with total time: %.1fms", optimal_split, min_time)
+
+    dnn_surgery._send_split_decision_to_server(optimal_split, server_address)  # pylint: disable=protected-access
+
+    from visualization import build_split_timing_summary, format_split_summary
+
+    split_summary = build_split_timing_summary(split_analysis, dnn_surgery.get_split_layer_names())
+
+    return optimal_split, {
+        'optimal_split': optimal_split,
+        'min_total_time': min_time,
+        'all_splits': split_analysis,
+        'split_summary': split_summary,
+        'split_summary_table': format_split_summary(split_summary, sort_by_total_time=False),
+        'layer_names': dnn_surgery.get_split_layer_names(),
+        'split_config_success': True,
+    }
+
+
 def run_distributed_inference_with_early_exit(
     model_id: str,
     input_tensor: torch.Tensor,
@@ -483,10 +590,18 @@ def run_distributed_inference_with_early_exit(
     exit_config = exit_config or EarlyExitConfig()
 
     if split_point is None:
-        optimal_split, analysis = dnn_surgery.find_optimal_split(input_tensor, server_address)
-        split_point = optimal_split
-        logger.info("NeuroSurgeon optimal split point: %s", split_point)
-        logger.info("Predicted total time: %.2fms", analysis['min_total_time'])
+        if exit_config.enabled and exit_config.exit_points:
+            optimal_split, analysis = find_optimal_split_with_early_exit(
+                dnn_surgery, input_tensor, server_address, exit_config
+            )
+            split_point = optimal_split
+            logger.info("NeuroSurgeon optimal split point (with early exits): %s", split_point)
+            logger.info("Predicted total time: %.2fms", analysis['min_total_time'])
+        else:
+            optimal_split, analysis = dnn_surgery.find_optimal_split(input_tensor, server_address)
+            split_point = optimal_split
+            logger.info("NeuroSurgeon optimal split point: %s", split_point)
+            logger.info("Predicted total time: %.2fms", analysis['min_total_time'])
     else:
         logger.info("Using manual split point: %s", split_point)
         success = dnn_surgery._send_split_decision_to_server(split_point, server_address)  # pylint: disable=protected-access
