@@ -586,11 +586,12 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         if not is_batch:
             assert results[0] is not None
             summary = aggregated_timings.copy()
+            summary['total_batch_processing_time'] = sum(aggregated_timings.values())  # Add total time for plotting
             summary['early_exit_count'] = float(current_exit_count)
             summary['early_exit_rate'] = float(current_exit_count)  # For single sample, rate is 1.0 if exited, 0.0 if not
             logger.info(
                 "Single sample processing with early exits completed. Total time: %.2fms, Early exit: %s",
-                sum(aggregated_timings.values()),
+                summary['total_batch_processing_time'],
                 "Yes" if current_exit_count > 0 else "No"
             )
             return results[0], summary
