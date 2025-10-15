@@ -114,8 +114,30 @@ class EarlyExitHead(nn.Module):
 
         # Use pretrained classifier if available (RECOMMENDED)
         if self.pretrained_classifier is not None:
+            # Get expected input features for the classifier
+            if isinstance(self.pretrained_classifier, nn.Linear):
+                expected_features = self.pretrained_classifier.in_features
+            else:
+                # For Sequential classifiers, find the first Linear layer
+                expected_features = None
+                for module in self.pretrained_classifier.modules():
+                    if isinstance(module, nn.Linear):
+                        expected_features = module.in_features
+                        break
+                
+                if expected_features is None:
+                    raise ValueError("Could not determine input features for pretrained classifier")
+            
+            # If dimensions don't match, add an adapter layer
+            if in_features != expected_features:
+                logger.info(f"Adding adapter layer: {in_features} -> {expected_features} features")
+                self.adapter = nn.Linear(in_features, expected_features).to(device)
+                self.register_module("adapter", self.adapter)
+            else:
+                self.adapter = None
+            
             self.classifier = self.pretrained_classifier.to(device)
-            logger.info(f"Using pretrained classifier with {in_features} input features")
+            logger.info(f"Using pretrained classifier (input: {in_features} -> adapted: {expected_features} -> output: {self.num_classes})")
         
         self._initialized = True
         self.register_module("classifier", self.classifier)
@@ -131,6 +153,10 @@ class EarlyExitHead(nn.Module):
 
         if x.dim() > 2:
             x = torch.flatten(x, 1)
+
+        # Apply adapter if needed to match classifier input dimensions
+        if hasattr(self, 'adapter') and self.adapter is not None:
+            x = self.adapter(x)
 
         return self.classifier(x)
 

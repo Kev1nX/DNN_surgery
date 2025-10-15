@@ -57,20 +57,6 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Context manager to suppress stderr (for C++ warnings)
-class SuppressStderr:
-    """Context manager to suppress stderr output (e.g., C++ warnings from PyTorch)"""
-    def __enter__(self):
-        self.null_fd = os.open(os.devnull, os.O_RDWR)
-        self.save_fd = os.dup(2)  # Save stderr file descriptor
-        os.dup2(self.null_fd, 2)  # Redirect stderr to devnull
-        return self
-    
-    def __exit__(self, *_):
-        os.dup2(self.save_fd, 2)  # Restore stderr
-        os.close(self.null_fd)
-        os.close(self.save_fd)
-
 # Global dataset loader instance
 _dataset_loader = None
 _dataset_iterator = None
@@ -177,14 +163,7 @@ def get_model(model_name: str):
             f"Unknown model: {model_name}. Supported models: {', '.join(SUPPORTED_MODELS)}"
         )
     model_fn, weights = MODEL_REGISTRY[model_name]
-    
-    # Suppress NNPACK warnings during model creation
-    with SuppressStderr():
-        model = model_fn(weights=weights).eval()
-        # Trigger any lazy initialization warnings
-        _ = model(torch.zeros(1, 3, 224, 224))
-    
-    return model
+    return model_fn(weights=weights).eval()
 
 def calculate_timing_averages(timings_list: List[Dict]) -> Dict[str, float]:
     """Calculate average timings from a list of timing dictionaries"""
