@@ -118,6 +118,15 @@ class EarlyExitTrainer:
             logger.info(f"Training exit head at layer {exit_idx}")
             logger.info(f"{'='*60}")
             
+            # Initialize the head by running a dummy forward pass
+            # This is needed because EarlyExitHead uses lazy initialization
+            logger.info("Initializing exit head architecture...")
+            dummy_batch = next(iter(train_loader))[0][:1].to(self.device)
+            with torch.no_grad():
+                dummy_features = self._extract_intermediate_features(dummy_batch)
+                _ = head(dummy_features[exit_idx])  # Initialize the head
+            logger.info(f"Exit head initialized with architecture: {head}")
+            
             # Setup optimizer and loss
             optimizer = optim.Adam(head.parameters(), lr=lr)
             criterion = nn.CrossEntropyLoss()
