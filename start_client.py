@@ -1484,6 +1484,52 @@ def main():
                 # Add true label info
                 timings['true_labels'] = true_labels.tolist()
                 timings['class_names'] = class_names
+                
+                # Generate plots if auto-plot is enabled
+                if args.auto_plot:
+                    from datetime import datetime
+                    from pathlib import Path
+                    
+                    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                    split_label = f"split-{timings.get('split_point', 'unknown')}"
+                    
+                    if args.plot_save is None:
+                        base_dir = Path("plots")
+                        base_name = f"{args.model}_{split_label}_early_exit_{timestamp}"
+                        actual_plot_path = base_dir / f"{base_name}_actual.png"
+                    else:
+                        destination = Path(args.plot_save)
+                        if destination.suffix:
+                            actual_plot_path = destination
+                        else:
+                            base_dir = destination
+                            base_name = f"{args.model}_{split_label}_early_exit_{timestamp}"
+                            actual_plot_path = base_dir / f"{base_name}_actual.png"
+                    
+                    # Generate the inference breakdown plot
+                    try:
+                        actual_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        total_metrics = {
+                            "edge_time": timings.get("edge_time", 0.0),
+                            "transfer_time": timings.get("transfer_time", 0.0),
+                            "cloud_time": timings.get("cloud_time", 0.0),
+                            "total_batch_processing_time": timings.get("total_batch_processing_time"),
+                        }
+                        
+                        from visualization import plot_actual_inference_breakdown
+                        plot_actual_inference_breakdown(
+                            total_metrics,
+                            show=args.plot_show,
+                            save_path=str(actual_plot_path),
+                            title=f"Measured Inference Breakdown - Early Exit ({args.model})",
+                        )
+                        
+                        timings['actual_split_plot_path'] = str(actual_plot_path.resolve())
+                        logger.info(f"Measured inference plot saved to {actual_plot_path.resolve()}")
+                        
+                    except Exception as plot_error:
+                        logger.error(f"Failed to generate plot: {plot_error}")
             else:
                 result, timings = run_single_inference(
                     args.server_address,
