@@ -51,7 +51,7 @@ class EarlyExitConfig:
     """
 
     enabled: bool = True
-    confidence_threshold: float = 0  # Lower threshold - 0% confidence to exit
+    confidence_threshold: float = 0.7  # Lower threshold - 0% confidence to exit
     exit_points: Optional[List[int]] = None
     per_layer_thresholds: Dict[int, float] = field(default_factory=dict)
     max_exits: Optional[int] = None
