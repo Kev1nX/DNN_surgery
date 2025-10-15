@@ -894,6 +894,9 @@ def test_all_models_neurosurgeon(
                         exit_config=exit_config,
                         split_point=current_split,  # None for first batch, then reuse optimal split
                         server_address=server_address,
+                        auto_plot=False,  # Disable auto-plotting during batch runs
+                        plot_show=False,
+                        plot_path=None,
                     )
                     early_exit_counts.append(timings.get('early_exit_count', 0))
                     early_exit_rates.append(timings.get('early_exit_rate', 0.0))
