@@ -6,6 +6,14 @@ import sys
 import time
 import traceback
 import warnings
+import os
+
+# Suppress warnings BEFORE importing torch
+warnings.filterwarnings('ignore')
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['OMP_NUM_THREADS'] = '1'  # Suppress OpenMP warnings
+os.environ['MKL_NUM_THREADS'] = '1'  # Suppress MKL warnings
+
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -23,8 +31,8 @@ from torchvision.models import (
     MobileNet_V3_Large_Weights,
 )
 
-# Suppress NNPACK warnings
-warnings.filterwarnings('ignore')
+# Disable PyTorch warnings after import
+torch.set_warn_always(False)
 
 from dataset.imagenet_loader import ImageNetMiniLoader
 from dnn_inference_client import DNNInferenceClient, resolve_plot_paths, run_distributed_inference
@@ -40,6 +48,12 @@ from visualization import (
     plot_multi_model_throughput_comparison,
     plot_model_throughput_comparison_bar,
 )
+
+# Suppress C++ level warnings at import time
+import contextlib
+with contextlib.redirect_stderr(open(os.devnull, 'w')):
+    # Trigger NNPACK initialization warnings early and suppress them
+    _ = torch.nn.functional.conv2d(torch.zeros(1, 3, 224, 224), torch.zeros(64, 3, 7, 7))
 
 # Configure logging
 logging.basicConfig(
