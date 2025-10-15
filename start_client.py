@@ -1403,23 +1403,48 @@ def main():
             if args.quantize:
                 logger.info("Quantization enabled: Edge model will use INT8 dynamic quantization")
             
+            if args.neurosurgeon_early_split:
+                logger.info("Early exit enabled: Will use confidence-based early exits at intermediate layers")
+            
             dnn_surgery = DNNSurgery(get_model(args.model), args.model, enable_quantization=args.quantize)
             
-            result, timings = run_single_inference(
-                args.server_address,
-                args.model,
-                dnn_surgery,
-                split_point,
-                args.batch_size,
-                auto_plot=args.auto_plot,
-                plot_show=args.plot_show,
-                plot_path=args.plot_save,
-            )
+            # Use early exit if requested
+            if args.neurosurgeon_early_split:
+                exit_config = EarlyExitConfig(
+                    enabled=True,
+                    confidence_threshold=0.0,  # Exit at first opportunity
+                    max_exits=3,
+                )
+                
+                input_tensor, true_labels, class_names = get_input_tensor(args.model, args.batch_size)
+                result, timings = run_distributed_inference_with_early_exit(
+                    args.model,
+                    input_tensor,
+                    dnn_surgery,
+                    exit_config=exit_config,
+                    split_point=split_point,
+                    server_address=args.server_address,
+                )
+                
+                # Add true label info
+                timings['true_labels'] = true_labels.tolist()
+                timings['class_names'] = class_names
+            else:
+                result, timings = run_single_inference(
+                    args.server_address,
+                    args.model,
+                    dnn_surgery,
+                    split_point,
+                    args.batch_size,
+                    auto_plot=args.auto_plot,
+                    plot_show=args.plot_show,
+                    plot_path=args.plot_save,
+                )
             
             total_time = timings.get('edge_time', 0) + timings.get('cloud_time', 0) + timings.get('transfer_time', 0)
             actual_split = timings.get('split_point', 'unknown')
             
-            print(f"\n Inference completed successfully!")
+            print(f"\n✓ Inference completed successfully!")
             print(f"Results:")
             print(f"   Output shape: {result.shape}")
             print(f"   Split point used: {actual_split}")
@@ -1427,6 +1452,17 @@ def main():
             print(f"   Edge time: {timings.get('edge_time', 0):.1f}ms")
             print(f"   Cloud time: {timings.get('cloud_time', 0):.1f}ms")
             print(f"   Transfer time: {timings.get('transfer_time', 0):.1f}ms")
+            
+            # Show early exit info if enabled
+            if args.neurosurgeon_early_split:
+                early_exit_count = timings.get('early_exit_count', 0)
+                early_exit_rate = timings.get('early_exit_rate', 0.0)
+                print(f"   Early exits: {int(early_exit_count)}/{args.batch_size} ({early_exit_rate*100:.1f}%)")
+                
+                if 'total_exits' in timings:
+                    total_exits = int(timings.get('total_exits', 0))
+                    if total_exits > 0:
+                        print(f"   Most frequent exit layer: {int(timings.get('most_frequent_exit_layer', -1))}")
 
             predicted_plot_path = timings.get('predicted_split_plot_path')
             actual_plot_path = timings.get('actual_split_plot_path')
