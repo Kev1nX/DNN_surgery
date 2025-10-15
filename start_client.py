@@ -956,17 +956,50 @@ def test_all_models_neurosurgeon(
     logger.info("\n" + "="*80)
     logger.info(f"NEUROSURGEON OPTIMIZATION SUMMARY ({config_desc})")
     logger.info("="*80)
-    logger.info(f"{'Model':<20} {'Split':<7} {'Total(ms)':<13} {'Std(ms)':<10} {'Accuracy':<10} {'Batches':<8}")
-    logger.info("-" * 80)
     
-    # Sort by total time
-    sorted_models = sorted(all_model_timings.items(), key=lambda x: x[1]['total_time'])
-    for model_name, timings in sorted_models:
-        logger.info(
-            f"{model_name:<20} {timings['optimal_split']:<7} {timings['total_time']:<13.1f} "
-            f"{timings.get('std_total_time', 0):<10.1f} {timings.get('accuracy', 0):<9.1f}% {timings['num_batches']:<8}"
-        )
+    # Check if any model has early exit data
+    has_early_exits = any('avg_early_exit_rate' in timings for timings in all_model_timings.values())
+    
+    if has_early_exits:
+        logger.info(f"{'Model':<20} {'Split':<7} {'Total(ms)':<13} {'Std(ms)':<10} {'Accuracy':<10} {'EE Rate':<10} {'Batches':<8}")
+        logger.info("-" * 80)
+        
+        # Sort by total time
+        sorted_models = sorted(all_model_timings.items(), key=lambda x: x[1]['total_time'])
+        for model_name, timings in sorted_models:
+            ee_rate = timings.get('avg_early_exit_rate', 0) * 100
+            logger.info(
+                f"{model_name:<20} {timings['optimal_split']:<7} {timings['total_time']:<13.1f} "
+                f"{timings.get('std_total_time', 0):<10.1f} {timings.get('accuracy', 0):<9.1f}% "
+                f"{ee_rate:<9.1f}% {timings['num_batches']:<8}"
+            )
+    else:
+        logger.info(f"{'Model':<20} {'Split':<7} {'Total(ms)':<13} {'Std(ms)':<10} {'Accuracy':<10} {'Batches':<8}")
+        logger.info("-" * 80)
+        
+        # Sort by total time
+        sorted_models = sorted(all_model_timings.items(), key=lambda x: x[1]['total_time'])
+        for model_name, timings in sorted_models:
+            logger.info(
+                f"{model_name:<20} {timings['optimal_split']:<7} {timings['total_time']:<13.1f} "
+                f"{timings.get('std_total_time', 0):<10.1f} {timings.get('accuracy', 0):<9.1f}% {timings['num_batches']:<8}"
+            )
+    
     logger.info("="*80)
+    
+    # Print detailed early exit statistics if available
+    if has_early_exits:
+        logger.info("\nEARLY EXIT DETAILS:")
+        logger.info("-" * 80)
+        for model_name, timings in sorted_models:
+            if 'avg_early_exit_rate' in timings:
+                ee_rate = timings.get('avg_early_exit_rate', 0) * 100
+                ee_count = timings.get('avg_early_exit_count', 0)
+                logger.info(
+                    f"{model_name:<20} Exit Rate: {ee_rate:>5.1f}%  "
+                    f"Avg Exits/Batch: {ee_count:>4.1f}"
+                )
+        logger.info("="*80 + "\n")
     
     # Generate comparison plots
     if auto_plot and all_model_timings:
