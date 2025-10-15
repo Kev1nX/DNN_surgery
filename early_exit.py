@@ -423,17 +423,28 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         server_exec_time = getattr(response, 'server_execution_time_ms', 0.0)
         server_total_time = getattr(response, 'server_total_time_ms', 0.0)
 
+        # Debug logging for timing breakdown
+        logger.debug(f"[TIMING DEBUG] Sample {idx + 1}/{batch_size}:")
+        logger.debug(f"  Total round-trip time: {total_time:.2f}ms")
+        logger.debug(f"  Server exec time (from response): {server_exec_time:.2f}ms")
+        logger.debug(f"  Server total time (from response): {server_total_time:.2f}ms")
+
         if server_total_time <= 0:
             # Fall back to execution time if total time is unavailable
+            logger.warning("Server total time not provided, falling back to exec time")
             server_total_time = server_exec_time
 
         if server_exec_time <= 0:
             # Ensure we at least report non-negative execution time
+            logger.warning("Server exec time not provided, using total time")
             server_exec_time = max(server_total_time, 0.0)
 
         # Calculate transfer time as the difference between total round-trip and server-reported time
         transfer_time = max(total_time - server_total_time, 0.0) if server_total_time > 0 else max(total_time - server_exec_time, 0.0)
         cloud_time = max(server_exec_time, 0.0)
+        
+        logger.debug(f"  Calculated transfer time: {transfer_time:.2f}ms")
+        logger.debug(f"  Calculated cloud time: {cloud_time:.2f}ms")
 
         sample_metrics['transfer_time'] = transfer_time
         sample_metrics['cloud_time'] = cloud_time
@@ -585,11 +596,29 @@ class EarlyExitInferenceClient(DNNInferenceClient):
             return results[0], summary
 
         batched_result = torch.cat(results, dim=0)  # type: ignore[arg-type]
-        avg_timings = {key: (value / batch_size) for key, value in aggregated_timings.items()}
+        
+        # Calculate averages correctly accounting for early exits
+        # For transfer/cloud: only divide by samples that actually used cloud
+        non_exit_count = batch_size - current_exit_count
+        
+        avg_timings = {}
+        avg_timings['edge_time'] = aggregated_timings['edge_time'] / batch_size if batch_size > 0 else 0.0
+        
+        # Only average transfer/cloud over samples that actually went to cloud
+        if non_exit_count > 0:
+            avg_timings['transfer_time'] = aggregated_timings['transfer_time'] / non_exit_count
+            avg_timings['cloud_time'] = aggregated_timings['cloud_time'] / non_exit_count
+        else:
+            # All samples exited early
+            avg_timings['transfer_time'] = 0.0
+            avg_timings['cloud_time'] = 0.0
+        
+        # Total batch time is the sum of all actual times
         avg_timings['total_batch_processing_time'] = sum(aggregated_timings.values())
         avg_timings['batch_size'] = batch_size
         avg_timings['early_exit_count'] = float(current_exit_count)
         avg_timings['early_exit_rate'] = current_exit_count / batch_size if batch_size else 0.0
+        avg_timings['non_exit_count'] = non_exit_count
 
         logger.info(
             "Batch processing with early exits completed. Total time: %.2fms, Average per sample: %.2fms, "
@@ -599,6 +628,13 @@ class EarlyExitInferenceClient(DNNInferenceClient):
             current_exit_count,
             batch_size,
             avg_timings['early_exit_rate'] * 100,
+        )
+        
+        logger.info(
+            "Timing breakdown (for non-exited samples): Edge=%.2fms, Transfer=%.2fms, Cloud=%.2fms",
+            avg_timings['edge_time'],
+            avg_timings['transfer_time'] if non_exit_count > 0 else 0.0,
+            avg_timings['cloud_time'] if non_exit_count > 0 else 0.0,
         )
 
         return batched_result, avg_timings
