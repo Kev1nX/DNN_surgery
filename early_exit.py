@@ -500,12 +500,23 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                 if decision.triggered:
                     current_exit_count += 1
                     results[idx] = decision.logits
+                    logger.info(
+                        "✓ Sample %d/%d exited early at layer %d with %.1f%% confidence (prediction: %d)",
+                        idx + 1,
+                        batch_size,
+                        decision.layer_index if decision.layer_index is not None else -1,
+                        decision.confidence * 100,
+                        decision.prediction if decision.prediction is not None else -1,
+                    )
                     # No transfer/cloud times when exiting on the edge
                     continue
 
                 if not requires_cloud_processing:
                     results[idx] = processed_sample
+                    logger.info("✗ Sample %d/%d did NOT exit early - all processing on edge (no cloud model)", idx + 1, batch_size)
                     continue
+                
+                logger.info("✗ Sample %d/%d did NOT exit early - sending to cloud for processing", idx + 1, batch_size)
 
                 request = dnn_inference_pb2.InferenceRequest(
                     tensor=tensor_to_proto(processed_sample, ensure_cpu=True),
@@ -549,7 +560,13 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         if not is_batch:
             assert results[0] is not None
             summary = aggregated_timings.copy()
-            summary['early_exit_triggered'] = current_exit_count
+            summary['early_exit_count'] = float(current_exit_count)
+            summary['early_exit_rate'] = float(current_exit_count)  # For single sample, rate is 1.0 if exited, 0.0 if not
+            logger.info(
+                "Single sample processing with early exits completed. Total time: %.2fms, Early exit: %s",
+                sum(aggregated_timings.values()),
+                "Yes" if current_exit_count > 0 else "No"
+            )
             return results[0], summary
 
         batched_result = torch.cat(results, dim=0)  # type: ignore[arg-type]
@@ -560,9 +577,13 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         avg_timings['early_exit_rate'] = current_exit_count / batch_size if batch_size else 0.0
 
         logger.info(
-            "Batch processing with early exits completed. Total time: %.2fms, Average per sample: %.2fms",
+            "Batch processing with early exits completed. Total time: %.2fms, Average per sample: %.2fms, "
+            "Early exits: %d/%d (%.1f%%)",
             avg_timings['total_batch_processing_time'],
             avg_timings['total_batch_processing_time'] / batch_size if batch_size else 0.0,
+            current_exit_count,
+            batch_size,
+            avg_timings['early_exit_rate'] * 100,
         )
 
         return batched_result, avg_timings
