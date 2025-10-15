@@ -81,38 +81,42 @@ def _is_residual_block(module: nn.Module) -> bool:
 
 
 class EarlyExitHead(nn.Module):
-    """A lightweight classifier head attached to an intermediate activation."""
+    """A lightweight classifier head attached to an intermediate activation.
+    
+    Uses the original model's classifier (fc/classifier layer) for maximum accuracy.
+    Only adds global average pooling if the intermediate features are spatial (4D).
+    """
 
-    def __init__(self, num_classes: int, hidden_dim: Optional[int] = None):
+    def __init__(
+        self, 
+        num_classes: int, 
+        hidden_dim: Optional[int] = None,
+        pretrained_classifier: Optional[nn.Module] = None,
+    ):
         super().__init__()
         self.num_classes = num_classes
         self.hidden_dim = hidden_dim
+        self.pretrained_classifier = pretrained_classifier
         self._initialized = False
         self.pool: Optional[nn.AdaptiveAvgPool2d] = None
-        self.classifier: Optional[nn.Sequential] = None
+        self.classifier: Optional[nn.Module] = None
 
     def _initialize(self, x: torch.Tensor) -> None:
+        device = x.device  # Get the device from input tensor
+        
+        # Always add global average pooling if features are spatial (4D)
         if x.dim() > 2:
-            self.pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.pool = nn.AdaptiveAvgPool2d((1, 1)).to(device)
             in_features = x.shape[1]
         else:
             self.pool = None
             in_features = x.shape[1]
 
-        layers: List[nn.Module] = []
-        if self.hidden_dim:
-            layers.extend(
-                [
-                    nn.Linear(in_features, self.hidden_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout(p=0.2),
-                    nn.Linear(self.hidden_dim, self.num_classes),
-                ]
-            )
-        else:
-            layers.append(nn.Linear(in_features, self.num_classes))
-
-        self.classifier = nn.Sequential(*layers)
+        # Use pretrained classifier if available (RECOMMENDED)
+        if self.pretrained_classifier is not None:
+            self.classifier = self.pretrained_classifier.to(device)
+            logger.info(f"Using pretrained classifier with {in_features} input features")
+        
         self._initialized = True
         self.register_module("classifier", self.classifier)
         if self.pool is not None:
@@ -156,8 +160,17 @@ class EarlyExitInferenceClient(DNNInferenceClient):
 
         self.num_classes = self._infer_num_classes()
         self.exit_points = self._determine_exit_points()
+        
+        # Extract the pretrained classifier from the base model
+        pretrained_classifier = self._extract_classifier()
+        
+        # Create exit heads using the pretrained classifier
         self.exit_heads: Dict[int, EarlyExitHead] = {
-            idx: EarlyExitHead(self.num_classes, hidden_dim=self.exit_config.head_hidden_dim).eval()
+            idx: EarlyExitHead(
+                self.num_classes, 
+                hidden_dim=self.exit_config.head_hidden_dim,
+                pretrained_classifier=pretrained_classifier  # Reuse the trained classifier!
+            ).eval()
             for idx in self.exit_points
         }
         self.exit_thresholds: Dict[int, float] = {
@@ -182,6 +195,42 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                     return module.out_features
 
         raise ValueError("Unable to infer number of classes from model")
+    
+    def _extract_classifier(self) -> Optional[nn.Module]:
+        """Extract the pretrained classifier from the base model.
+        
+        Returns a copy of the final classifier layer that can be reused
+        for early exit heads. This ensures high accuracy predictions.
+        """
+        import copy
+        
+        # Try to find fc layer (ResNet, etc.)
+        if hasattr(self.base_model, "fc") and isinstance(self.base_model.fc, nn.Linear):
+            classifier = copy.deepcopy(self.base_model.fc)
+            logger.info("Extracted pretrained 'fc' classifier for early exits")
+            return classifier
+        
+        # Try to find classifier (AlexNet, VGG, etc.)
+        if hasattr(self.base_model, "classifier"):
+            classifier_module = self.base_model.classifier
+            
+            # If it's a Sequential, we want the final Linear layer
+            if isinstance(classifier_module, nn.Sequential):
+                # Find the last Linear layer
+                for module in reversed(list(classifier_module)):
+                    if isinstance(module, nn.Linear):
+                        classifier = copy.deepcopy(module)
+                        logger.info("Extracted pretrained classifier from Sequential for early exits")
+                        return classifier
+            
+            # If it's directly a Linear layer
+            elif isinstance(classifier_module, nn.Linear):
+                classifier = copy.deepcopy(classifier_module)
+                logger.info("Extracted pretrained Linear classifier for early exits")
+                return classifier
+        
+        logger.warning("Could not extract pretrained classifier - early exit heads will use random initialization!")
+        return None
 
     def _determine_exit_points(self) -> List[int]:
         if self.exit_config.exit_points is not None:
