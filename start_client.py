@@ -298,7 +298,7 @@ def run_batch_processing(
         logger.info("Early exit enabled for batch processing")
         exit_config = EarlyExitConfig(
             enabled=True,
-            confidence_threshold=0.85,  # Exit at first opportunity
+            entropy_threshold=0.3,  # Maximum entropy for early exit (lower = more confident)
             max_exits=3,
         )
     
@@ -860,7 +860,7 @@ def test_all_models_neurosurgeon(
                 logger.info(f"Using early exit configuration with intermediate classifiers")
                 exit_config = EarlyExitConfig(
                     enabled=True,
-                    confidence_threshold=0.85, 
+                    entropy_threshold=0.3,  # Maximum entropy for early exit (lower = more confident)
                     max_exits=3,  # Limit to 3 early exit points
                 )
             else:
@@ -1396,7 +1396,7 @@ def main():
             
             # Run inference (with or without early exit)
             if args.neurosurgeon_early_split:
-                exit_config = EarlyExitConfig(enabled=True, confidence_threshold=0.85, max_exits=3)
+                exit_config = EarlyExitConfig(enabled=True, entropy_threshold=0.3, max_exits=3)
                 input_tensor, true_labels, class_names = get_input_tensor(args.model, args.batch_size)
                 result, timings = run_distributed_inference_with_early_exit(
                     args.model, input_tensor, dnn_surgery, exit_config=exit_config,
