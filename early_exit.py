@@ -74,82 +74,96 @@ def _is_residual_block(module: nn.Module) -> bool:
 
 
 class EarlyExitHead(nn.Module):
-    """A lightweight classifier head attached to an intermediate activation.
+    """Early exit head following the architecture from the paper.
     
-    Uses the original model's classifier (fc/classifier layer) for maximum accuracy.
-    Only adds global average pooling if the intermediate features are spatial (4D).
+    Architecture (as shown in diagram):
+    1. Batch Normalization - normalize intermediate features
+    2. ReLU - activation
+    3. Global Average Pooling - spatial reduction
+    4. Optional adapter layer - project features to target dimension
+    5. Two parallel branches:
+       - Confidence head: FC -> Sigmoid (outputs confidence score h)
+       - Classifier head: FC -> Softmax (outputs class predictions ŷ)
     """
 
     def __init__(
         self, 
-        num_classes: int, 
-        hidden_dim: Optional[int] = None,
-        pretrained_classifier: Optional[nn.Module] = None,
+        num_classes: int,
+        target_dim: Optional[int] = 512,  # Target dimension for adapter (512 for ResNet)
     ):
         super().__init__()
         self.num_classes = num_classes
-        self.hidden_dim = hidden_dim
-        self.pretrained_classifier = pretrained_classifier
+        self.target_dim = target_dim
         self._initialized = False
+        
+        # Architecture components
+        self.bn: Optional[nn.BatchNorm2d] = None
+        self.relu: nn.ReLU = nn.ReLU()
         self.pool: Optional[nn.AdaptiveAvgPool2d] = None
-        self.classifier: Optional[nn.Module] = None
+        self.adapter: Optional[nn.Linear] = None  # Projects features to target_dim
+        self.fc_confidence: Optional[nn.Linear] = None  # For confidence score
+        self.fc_classifier: Optional[nn.Linear] = None  # For class predictions
 
     def _initialize(self, x: torch.Tensor) -> None:
-        device = x.device  # Get the device from input tensor
+        device = x.device
         
-        # Always add global average pooling if features are spatial (4D)
+        # Add batch norm and pooling if features are spatial (4D)
         if x.dim() > 2:
+            num_channels = x.shape[1]
+            self.bn = nn.BatchNorm2d(num_channels).to(device)
             self.pool = nn.AdaptiveAvgPool2d((1, 1)).to(device)
-            in_features = x.shape[1]
+            in_features = num_channels
         else:
+            self.bn = None
             self.pool = None
             in_features = x.shape[1]
-        if self.pretrained_classifier is not None:
-            # Get expected input features for the classifier
-            if isinstance(self.pretrained_classifier, nn.Linear):
-                expected_features = self.pretrained_classifier.in_features
-            else:
-                # For Sequential classifiers, find the first Linear layer
-                expected_features = None
-                for module in self.pretrained_classifier.modules():
-                    if isinstance(module, nn.Linear):
-                        expected_features = module.in_features
-                        break
-                
-                if expected_features is None:
-                    raise ValueError("Could not determine input features for pretrained classifier")
-            
-            # If dimensions don't match, add an adapter layer
-            if in_features != expected_features:
-                logger.info(f"Adding adapter layer: {in_features} -> {expected_features} features")
-                self.adapter = nn.Linear(in_features, expected_features).to(device)
-                self.register_module("adapter", self.adapter)
-            else:
-                self.adapter = None
-            
-            self.classifier = self.pretrained_classifier.to(device)
-            logger.info(f"Using pretrained classifier (input: {in_features} -> adapted: {expected_features} -> output: {self.num_classes})")
         
+        # Add adapter layer if intermediate features < target dimension
+        if self.target_dim is not None and in_features < self.target_dim:
+            self.adapter = nn.Linear(in_features, self.target_dim).to(device)
+            classifier_in_features = self.target_dim
+            logger.info(f"Added adapter layer: {in_features} -> {self.target_dim}")
+        else:
+            self.adapter = None
+            classifier_in_features = in_features
+        
+        # Two parallel heads
+        self.fc_confidence = nn.Linear(classifier_in_features, 1).to(device)  # Confidence score
+        self.fc_classifier = nn.Linear(classifier_in_features, self.num_classes).to(device)  # Class predictions
         self._initialized = True
-        self.register_module("classifier", self.classifier)
-        if self.pool is not None:
-            self.register_module("pool", self.pool)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass returning class logits (for training compatibility).
+        
+        Note: During training we only use the classifier output.
+        The confidence head is available but not used in standard cross-entropy loss.
+        """
         if not self._initialized:
             self._initialize(x)
 
+        # Batch normalization (if spatial features)
+        if self.bn is not None:
+            x = self.bn(x)
+        
+        # ReLU activation
+        x = self.relu(x)
+        
+        # Global average pooling (if spatial features)
         if self.pool is not None:
             x = self.pool(x)
 
+        # Flatten to 2D
         if x.dim() > 2:
             x = torch.flatten(x, 1)
 
-        # Apply adapter if needed to match classifier input dimensions
-        if hasattr(self, 'adapter') and self.adapter is not None:
+        # Apply adapter if present (project to target dimension)
+        if self.adapter is not None:
             x = self.adapter(x)
 
-        return self.classifier(x)
+        # Return classifier logits (confidence head not used during training)
+        x = self.fc_classifier(x)
+
+        return x
 
 
 class EarlyExitInferenceClient(DNNInferenceClient):
@@ -178,16 +192,9 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         self.num_classes = self._infer_num_classes()
         self.exit_points = self._determine_exit_points()
         
-        # Extract the pretrained classifier from the base model
-        pretrained_classifier = self._extract_classifier()
-        
-        # Create exit heads using the pretrained classifier
+        # Create simple exit heads (single linear layer after global avg pooling)
         self.exit_heads: Dict[int, EarlyExitHead] = {
-            idx: EarlyExitHead(
-                self.num_classes, 
-                hidden_dim=self.exit_config.head_hidden_dim,
-                pretrained_classifier=pretrained_classifier  # Reuse the trained classifier!
-            ).eval()
+            idx: EarlyExitHead(self.num_classes).eval()
             for idx in self.exit_points
         }
         self.exit_thresholds: Dict[int, float] = {
@@ -213,42 +220,6 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                     return module.out_features
 
         raise ValueError("Unable to infer number of classes from model")
-    
-    def _extract_classifier(self) -> Optional[nn.Module]:
-        """Extract the pretrained classifier from the base model.
-        
-        Returns a copy of the final classifier layer that can be reused
-        for early exit heads. This ensures high accuracy predictions.
-        """
-        import copy
-        
-        # Try to find fc layer (ResNet, etc.)
-        if hasattr(self.base_model, "fc") and isinstance(self.base_model.fc, nn.Linear):
-            classifier = copy.deepcopy(self.base_model.fc)
-            logger.info("Extracted pretrained 'fc' classifier for early exits")
-            return classifier
-        
-        # Try to find classifier (AlexNet, VGG, etc.)
-        if hasattr(self.base_model, "classifier"):
-            classifier_module = self.base_model.classifier
-            
-            # If it's a Sequential, we want the final Linear layer
-            if isinstance(classifier_module, nn.Sequential):
-                # Find the last Linear layer
-                for module in reversed(list(classifier_module)):
-                    if isinstance(module, nn.Linear):
-                        classifier = copy.deepcopy(module)
-                        logger.info("Extracted pretrained classifier from Sequential for early exits")
-                        return classifier
-            
-            # If it's directly a Linear layer
-            elif isinstance(classifier_module, nn.Linear):
-                classifier = copy.deepcopy(classifier_module)
-                logger.info("Extracted pretrained Linear classifier for early exits")
-                return classifier
-        
-        logger.warning("Could not extract pretrained classifier - early exit heads will use random initialization!")
-        return None
 
     def _determine_exit_points(self) -> List[int]:
         if self.exit_config.exit_points is not None:
