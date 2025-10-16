@@ -301,18 +301,21 @@ class EarlyExitInferenceClient(DNNInferenceClient):
 
     def _determine_exit_points(self) -> List[int]:
         if self.exit_config.exit_points is not None:
-            explicit = [idx for idx in self.exit_config.exit_points if self.edge_model and idx < len(self.edge_model.layers)]
+            # Explicit exit points provided - use model.children() indexing to match training
+            full_model_layers = list(self.base_model.children())
+            explicit = [idx for idx in self.exit_config.exit_points if idx < len(full_model_layers)]
             if self.exit_config.max_exits is not None:
-                return explicit[: self.exit_config.max_exits]
-            logger.info(f"Using explicit exit points: {explicit}")
+                explicit = explicit[: self.exit_config.max_exits]
+            logger.info(f"Using explicit exit points (model.children() indexing): {explicit}")
             return explicit
 
-        # CRITICAL: Use FULL MODEL structure to match training exit point detection
-        # Training uses model.children(), so we must use the same indexing
-        # This ensures checkpoint files (e.g., resnet50_exit4.pt) map correctly
+        # CRITICAL: Use model.children() to match training's get_exit_points()
+        # Training script uses: layers = list(model.children())
+        # Then finds residual blocks using: enumerate(edge_layers)
+        # This ensures checkpoint files (e.g., resnet50_exit4.pt) map correctly to layer indices
         full_model_layers = list(self.base_model.children())
         num_full_layers = len(full_model_layers)
-        logger.info(f"Full model has {num_full_layers} layers, determining exit points...")
+        logger.info(f"Full model has {num_full_layers} components (model.children()), determining exit points...")
 
         # Try to find residual blocks first (same as training)
         candidate_indices = [
@@ -330,11 +333,25 @@ class EarlyExitInferenceClient(DNNInferenceClient):
             spacing = max(1, num_full_layers // (max_exits + 1))
             candidate_indices = [spacing * (i + 1) for i in range(max_exits) if spacing * (i + 1) < num_full_layers]
 
-        # Filter to only exit points that are within the edge model
+        # Filter to only exit points that can actually be used during inference
+        # Exit point i means we execute layers 0..i on edge, so we need split_point > i
+        # ModelSplitter.layers might have different length than model.children(), so check actual edge model
         if self.edge_model is not None and hasattr(self.edge_model, "layers"):
-            num_edge_layers = len(self.edge_model.layers)
-            candidate_indices = [idx for idx in candidate_indices if idx < num_edge_layers]
-            logger.info(f"Filtered to {len(candidate_indices)} exit points within edge model (split={num_edge_layers}): {candidate_indices}")
+            # During inference, we're limited by the split point
+            # The edge model has layers from ModelSplitter.layers, not model.children()
+            # But exit points are in model.children() indexing
+            # We need to ensure the exit point layer exists in the edge portion
+            
+            # Get the actual split point from the edge model's layer count
+            # This corresponds to how many of ModelSplitter's layers are on the edge
+            num_edge_layers_splitter = len(self.edge_model.layers)
+            
+            # We can only use exit points if the corresponding layer from model.children()
+            # is actually included in the edge model's execution path
+            # Since ModelSplitter may flatten/group differently, we keep all candidates
+            # and let the forward pass handle it (checking idx in self.exit_heads)
+            logger.info(f"Edge model has {num_edge_layers_splitter} layers (ModelSplitter.layers)")
+            logger.info(f"Exit points use model.children() indexing: {candidate_indices}")
 
         if self.exit_config.max_exits is not None:
             candidate_indices = candidate_indices[: self.exit_config.max_exits]
@@ -393,14 +410,38 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         if self.edge_model is None or not self.exit_heads:
             return self._forward_edge_without_exits(sample)
 
+        # CRITICAL: Use model.children() indexing to match training
+        # Training extracts features using: for idx, layer in enumerate(list(model.children()))
+        # We must use the same indexing to match checkpoint exit points
+        full_model_layers = list(self.base_model.children())
+        
+        # Determine how many layers are in the edge model
+        num_edge_layers = len(self.edge_model.layers) if hasattr(self.edge_model, 'layers') else len(full_model_layers)
+        
         activation = sample
         with torch.no_grad():
             edge_start = time.perf_counter()
-            for idx, layer in enumerate(self.edge_model.layers):
-                if self.edge_model._needs_flattening(layer, activation):  # type: ignore[attr-defined]
+            
+            # Execute layers using model.children() indexing (matching training)
+            for idx, layer in enumerate(full_model_layers):
+                # Stop if we've gone past the edge model split point
+                # Note: This is approximate since ModelSplitter.layers != model.children()
+                # But exit points use model.children() indexing
+                if idx >= num_edge_layers:
+                    break
+                
+                # Handle flattening if needed
+                if isinstance(layer, nn.Linear) and activation.dim() > 2:
                     activation = torch.flatten(activation, 1)
+                elif isinstance(layer, nn.Sequential) and activation.dim() > 2:
+                    # Check if Sequential contains Linear layers
+                    has_linear = any(isinstance(sublayer, nn.Linear) for sublayer in layer.children())
+                    if has_linear:
+                        activation = torch.flatten(activation, 1)
+                
                 activation = layer(activation)
 
+                # Check for early exit at this layer
                 if idx not in self.exit_heads:
                     continue
 
@@ -413,8 +454,8 @@ class EarlyExitInferenceClient(DNNInferenceClient):
 
                 # Log every exit check with INFO level to see what's happening
                 logger.info(
-                    "Exit candidate at layer %s: confidence=%.4f threshold=%.4f prediction=%s", 
-                    idx, confidence_value, threshold, prediction.item()
+                    "Exit candidate at layer %s (%s): confidence=%.4f threshold=%.4f prediction=%s", 
+                    idx, layer.__class__.__name__, confidence_value, threshold, prediction.item()
                 )
 
                 if confidence_value >= threshold:
@@ -428,8 +469,9 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                     )
                     self.exit_history.append(decision)
                     logger.info(
-                        "Early exit triggered at layer %s with confidence %.3f (prediction=%s)",
+                        "Early exit triggered at layer %s (%s) with confidence %.3f (prediction=%s)",
                         idx,
+                        layer.__class__.__name__,
                         confidence_value,
                         prediction.item(),
                     )
