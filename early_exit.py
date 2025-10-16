@@ -28,12 +28,13 @@ class EarlyExitConfig:
     Attributes:
         enabled: Master switch for early exits. When False, behaviour falls
             back to the standard pipeline.
-        confidence_threshold: Global softmax confidence threshold that must be
-            exceeded to trigger an exit.
+        entropy_threshold: Maximum entropy threshold for early exit. Lower entropy
+            indicates higher confidence. Typical values: 0.1-0.5 (lower = stricter).
+            Entropy of 0 = perfect confidence, log(num_classes) = uniform distribution.
         exit_points: Optional explicit list of edge-layer indices where exit
             heads should be attached. If omitted, residual blocks are detected
             automatically.
-        per_layer_thresholds: Optional custom thresholds per exit layer index.
+        per_layer_entropy_thresholds: Optional custom entropy thresholds per exit layer index.
         max_exits: Optional cap on the number of exit heads to attach (starting
             from shallower layers).
         head_hidden_dim: Optional hidden dimension for exit heads; when None a
@@ -44,9 +45,9 @@ class EarlyExitConfig:
     """
 
     enabled: bool = True
-    confidence_threshold: float = 0.7  # Lower threshold - 0% confidence to exit
+    entropy_threshold: float = 0.3  # Maximum entropy to trigger exit (lower = more confident)
     exit_points: Optional[List[int]] = None
-    per_layer_thresholds: Dict[int, float] = field(default_factory=dict)
+    per_layer_entropy_thresholds: Dict[int, float] = field(default_factory=dict)
     max_exits: Optional[int] = None
     head_hidden_dim: Optional[int] = None
     head_state_dicts: Dict[int, str] = field(default_factory=dict)
@@ -58,7 +59,7 @@ class EarlyExitDecision:
 
     triggered: bool
     layer_index: Optional[int] = None
-    confidence: float = 0.0
+    entropy: float = 0.0
     prediction: Optional[int] = None
     logits: Optional[torch.Tensor] = None
 
@@ -71,6 +72,27 @@ def _is_residual_block(module: nn.Module) -> bool:
 
     child_names = {child.__class__.__name__ for child in module.children()}
     return any("BasicBlock" in name or "Bottleneck" in name for name in child_names)
+
+
+def calculate_entropy(probabilities: torch.Tensor) -> float:
+    """Calculate Shannon entropy of probability distribution.
+    
+    Entropy measures uncertainty in a probability distribution:
+    - H(p) = -sum(p * log(p))
+    - Lower entropy = more confident (peaked distribution)
+    - Higher entropy = less confident (uniform distribution)
+    - Minimum entropy = 0 (perfect confidence, p=1 for one class)
+    - Maximum entropy = log(num_classes) (uniform distribution)
+    
+    Args:
+        probabilities: Probability distribution (shape: [batch_size, num_classes])
+        
+    Returns:
+        Entropy value (scalar, averaged over batch if batch_size > 1)
+    """
+    # Add small epsilon to avoid log(0)
+    entropy = -torch.sum(probabilities * torch.log(probabilities + 1e-10), dim=1)
+    return entropy.mean().item() if entropy.numel() > 1 else entropy.item()
 
 
 class EarlyExitHead(nn.Module):
@@ -190,11 +212,12 @@ class EarlyExitInferenceClient(DNNInferenceClient):
             ).eval()
             for idx in self.exit_points
         }
-        self.exit_thresholds: Dict[int, float] = {
-            idx: self.exit_config.per_layer_thresholds.get(idx, self.exit_config.confidence_threshold)
+        self.entropy_thresholds: Dict[int, float] = {
+            idx: self.exit_config.per_layer_entropy_thresholds.get(idx, self.exit_config.entropy_threshold)
             for idx in self.exit_points
         }
-        logger.info(f"Exit thresholds: {self.exit_thresholds}")
+        logger.info(f"Entropy thresholds (max allowed): {self.entropy_thresholds}")
+        logger.info(f"Lower entropy = higher confidence. Max possible entropy = {torch.log(torch.tensor(self.num_classes)).item():.3f}")
         self._load_head_weights()
 
     # ------------------------------------------------------------------
@@ -334,30 +357,34 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                 head = self.exit_heads[idx].to(activation.device)
                 logits = head(activation)
                 probabilities = F.softmax(logits, dim=1)
-                confidence, prediction = torch.max(probabilities, dim=1)
-                confidence_value = confidence.item()
-                threshold = self.exit_thresholds.get(idx, self.exit_config.confidence_threshold)
+                
+                # Calculate entropy - lower entropy = higher confidence
+                entropy_value = calculate_entropy(probabilities)
+                _, prediction = torch.max(probabilities, dim=1)
+                
+                entropy_threshold = self.entropy_thresholds.get(idx, self.exit_config.entropy_threshold)
 
                 # Log every exit check with INFO level to see what's happening
                 logger.info(
-                    "Exit candidate at layer %s: confidence=%.4f threshold=%.4f prediction=%s", 
-                    idx, confidence_value, threshold, prediction.item()
+                    "Exit candidate at layer %s: entropy=%.4f threshold=%.4f prediction=%s", 
+                    idx, entropy_value, entropy_threshold, prediction.item()
                 )
 
-                if confidence_value >= threshold:
+                # Exit if entropy is LOW (confident prediction)
+                if entropy_value <= entropy_threshold:
                     edge_time = (time.perf_counter() - edge_start) * 1000
                     decision = EarlyExitDecision(
                         triggered=True,
                         layer_index=idx,
-                        confidence=confidence_value,
+                        entropy=entropy_value,
                         prediction=prediction.item(),
                         logits=logits.detach(),
                     )
                     self.exit_history.append(decision)
                     logger.info(
-                        "Early exit triggered at layer %s with confidence %.3f (prediction=%s)",
+                        "Early exit triggered at layer %s with entropy %.3f (prediction=%s)",
                         idx,
-                        confidence_value,
+                        entropy_value,
                         prediction.item(),
                     )
                     return logits.detach(), decision, edge_time
@@ -495,11 +522,11 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                     current_exit_count += 1
                     results[idx] = decision.logits
                     logger.info(
-                        "✓ Sample %d/%d exited early at layer %d with %.1f%% confidence (prediction: %d)",
+                        "✓ Sample %d/%d exited early at layer %d with entropy %.3f (prediction: %d)",
                         idx + 1,
                         batch_size,
                         decision.layer_index if decision.layer_index is not None else -1,
-                        decision.confidence * 100,
+                        decision.entropy,
                         decision.prediction if decision.prediction is not None else -1,
                     )
                     # No transfer/cloud times when exiting on the edge
@@ -631,9 +658,10 @@ def find_optimal_split_with_early_exit(
 ) -> Tuple[int, Dict]:
     """Find optimal split point for baseline inference (without early exits).
     
-    Early exits are used opportunistically during inference, but the split point
-    is optimized for the case when confidence is NOT high enough to exit early.
-    This ensures good performance regardless of whether early exits trigger.
+    Early exits are used opportunistically during inference based on entropy,
+    but the split point is optimized for the case when entropy is too HIGH
+    (uncertainty too high) to exit early. This ensures good performance 
+    regardless of whether early exits trigger.
     
     Important: Split point must be at least 1 so there are edge layers for exit heads.
 
