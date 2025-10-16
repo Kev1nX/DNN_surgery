@@ -21,63 +21,6 @@ from grpc_utils import proto_to_tensor, tensor_to_proto
 logger = logging.getLogger(__name__)
 
 
-def discover_exit_checkpoints(
-    model_name: str,
-    exit_points: Optional[List[int]] = None,
-    checkpoint_dir: str = "checkpoints/early_exit_heads",
-) -> Dict[int, str]:
-    """Automatically discover checkpoint files for a model.
-    
-    Note: Discovered checkpoints contain training-time layer indices in their filenames.
-    The caller is responsible for mapping these to runtime exit points if needed.
-    
-    Args:
-        model_name: Name of the model (e.g., 'resnet18', 'alexnet')
-        exit_points: List of exit layer indices (currently unused, kept for API compatibility).
-        checkpoint_dir: Directory containing checkpoint files
-        
-    Returns:
-        Dictionary mapping training-time layer index to checkpoint file path
-    """
-    checkpoint_mapping = {}
-    
-    if not os.path.exists(checkpoint_dir):
-        logger.warning(f"Checkpoint directory does not exist: {checkpoint_dir}")
-        return checkpoint_mapping
-    
-    # List all checkpoint files for this model
-    checkpoint_files = [
-        f for f in os.listdir(checkpoint_dir)
-        if f.startswith(f"{model_name}_exit") and f.endswith(".pt")
-    ]
-    
-    if not checkpoint_files:
-        logger.warning(f"No checkpoint files found for model '{model_name}' in {checkpoint_dir}")
-        return checkpoint_mapping
-    
-    # Extract exit indices from filenames and create mapping
-    for filename in checkpoint_files:
-        try:
-            # Parse filename: "{model_name}_exit{layer_index}.pt"
-            exit_idx_str = filename.replace(f"{model_name}_exit", "").replace(".pt", "")
-            exit_idx = int(exit_idx_str)
-            
-            # Load ALL available checkpoints - we'll match them to runtime exit points later
-            checkpoint_path = os.path.join(checkpoint_dir, filename)
-            checkpoint_mapping[exit_idx] = checkpoint_path
-            logger.info(f"Discovered checkpoint for exit {exit_idx}: {checkpoint_path}")
-        except ValueError:
-            logger.warning(f"Could not parse exit index from filename: {filename}")
-            continue
-    
-    if checkpoint_mapping:
-        logger.info(f"Loaded {len(checkpoint_mapping)} checkpoint(s) for {model_name}: {sorted(checkpoint_mapping.keys())}")
-    else:
-        logger.warning(f"No valid checkpoints found for {model_name} with exit points {exit_points}")
-    
-    return checkpoint_mapping
-
-
 @dataclass
 class EarlyExitConfig:
     """Configuration for optional early exits.
@@ -131,105 +74,82 @@ def _is_residual_block(module: nn.Module) -> bool:
 
 
 class EarlyExitHead(nn.Module):
-    """Early exit head following the architecture from the paper.
+    """A lightweight classifier head attached to an intermediate activation.
     
-    Architecture (as shown in diagram):
-    1. Batch Normalization - normalize intermediate features
-    2. ReLU - activation
-    3. Global Average Pooling - spatial reduction
-    4. Optional adapter layer - project features to target dimension
-    5. Two parallel branches:
-       - Confidence head: FC -> Sigmoid (outputs confidence score h)
-       - Classifier head: FC -> Softmax (outputs class predictions ŷ)
+    Uses the original model's classifier (fc/classifier layer) for maximum accuracy.
+    Only adds global average pooling if the intermediate features are spatial (4D).
     """
 
     def __init__(
         self, 
-        num_classes: int,
-        target_dim: Optional[int] = 512,  # Target dimension for adapter (512 for ResNet)
+        num_classes: int, 
+        hidden_dim: Optional[int] = None,
+        pretrained_classifier: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.num_classes = num_classes
-        self.target_dim = target_dim
+        self.hidden_dim = hidden_dim
+        self.pretrained_classifier = pretrained_classifier
         self._initialized = False
-        
-        # Architecture components
-        self.bn: Optional[nn.BatchNorm2d] = None
-        self.relu: nn.ReLU = nn.ReLU()
         self.pool: Optional[nn.AdaptiveAvgPool2d] = None
-        self.adapter: Optional[nn.Linear] = None  # Projects features to target_dim
-        self.fc_confidence: Optional[nn.Linear] = None  # For confidence score
-        self.fc_classifier: Optional[nn.Linear] = None  # For class predictions
+        self.classifier: Optional[nn.Module] = None
 
     def _initialize(self, x: torch.Tensor) -> None:
-        device = x.device
+        device = x.device  # Get the device from input tensor
         
-        # Add batch norm and pooling if features are spatial (4D)
+        # Always add global average pooling if features are spatial (4D)
         if x.dim() > 2:
-            num_channels = x.shape[1]
-            self.bn = nn.BatchNorm2d(num_channels).to(device)
             self.pool = nn.AdaptiveAvgPool2d((1, 1)).to(device)
-            in_features = num_channels
+            in_features = x.shape[1]
         else:
-            self.bn = None
             self.pool = None
             in_features = x.shape[1]
+        if self.pretrained_classifier is not None:
+            # Get expected input features for the classifier
+            if isinstance(self.pretrained_classifier, nn.Linear):
+                expected_features = self.pretrained_classifier.in_features
+            else:
+                # For Sequential classifiers, find the first Linear layer
+                expected_features = None
+                for module in self.pretrained_classifier.modules():
+                    if isinstance(module, nn.Linear):
+                        expected_features = module.in_features
+                        break
+                
+                if expected_features is None:
+                    raise ValueError("Could not determine input features for pretrained classifier")
+            
+            # If dimensions don't match, add an adapter layer
+            if in_features != expected_features:
+                logger.info(f"Adding adapter layer: {in_features} -> {expected_features} features")
+                self.adapter = nn.Linear(in_features, expected_features).to(device)
+                self.register_module("adapter", self.adapter)
+            else:
+                self.adapter = None
+            
+            self.classifier = self.pretrained_classifier.to(device)
+            logger.info(f"Using pretrained classifier (input: {in_features} -> adapted: {expected_features} -> output: {self.num_classes})")
         
-        # Add adapter layer if intermediate features < target dimension
-        if self.target_dim is not None and in_features < self.target_dim:
-            self.adapter = nn.Linear(in_features, self.target_dim).to(device)
-            classifier_in_features = self.target_dim
-            logger.info(f"Added adapter layer: {in_features} -> {self.target_dim}")
-        else:
-            self.adapter = None
-            classifier_in_features = in_features
-        
-        # Two parallel heads
-        self.fc_confidence = nn.Linear(classifier_in_features, 1).to(device)  # Confidence score
-        self.fc_classifier = nn.Linear(classifier_in_features, self.num_classes).to(device)  # Class predictions
         self._initialized = True
+        self.register_module("classifier", self.classifier)
+        if self.pool is not None:
+            self.register_module("pool", self.pool)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass returning class logits (for training compatibility).
-        
-        Note: During training we only use the classifier output.
-        The confidence head is available but not used in standard cross-entropy loss.
-        """
         if not self._initialized:
             self._initialize(x)
-            
-            # Load pending checkpoint if available
-            if hasattr(self, '_pending_checkpoint'):
-                try:
-                    self.load_state_dict(self._pending_checkpoint, strict=False)
-                    logger.info("✓ Loaded checkpoint weights after initialization")
-                    delattr(self, '_pending_checkpoint')
-                except Exception as exc:
-                    logger.error(f"Failed to load pending checkpoint: {exc}")
 
-        # Batch normalization (if spatial features)
-        if self.bn is not None:
-            x = self.bn(x)
-        
-        # ReLU activation
-        x = self.relu(x)
-        
-        # Global average pooling (if spatial features)
         if self.pool is not None:
             x = self.pool(x)
 
-        # Flatten to 2D
         if x.dim() > 2:
             x = torch.flatten(x, 1)
 
-        # Apply adapter if present (project to target dimension)
-        if self.adapter is not None:
+        # Apply adapter if needed to match classifier input dimensions
+        if hasattr(self, 'adapter') and self.adapter is not None:
             x = self.adapter(x)
 
-        # Return classifier logits (confidence head not used during training)
-        x = self.fc_classifier(x)
-
-        return x
+        return self.classifier(x)
 
 
 class EarlyExitInferenceClient(DNNInferenceClient):
@@ -258,40 +178,16 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         self.num_classes = self._infer_num_classes()
         self.exit_points = self._determine_exit_points()
         
-        # Auto-discover checkpoints if not explicitly provided
-        if not self.exit_config.head_state_dicts and self.exit_points:
-            model_name = getattr(dnn_surgery, 'model_name', None)
-            if model_name:
-                logger.info(f"Auto-discovering checkpoints for {model_name} at runtime exit points {self.exit_points}")
-                discovered_checkpoints = discover_exit_checkpoints(
-                    model_name=model_name,
-                    exit_points=self.exit_points,
-                )
-                
-                if discovered_checkpoints:
-                    # Only use checkpoints that match runtime exit points EXACTLY
-                    # Checkpoints contain training-time layer indices - they must match runtime indices
-                    matched_checkpoints = {}
-                    for runtime_idx in self.exit_points:
-                        if runtime_idx in discovered_checkpoints:
-                            matched_checkpoints[runtime_idx] = discovered_checkpoints[runtime_idx]
-                            logger.info(f"✓ Matched checkpoint for exit point {runtime_idx}: {discovered_checkpoints[runtime_idx]}")
-                        else:
-                            logger.warning(f"✗ No checkpoint found for runtime exit point {runtime_idx} - will use random weights")
-                    
-                    if matched_checkpoints:
-                        self.exit_config.head_state_dicts = matched_checkpoints
-                        logger.info(f"Successfully loaded {len(matched_checkpoints)}/{len(self.exit_points)} checkpoint(s)")
-                    else:
-                        logger.warning(f"No matching checkpoints found for runtime exit points {self.exit_points}")
-                        logger.warning(f"Available checkpoints: {sorted(discovered_checkpoints.keys())}")
-                        logger.warning(f"You may need to retrain exit heads at the current runtime exit points")
-                else:
-                    logger.warning(f"No checkpoints found for {model_name} - early exits will use random weights!")
+        # Extract the pretrained classifier from the base model
+        pretrained_classifier = self._extract_classifier()
         
-        # Create simple exit heads (single linear layer after global avg pooling)
+        # Create exit heads using the pretrained classifier
         self.exit_heads: Dict[int, EarlyExitHead] = {
-            idx: EarlyExitHead(self.num_classes).eval()
+            idx: EarlyExitHead(
+                self.num_classes, 
+                hidden_dim=self.exit_config.head_hidden_dim,
+                pretrained_classifier=pretrained_classifier  # Reuse the trained classifier!
+            ).eval()
             for idx in self.exit_points
         }
         self.exit_thresholds: Dict[int, float] = {
@@ -317,6 +213,42 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                     return module.out_features
 
         raise ValueError("Unable to infer number of classes from model")
+    
+    def _extract_classifier(self) -> Optional[nn.Module]:
+        """Extract the pretrained classifier from the base model.
+        
+        Returns a copy of the final classifier layer that can be reused
+        for early exit heads. This ensures high accuracy predictions.
+        """
+        import copy
+        
+        # Try to find fc layer (ResNet, etc.)
+        if hasattr(self.base_model, "fc") and isinstance(self.base_model.fc, nn.Linear):
+            classifier = copy.deepcopy(self.base_model.fc)
+            logger.info("Extracted pretrained 'fc' classifier for early exits")
+            return classifier
+        
+        # Try to find classifier (AlexNet, VGG, etc.)
+        if hasattr(self.base_model, "classifier"):
+            classifier_module = self.base_model.classifier
+            
+            # If it's a Sequential, we want the final Linear layer
+            if isinstance(classifier_module, nn.Sequential):
+                # Find the last Linear layer
+                for module in reversed(list(classifier_module)):
+                    if isinstance(module, nn.Linear):
+                        classifier = copy.deepcopy(module)
+                        logger.info("Extracted pretrained classifier from Sequential for early exits")
+                        return classifier
+            
+            # If it's directly a Linear layer
+            elif isinstance(classifier_module, nn.Linear):
+                classifier = copy.deepcopy(classifier_module)
+                logger.info("Extracted pretrained Linear classifier for early exits")
+                return classifier
+        
+        logger.warning("Could not extract pretrained classifier - early exit heads will use random initialization!")
+        return None
 
     def _determine_exit_points(self) -> List[int]:
         if self.exit_config.exit_points is not None:
@@ -355,16 +287,9 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         return candidate_indices
 
     def _load_head_weights(self) -> None:
-        """Load pre-trained weights for exit heads.
-        
-        Note: Weights are stored and will be loaded after head initialization.
-        This is necessary because EarlyExitHead uses lazy initialization.
-        """
         if not self.exit_config.head_state_dicts:
-            logger.warning("No checkpoint paths provided - exit heads will use random weights!")
             return
 
-        loaded_count = 0
         for idx, path in self.exit_config.head_state_dicts.items():
             if idx not in self.exit_heads:
                 logger.warning("Skipping state dict for undefined exit head at index %s", idx)
@@ -373,21 +298,11 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                 logger.warning("State dict path does not exist for head %s: %s", idx, path)
                 continue
             try:
-                state_dict = torch.load(path, map_location="cpu", weights_only=True)
-                
-                # Store checkpoint to load after initialization
-                if not hasattr(self.exit_heads[idx], '_pending_checkpoint'):
-                    self.exit_heads[idx]._pending_checkpoint = state_dict  # type: ignore[attr-defined]
-                    logger.info("✓ Queued checkpoint for exit %s from %s (will load after initialization)", idx, path)
-                    loaded_count += 1
-                    
+                state_dict = torch.load(path, map_location="cpu")
+                self.exit_heads[idx].load_state_dict(state_dict)
+                logger.info("Loaded pre-trained head weights for exit %s from %s", idx, path)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.error("Failed to load head weights for exit %s: %s", idx, exc)
-        
-        if loaded_count > 0:
-            logger.info(f"Successfully queued {loaded_count}/{len(self.exit_config.head_state_dicts)} checkpoint(s) for loading")
-        else:
-            logger.warning("No checkpoints were successfully queued!")
 
     def _forward_edge_without_exits(self, sample: torch.Tensor) -> Tuple[torch.Tensor, EarlyExitDecision, float]:
         if self.edge_model is None:
@@ -714,15 +629,11 @@ def find_optimal_split_with_early_exit(
     server_address: str,
     exit_config: EarlyExitConfig,
 ) -> Tuple[int, Dict]:
-    """Find optimal BASELINE split point (without early exits).
+    """Find optimal split point for baseline inference (without early exits).
     
-    Uses standard NeuroSurgeon profiling to find the split that minimizes latency
-    for the worst-case scenario (when early exits don't trigger). Early exits are
-    then applied opportunistically at runtime on top of this baseline split.
-    
-    This ensures good performance regardless of confidence levels:
-    - Low confidence → uses baseline optimal split (profiled here)
-    - High confidence → early exits reduce latency further
+    Early exits are used opportunistically during inference, but the split point
+    is optimized for the case when confidence is NOT high enough to exit early.
+    This ensures good performance regardless of whether early exits trigger.
     
     Important: Split point must be at least 1 so there are edge layers for exit heads.
 
@@ -730,7 +641,7 @@ def find_optimal_split_with_early_exit(
         dnn_surgery: DNNSurgery instance with the model to split.
         input_tensor: Input tensor for profiling.
         server_address: Server address for distributed inference.
-        exit_config: Early exit configuration (not used for baseline profiling).
+        exit_config: Early exit configuration (not used for split selection).
 
     Returns:
         Tuple of (optimal_split_point, timing_analysis).
@@ -738,26 +649,18 @@ def find_optimal_split_with_early_exit(
     from dnn_inference_client import DNNInferenceClient
     
     num_splits = len(dnn_surgery.splitter.layers) + 1
-    logger.info("=== Finding Baseline Optimal Split Point (without Early Exits) ===")
-    logger.info("Using NeuroSurgeon profiling for worst-case (no early exit) scenario")
-    logger.info("Early exits will be applied opportunistically at runtime on top of this baseline")
+    logger.info("=== Finding Optimal Split Point (Baseline without Early Exits) ===")
+    logger.info("Early exits will be used opportunistically at runtime, but split point optimized for baseline case")
     
-    # CRITICAL: Determine minimum split point based on exit point requirements
-    # If explicit exit points are provided, we need enough edge layers to accommodate them
-    min_split = 1  # Default minimum
-    if exit_config.exit_points:
-        # Need split point > max exit point to ensure all exits are on the edge
-        max_exit_point = max(exit_config.exit_points)
-        min_split = max_exit_point + 1
-        logger.info(f"Exit points specified: {exit_config.exit_points} - minimum split must be > {max_exit_point}")
-    
-    logger.info(f"Testing {num_splits - min_split} split points ({min_split} to {num_splits - 1}) - ensuring exit heads can be placed on edge")
+    # CRITICAL: Skip split point 0 - early exits require edge layers
+    min_split = 1
+    logger.info(f"Testing {num_splits - min_split} split points ({min_split} to {num_splits - 1}) - skipping split point 0 (no edge layers for exit heads)")
     
     split_analysis = {}
     
-    # Profile each valid split point WITHOUT early exits (baseline)
+    # Profile each valid split point WITHOUT early exits
     for split_point in range(min_split, num_splits):
-        logger.info(f"Testing baseline split point {split_point}/{num_splits - 1}...")
+        logger.info(f"Testing split point {split_point}/{num_splits - 1} (baseline)...")
         
         dnn_surgery.splitter.set_split_point(split_point)
         edge_model = dnn_surgery.splitter.get_edge_model(
@@ -765,7 +668,7 @@ def find_optimal_split_with_early_exit(
             quantizer=dnn_surgery.quantizer,
         )
         
-        # Use standard client WITHOUT early exits for baseline profiling
+        # Use standard client WITHOUT early exits
         client = DNNInferenceClient(server_address, edge_model)
         requires_cloud = dnn_surgery.splitter.get_cloud_model() is not None
         dnn_surgery._send_split_decision_to_server(split_point, server_address)  # pylint: disable=protected-access
@@ -797,15 +700,15 @@ def find_optimal_split_with_early_exit(
                 'total_time': float('inf'),
             }
     
-    # Find optimal split among valid candidates (minimum baseline time)
+    # Find optimal split among valid candidates
     optimal_split = min(split_analysis.keys(), key=lambda k: split_analysis[k]['total_time'])
     min_time = split_analysis[optimal_split]['total_time']
     
     logger.info("=== Baseline Optimal Split Point Found ===")
-    logger.info(f"Optimal baseline split: {optimal_split} with time: {min_time:.1f}ms (without early exits)")
-    logger.info("Early exits will be applied opportunistically at runtime to further reduce latency")
+    logger.info(f"Optimal split: {optimal_split} with baseline time: {min_time:.1f}ms")
+    logger.info("Early exits will be attempted at runtime as an optimization")
     
-    # Configure server with optimal baseline split
+    # Configure server with optimal split
     dnn_surgery._send_split_decision_to_server(optimal_split, server_address)  # pylint: disable=protected-access
     
     from visualization import build_split_timing_summary, format_split_summary
