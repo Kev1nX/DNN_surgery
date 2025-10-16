@@ -60,11 +60,10 @@ def discover_exit_checkpoints(
             exit_idx_str = filename.replace(f"{model_name}_exit", "").replace(".pt", "")
             exit_idx = int(exit_idx_str)
             
-            # Only include if no explicit exit_points or if in the list
-            if exit_points is None or exit_idx in exit_points:
-                checkpoint_path = os.path.join(checkpoint_dir, filename)
-                checkpoint_mapping[exit_idx] = checkpoint_path
-                logger.info(f"Discovered checkpoint for exit {exit_idx}: {checkpoint_path}")
+            # Load ALL available checkpoints - we'll match them to runtime exit points later
+            checkpoint_path = os.path.join(checkpoint_dir, filename)
+            checkpoint_mapping[exit_idx] = checkpoint_path
+            logger.info(f"Discovered checkpoint for exit {exit_idx}: {checkpoint_path}")
         except ValueError:
             logger.warning(f"Could not parse exit index from filename: {filename}")
             continue
