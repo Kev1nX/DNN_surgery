@@ -74,85 +74,78 @@ def _is_residual_block(module: nn.Module) -> bool:
 
 
 class EarlyExitHead(nn.Module):
-    """Early exit head that reuses the model's classifier.
+    """Early exit head that reuses the model's pretrained classifier.
     
     Simple architecture:
-    1. Global Average Pooling - spatial reduction (if needed)
+    1. Global Average Pooling - spatial reduction (always needed for intermediate features)
     2. Flatten
-    3. Optional adapter layer - project features to match classifier input dimension
+    3. Optional adapter layer - project features to match classifier input dimension (if needed)
     4. Reused pretrained classifier head
     
     This is lightweight and leverages the pretrained classifier directly.
+    No lazy initialization - we know the classifier dimensions upfront.
     """
 
     def __init__(
         self, 
         num_classes: int,
-        pretrained_classifier: Optional[nn.Linear] = None,
+        pretrained_classifier: nn.Linear,
     ):
+        """Initialize early exit head.
+        
+        Args:
+            num_classes: Number of output classes
+            pretrained_classifier: The model's pretrained classifier to reuse
+        """
         super().__init__()
         self.num_classes = num_classes
-        self.pretrained_classifier = pretrained_classifier
-        self._initialized = False
         
-        # Architecture components (minimal)
-        self.pool: Optional[nn.AdaptiveAvgPool2d] = None
+        # Always need global average pooling for intermediate spatial features
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Reuse the pretrained classifier directly (no copy, same weights)
+        self.fc_classifier = pretrained_classifier
+        
+        # Adapter will be added if needed (dimensions known after first forward pass)
         self.adapter: Optional[nn.Linear] = None
-        self.fc_classifier: Optional[nn.Linear] = None
-
-    def _initialize(self, x: torch.Tensor) -> None:
-        device = x.device
+        self._adapter_initialized = False
         
-        # Add pooling if features are spatial (4D)
-        if x.dim() > 2:
-            self.pool = nn.AdaptiveAvgPool2d((1, 1)).to(device)
-            in_features = x.shape[1]
-        else:
-            self.pool = None
-            in_features = x.shape[1]
-        
-        # If we have pretrained classifier, use it directly or with adapter
-        if self.pretrained_classifier is not None:
-            target_dim = self.pretrained_classifier.in_features
-            
-            # Add adapter if intermediate features don't match classifier input
-            if in_features != target_dim:
-                self.adapter = nn.Linear(in_features, target_dim).to(device)
-                logger.info(f"Added adapter layer: {in_features} -> {target_dim} (to match pretrained classifier)")
-            else:
-                self.adapter = None
-                logger.info(f"Using pretrained classifier directly (dimensions match: {in_features})")
-            
-            # Use the pretrained classifier
-            self.fc_classifier = self.pretrained_classifier
-        else:
-            # No pretrained classifier - create new one
-            self.adapter = None
-            self.fc_classifier = nn.Linear(in_features, self.num_classes).to(device)
-            logger.warning(f"No pretrained classifier available - created new classifier: {in_features} -> {self.num_classes}")
-        
-        self._initialized = True
+        logger.info(f"Created exit head reusing pretrained classifier (expects {pretrained_classifier.in_features} features)")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass returning class logits."""
-        if not self._initialized:
-            self._initialize(x)
-
-        # Global average pooling (if spatial features)
-        if self.pool is not None:
-            x = self.pool(x)
-
+        
+        # Global average pooling (spatial features -> 1x1)
+        x = self.pool(x)
+        
         # Flatten to 2D
-        if x.dim() > 2:
-            x = torch.flatten(x, 1)
-
+        x = torch.flatten(x, 1)
+        
+        # Initialize adapter on first forward pass if dimensions don't match
+        if not self._adapter_initialized:
+            in_features = x.shape[1]
+            target_dim = self.fc_classifier.in_features
+            
+            if in_features != target_dim:
+                # Need adapter to project features
+                self.adapter = nn.Linear(in_features, target_dim).to(x.device)
+                # Initialize adapter with small random weights (better than uninitialized)
+                nn.init.xavier_uniform_(self.adapter.weight)
+                nn.init.zeros_(self.adapter.bias)
+                logger.info(f"Initialized adapter: {in_features} -> {target_dim} (to match pretrained classifier)")
+            else:
+                self.adapter = None
+                logger.info(f"No adapter needed - dimensions match: {in_features}")
+            
+            self._adapter_initialized = True
+        
         # Apply adapter if present
         if self.adapter is not None:
             x = self.adapter(x)
-
-        # Return classifier logits
+        
+        # Use pretrained classifier
         x = self.fc_classifier(x)
-
+        
         return x
 
 
@@ -182,15 +175,16 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         self.num_classes = self._infer_num_classes()
         self.exit_points = self._determine_exit_points()
         
-        # Get pretrained classifier to reuse in exit heads
-        pretrained_classifier = None
-        if hasattr(self.base_model, 'fc') and isinstance(self.base_model.fc, nn.Linear):
-            pretrained_classifier = self.base_model.fc
-            logger.info(f"Using pretrained classifier from base model: {pretrained_classifier.in_features} -> {pretrained_classifier.out_features}")
+        # Get pretrained classifier to reuse in exit heads (required!)
+        if not hasattr(self.base_model, 'fc') or not isinstance(self.base_model.fc, nn.Linear):
+            raise ValueError(f"Model {self.base_model.__class__.__name__} must have a 'fc' classifier for early exits")
+        
+        pretrained_classifier = self.base_model.fc
+        logger.info(f"Using pretrained classifier from base model: {pretrained_classifier.in_features} -> {pretrained_classifier.out_features}")
         
         # Create exit heads that reuse the pretrained classifier
         self.exit_heads: Dict[int, EarlyExitHead] = {
-            idx: EarlyExitHead(self.num_classes, pretrained_classifier=pretrained_classifier).eval()
+            idx: EarlyExitHead(self.num_classes, pretrained_classifier).eval()
             for idx in self.exit_points
         }
         self.exit_thresholds: Dict[int, float] = {
