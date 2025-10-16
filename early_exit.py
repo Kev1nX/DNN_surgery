@@ -258,22 +258,59 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         return candidate_indices
 
     def _load_head_weights(self) -> None:
-        if not self.exit_config.head_state_dicts:
-            return
-
-        for idx, path in self.exit_config.head_state_dicts.items():
-            if idx not in self.exit_heads:
-                logger.warning("Skipping state dict for undefined exit head at index %s", idx)
-                continue
-            if not os.path.exists(path):
-                logger.warning("State dict path does not exist for head %s: %s", idx, path)
-                continue
-            try:
-                state_dict = torch.load(path, map_location="cpu")
-                self.exit_heads[idx].load_state_dict(state_dict)
-                logger.info("Loaded pre-trained head weights for exit %s from %s", idx, path)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.error("Failed to load head weights for exit %s: %s", idx, exc)
+        """Load trained weights from checkpoints, or initialize from pretrained classifier if not found."""
+        # Get pretrained classifier from base model for fallback initialization
+        pretrained_fc = None
+        if hasattr(self.base_model, 'fc') and isinstance(self.base_model.fc, nn.Linear):
+            pretrained_fc = self.base_model.fc
+            logger.info(f"Found pretrained classifier: {pretrained_fc.in_features} -> {pretrained_fc.out_features}")
+        
+        for idx in self.exit_heads:
+            exit_head = self.exit_heads[idx]
+            checkpoint_path = self.exit_config.head_state_dicts.get(idx)
+            loaded_from_checkpoint = False
+            
+            # Try to load from checkpoint if path is provided and exists
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                try:
+                    state_dict = torch.load(checkpoint_path, map_location="cpu")
+                    exit_head.load_state_dict(state_dict)
+                    logger.info("✓ Loaded trained weights for exit %s from %s", idx, checkpoint_path)
+                    loaded_from_checkpoint = True
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning("Failed to load checkpoint for exit %s: %s - will use pretrained classifier", idx, exc)
+            
+            # If no checkpoint loaded, initialize from pretrained classifier
+            if not loaded_from_checkpoint:
+                # Need to initialize the head first by doing a forward pass
+                if not exit_head._initialized:
+                    # Get a sample feature from this exit point
+                    with torch.no_grad():
+                        sample_input = torch.randn(1, 3, 224, 224).to(next(self.base_model.parameters()).device)
+                        activation = sample_input
+                        
+                        # Forward through base model to this exit point
+                        for layer_idx, layer in enumerate(self.base_model.children()):
+                            if layer_idx > idx:
+                                break
+                            if isinstance(layer, nn.Linear) and activation.dim() > 2:
+                                activation = torch.flatten(activation, 1)
+                            activation = layer(activation)
+                        
+                        # Initialize the exit head with this feature
+                        _ = exit_head(activation)
+                
+                # Copy pretrained classifier weights if dimensions match
+                if pretrained_fc is not None and exit_head.fc_classifier is not None:
+                    if exit_head.fc_classifier.in_features == pretrained_fc.in_features:
+                        exit_head.fc_classifier.weight.data.copy_(pretrained_fc.weight.data)
+                        exit_head.fc_classifier.bias.data.copy_(pretrained_fc.bias.data)
+                        logger.info("✓ Initialized exit %s with pretrained classifier weights", idx)
+                    else:
+                        logger.warning("Exit %s classifier dimension (%d) doesn't match pretrained classifier (%d) - using random initialization",
+                                     idx, exit_head.fc_classifier.in_features, pretrained_fc.in_features)
+                else:
+                    logger.warning("No pretrained classifier available for exit %s - using random initialization", idx)
 
     def _forward_edge_without_exits(self, sample: torch.Tensor) -> Tuple[torch.Tensor, EarlyExitDecision, float]:
         if self.edge_model is None:
