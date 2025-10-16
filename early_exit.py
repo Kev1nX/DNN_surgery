@@ -286,6 +286,9 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                 if not exit_head._initialized:
                     # Get a sample feature from this exit point
                     with torch.no_grad():
+                        # Set exit head to eval mode to avoid BatchNorm issues with batch_size=1
+                        exit_head.eval()
+                        
                         sample_input = torch.randn(1, 3, 224, 224).to(next(self.base_model.parameters()).device)
                         activation = sample_input
                         
