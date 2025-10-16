@@ -307,27 +307,34 @@ class EarlyExitInferenceClient(DNNInferenceClient):
             logger.info(f"Using explicit exit points: {explicit}")
             return explicit
 
-        if self.edge_model is None or not hasattr(self.edge_model, "layers"):
-            return []
+        # CRITICAL: Use FULL MODEL structure to match training exit point detection
+        # Training uses model.children(), so we must use the same indexing
+        # This ensures checkpoint files (e.g., resnet50_exit4.pt) map correctly
+        full_model_layers = list(self.base_model.children())
+        num_full_layers = len(full_model_layers)
+        logger.info(f"Full model has {num_full_layers} layers, determining exit points...")
 
-        num_layers = len(self.edge_model.layers)
-        logger.info(f"Edge model has {num_layers} layers, determining exit points...")
-
-        # Try to find residual blocks first
+        # Try to find residual blocks first (same as training)
         candidate_indices = [
-            idx for idx, layer in enumerate(self.edge_model.layers) if _is_residual_block(layer)
+            idx for idx, layer in enumerate(full_model_layers) if _is_residual_block(layer)
         ]
         
         # If no residual blocks found, use evenly spaced layers as fallback
         if not candidate_indices:
             max_exits = self.exit_config.max_exits or 3
             # Place exits at 25%, 50%, 75% of the network
-            if num_layers == 0:
-                logger.warning(f"Edge model has 0 layers - cannot place exit points!")
+            if num_full_layers == 0:
+                logger.warning(f"Full model has 0 layers - cannot place exit points!")
                 return []
             
-            spacing = max(1, num_layers // (max_exits + 1))
-            candidate_indices = [spacing * (i + 1) for i in range(max_exits) if spacing * (i + 1) < num_layers]
+            spacing = max(1, num_full_layers // (max_exits + 1))
+            candidate_indices = [spacing * (i + 1) for i in range(max_exits) if spacing * (i + 1) < num_full_layers]
+
+        # Filter to only exit points that are within the edge model
+        if self.edge_model is not None and hasattr(self.edge_model, "layers"):
+            num_edge_layers = len(self.edge_model.layers)
+            candidate_indices = [idx for idx in candidate_indices if idx < num_edge_layers]
+            logger.info(f"Filtered to {len(candidate_indices)} exit points within edge model (split={num_edge_layers}): {candidate_indices}")
 
         if self.exit_config.max_exits is not None:
             candidate_indices = candidate_indices[: self.exit_config.max_exits]
