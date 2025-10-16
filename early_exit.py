@@ -176,10 +176,10 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         self.exit_points = self._determine_exit_points()
         
         # Get pretrained classifier to reuse in exit heads (required!)
-        if not hasattr(self.base_model, 'fc') or not isinstance(self.base_model.fc, nn.Linear):
-            raise ValueError(f"Model {self.base_model.__class__.__name__} must have a 'fc' classifier for early exits")
+        pretrained_classifier = self._get_pretrained_classifier()
+        if pretrained_classifier is None:
+            raise ValueError(f"Model {self.base_model.__class__.__name__} must have a linear classifier (fc or classifier) for early exits")
         
-        pretrained_classifier = self.base_model.fc
         logger.info(f"Using pretrained classifier from base model: {pretrained_classifier.in_features} -> {pretrained_classifier.out_features}")
         
         # Create exit heads that reuse the pretrained classifier
@@ -197,6 +197,32 @@ class EarlyExitInferenceClient(DNNInferenceClient):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _get_pretrained_classifier(self) -> Optional[nn.Linear]:
+        """Get the pretrained classifier from the base model.
+        
+        Supports different model architectures:
+        - ResNet, AlexNet, GoogLeNet, EfficientNet: use 'fc' attribute
+        - MobileNetV3: uses 'classifier' Sequential with final Linear layer
+        
+        Returns:
+            The pretrained Linear classifier, or None if not found
+        """
+        # Try 'fc' attribute first (ResNet, AlexNet, GoogLeNet, EfficientNet)
+        if hasattr(self.base_model, 'fc') and isinstance(self.base_model.fc, nn.Linear):
+            return self.base_model.fc
+        
+        # Try 'classifier' attribute (MobileNetV3, etc.)
+        classifier = getattr(self.base_model, 'classifier', None)
+        if isinstance(classifier, nn.Linear):
+            return classifier
+        if isinstance(classifier, nn.Sequential):
+            # Find the last Linear layer in the Sequential
+            for module in reversed(list(classifier.children())):
+                if isinstance(module, nn.Linear):
+                    return module
+        
+        return None
+    
     def _infer_num_classes(self) -> int:
         if hasattr(self.base_model, "fc") and isinstance(self.base_model.fc, nn.Linear):
             return self.base_model.fc.out_features
