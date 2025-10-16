@@ -21,6 +21,62 @@ from grpc_utils import proto_to_tensor, tensor_to_proto
 logger = logging.getLogger(__name__)
 
 
+def discover_exit_checkpoints(
+    model_name: str,
+    exit_points: Optional[List[int]] = None,
+    checkpoint_dir: str = "checkpoints/early_exit_heads",
+) -> Dict[int, str]:
+    """Automatically discover and map checkpoint files to exit points.
+    
+    Args:
+        model_name: Name of the model (e.g., 'resnet18', 'alexnet')
+        exit_points: List of exit layer indices to load checkpoints for.
+                    If None, will load all available checkpoints.
+        checkpoint_dir: Directory containing checkpoint files
+        
+    Returns:
+        Dictionary mapping exit layer index to checkpoint file path
+    """
+    checkpoint_mapping = {}
+    
+    if not os.path.exists(checkpoint_dir):
+        logger.warning(f"Checkpoint directory does not exist: {checkpoint_dir}")
+        return checkpoint_mapping
+    
+    # List all checkpoint files for this model
+    checkpoint_files = [
+        f for f in os.listdir(checkpoint_dir)
+        if f.startswith(f"{model_name}_exit") and f.endswith(".pt")
+    ]
+    
+    if not checkpoint_files:
+        logger.warning(f"No checkpoint files found for model '{model_name}' in {checkpoint_dir}")
+        return checkpoint_mapping
+    
+    # Extract exit indices from filenames and create mapping
+    for filename in checkpoint_files:
+        try:
+            # Parse filename: "{model_name}_exit{layer_index}.pt"
+            exit_idx_str = filename.replace(f"{model_name}_exit", "").replace(".pt", "")
+            exit_idx = int(exit_idx_str)
+            
+            # Only include if no explicit exit_points or if in the list
+            if exit_points is None or exit_idx in exit_points:
+                checkpoint_path = os.path.join(checkpoint_dir, filename)
+                checkpoint_mapping[exit_idx] = checkpoint_path
+                logger.info(f"Discovered checkpoint for exit {exit_idx}: {checkpoint_path}")
+        except ValueError:
+            logger.warning(f"Could not parse exit index from filename: {filename}")
+            continue
+    
+    if checkpoint_mapping:
+        logger.info(f"Loaded {len(checkpoint_mapping)} checkpoint(s) for {model_name}: {sorted(checkpoint_mapping.keys())}")
+    else:
+        logger.warning(f"No valid checkpoints found for {model_name} with exit points {exit_points}")
+    
+    return checkpoint_mapping
+
+
 @dataclass
 class EarlyExitConfig:
     """Configuration for optional early exits.
@@ -140,6 +196,15 @@ class EarlyExitHead(nn.Module):
         """
         if not self._initialized:
             self._initialize(x)
+            
+            # Load pending checkpoint if available
+            if hasattr(self, '_pending_checkpoint'):
+                try:
+                    self.load_state_dict(self._pending_checkpoint, strict=False)
+                    logger.info("✓ Loaded checkpoint weights after initialization")
+                    delattr(self, '_pending_checkpoint')
+                except Exception as exc:
+                    logger.error(f"Failed to load pending checkpoint: {exc}")
 
         # Batch normalization (if spatial features)
         if self.bn is not None:
@@ -191,6 +256,20 @@ class EarlyExitInferenceClient(DNNInferenceClient):
 
         self.num_classes = self._infer_num_classes()
         self.exit_points = self._determine_exit_points()
+        
+        # Auto-discover checkpoints if not explicitly provided
+        if not self.exit_config.head_state_dicts and self.exit_points:
+            model_name = getattr(dnn_surgery, 'model_name', None)
+            if model_name:
+                logger.info(f"Auto-discovering checkpoints for {model_name} at exit points {self.exit_points}")
+                self.exit_config.head_state_dicts = discover_exit_checkpoints(
+                    model_name=model_name,
+                    exit_points=self.exit_points,
+                )
+                if self.exit_config.head_state_dicts:
+                    logger.info(f"Auto-loaded {len(self.exit_config.head_state_dicts)} checkpoint paths")
+                else:
+                    logger.warning(f"No checkpoints found for {model_name} - early exits will use random weights!")
         
         # Create simple exit heads (single linear layer after global avg pooling)
         self.exit_heads: Dict[int, EarlyExitHead] = {
@@ -258,9 +337,16 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         return candidate_indices
 
     def _load_head_weights(self) -> None:
+        """Load pre-trained weights for exit heads.
+        
+        Note: Weights are stored and will be loaded after head initialization.
+        This is necessary because EarlyExitHead uses lazy initialization.
+        """
         if not self.exit_config.head_state_dicts:
+            logger.warning("No checkpoint paths provided - exit heads will use random weights!")
             return
 
+        loaded_count = 0
         for idx, path in self.exit_config.head_state_dicts.items():
             if idx not in self.exit_heads:
                 logger.warning("Skipping state dict for undefined exit head at index %s", idx)
@@ -269,11 +355,21 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                 logger.warning("State dict path does not exist for head %s: %s", idx, path)
                 continue
             try:
-                state_dict = torch.load(path, map_location="cpu")
-                self.exit_heads[idx].load_state_dict(state_dict)
-                logger.info("Loaded pre-trained head weights for exit %s from %s", idx, path)
+                state_dict = torch.load(path, map_location="cpu", weights_only=True)
+                
+                # Store checkpoint to load after initialization
+                if not hasattr(self.exit_heads[idx], '_pending_checkpoint'):
+                    self.exit_heads[idx]._pending_checkpoint = state_dict  # type: ignore[attr-defined]
+                    logger.info("✓ Queued checkpoint for exit %s from %s (will load after initialization)", idx, path)
+                    loaded_count += 1
+                    
             except Exception as exc:  # pylint: disable=broad-except
                 logger.error("Failed to load head weights for exit %s: %s", idx, exc)
+        
+        if loaded_count > 0:
+            logger.info(f"Successfully queued {loaded_count}/{len(self.exit_config.head_state_dicts)} checkpoint(s) for loading")
+        else:
+            logger.warning("No checkpoints were successfully queued!")
 
     def _forward_edge_without_exits(self, sample: torch.Tensor) -> Tuple[torch.Tensor, EarlyExitDecision, float]:
         if self.edge_model is None:
