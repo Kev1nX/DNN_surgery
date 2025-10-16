@@ -262,26 +262,30 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         if not self.exit_config.head_state_dicts and self.exit_points:
             model_name = getattr(dnn_surgery, 'model_name', None)
             if model_name:
-                logger.info(f"Auto-discovering checkpoints for {model_name} at exit points {self.exit_points}")
+                logger.info(f"Auto-discovering checkpoints for {model_name} at runtime exit points {self.exit_points}")
                 discovered_checkpoints = discover_exit_checkpoints(
                     model_name=model_name,
                     exit_points=self.exit_points,
                 )
                 
                 if discovered_checkpoints:
-                    # Map discovered checkpoints to runtime exit points by position
-                    # Discovered keys are training-time layer indices, runtime keys are current split indices
-                    sorted_discovered = sorted(discovered_checkpoints.items())
-                    sorted_runtime = sorted(self.exit_points)
-                    
-                    # Match by position: first checkpoint -> first exit point, etc.
+                    # Only use checkpoints that match runtime exit points EXACTLY
+                    # Checkpoints contain training-time layer indices - they must match runtime indices
                     matched_checkpoints = {}
-                    for runtime_idx, (_, checkpoint_path) in zip(sorted_runtime, sorted_discovered):
-                        matched_checkpoints[runtime_idx] = checkpoint_path
-                        logger.info(f"Mapped checkpoint to runtime exit point {runtime_idx}: {checkpoint_path}")
+                    for runtime_idx in self.exit_points:
+                        if runtime_idx in discovered_checkpoints:
+                            matched_checkpoints[runtime_idx] = discovered_checkpoints[runtime_idx]
+                            logger.info(f"✓ Matched checkpoint for exit point {runtime_idx}: {discovered_checkpoints[runtime_idx]}")
+                        else:
+                            logger.warning(f"✗ No checkpoint found for runtime exit point {runtime_idx} - will use random weights")
                     
-                    self.exit_config.head_state_dicts = matched_checkpoints
-                    logger.info(f"Successfully mapped {len(matched_checkpoints)} checkpoint(s) to runtime exit points")
+                    if matched_checkpoints:
+                        self.exit_config.head_state_dicts = matched_checkpoints
+                        logger.info(f"Successfully loaded {len(matched_checkpoints)}/{len(self.exit_points)} checkpoint(s)")
+                    else:
+                        logger.warning(f"No matching checkpoints found for runtime exit points {self.exit_points}")
+                        logger.warning(f"Available checkpoints: {sorted(discovered_checkpoints.keys())}")
+                        logger.warning(f"You may need to retrain exit heads at the current runtime exit points")
                 else:
                     logger.warning(f"No checkpoints found for {model_name} - early exits will use random weights!")
         
@@ -710,11 +714,15 @@ def find_optimal_split_with_early_exit(
     server_address: str,
     exit_config: EarlyExitConfig,
 ) -> Tuple[int, Dict]:
-    """Find optimal split point for baseline inference (without early exits).
+    """Find optimal BASELINE split point (without early exits).
     
-    Early exits are used opportunistically during inference, but the split point
-    is optimized for the case when confidence is NOT high enough to exit early.
-    This ensures good performance regardless of whether early exits trigger.
+    Uses standard NeuroSurgeon profiling to find the split that minimizes latency
+    for the worst-case scenario (when early exits don't trigger). Early exits are
+    then applied opportunistically at runtime on top of this baseline split.
+    
+    This ensures good performance regardless of confidence levels:
+    - Low confidence → uses baseline optimal split (profiled here)
+    - High confidence → early exits reduce latency further
     
     Important: Split point must be at least 1 so there are edge layers for exit heads.
 
@@ -722,7 +730,7 @@ def find_optimal_split_with_early_exit(
         dnn_surgery: DNNSurgery instance with the model to split.
         input_tensor: Input tensor for profiling.
         server_address: Server address for distributed inference.
-        exit_config: Early exit configuration (not used for split selection).
+        exit_config: Early exit configuration (not used for baseline profiling).
 
     Returns:
         Tuple of (optimal_split_point, timing_analysis).
@@ -730,18 +738,26 @@ def find_optimal_split_with_early_exit(
     from dnn_inference_client import DNNInferenceClient
     
     num_splits = len(dnn_surgery.splitter.layers) + 1
-    logger.info("=== Finding Optimal Split Point (Baseline without Early Exits) ===")
-    logger.info("Early exits will be used opportunistically at runtime, but split point optimized for baseline case")
+    logger.info("=== Finding Baseline Optimal Split Point (without Early Exits) ===")
+    logger.info("Using NeuroSurgeon profiling for worst-case (no early exit) scenario")
+    logger.info("Early exits will be applied opportunistically at runtime on top of this baseline")
     
-    # CRITICAL: Skip split point 0 - early exits require edge layers
-    min_split = 1
-    logger.info(f"Testing {num_splits - min_split} split points ({min_split} to {num_splits - 1}) - skipping split point 0 (no edge layers for exit heads)")
+    # CRITICAL: Determine minimum split point based on exit point requirements
+    # If explicit exit points are provided, we need enough edge layers to accommodate them
+    min_split = 1  # Default minimum
+    if exit_config.exit_points:
+        # Need split point > max exit point to ensure all exits are on the edge
+        max_exit_point = max(exit_config.exit_points)
+        min_split = max_exit_point + 1
+        logger.info(f"Exit points specified: {exit_config.exit_points} - minimum split must be > {max_exit_point}")
+    
+    logger.info(f"Testing {num_splits - min_split} split points ({min_split} to {num_splits - 1}) - ensuring exit heads can be placed on edge")
     
     split_analysis = {}
     
-    # Profile each valid split point WITHOUT early exits
+    # Profile each valid split point WITHOUT early exits (baseline)
     for split_point in range(min_split, num_splits):
-        logger.info(f"Testing split point {split_point}/{num_splits - 1} (baseline)...")
+        logger.info(f"Testing baseline split point {split_point}/{num_splits - 1}...")
         
         dnn_surgery.splitter.set_split_point(split_point)
         edge_model = dnn_surgery.splitter.get_edge_model(
@@ -749,7 +765,7 @@ def find_optimal_split_with_early_exit(
             quantizer=dnn_surgery.quantizer,
         )
         
-        # Use standard client WITHOUT early exits
+        # Use standard client WITHOUT early exits for baseline profiling
         client = DNNInferenceClient(server_address, edge_model)
         requires_cloud = dnn_surgery.splitter.get_cloud_model() is not None
         dnn_surgery._send_split_decision_to_server(split_point, server_address)  # pylint: disable=protected-access
@@ -781,15 +797,15 @@ def find_optimal_split_with_early_exit(
                 'total_time': float('inf'),
             }
     
-    # Find optimal split among valid candidates
+    # Find optimal split among valid candidates (minimum baseline time)
     optimal_split = min(split_analysis.keys(), key=lambda k: split_analysis[k]['total_time'])
     min_time = split_analysis[optimal_split]['total_time']
     
     logger.info("=== Baseline Optimal Split Point Found ===")
-    logger.info(f"Optimal split: {optimal_split} with baseline time: {min_time:.1f}ms")
-    logger.info("Early exits will be attempted at runtime as an optimization")
+    logger.info(f"Optimal baseline split: {optimal_split} with time: {min_time:.1f}ms (without early exits)")
+    logger.info("Early exits will be applied opportunistically at runtime to further reduce latency")
     
-    # Configure server with optimal split
+    # Configure server with optimal baseline split
     dnn_surgery._send_split_decision_to_server(optimal_split, server_address)  # pylint: disable=protected-access
     
     from visualization import build_split_timing_summary, format_split_summary
