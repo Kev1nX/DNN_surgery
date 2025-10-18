@@ -184,6 +184,29 @@ class ModelSplitter:
                 layers.append(child)
         
         return layers
+
+    def _is_linear_like(self, module: nn.Module) -> bool:
+        """Return True for modules that behave like Linear layers.
+
+        This is robust to dynamic/quantized replacements where the runtime
+        class may not be exactly ``nn.Linear`` but still needs 2D inputs
+        (e.g. quantized dynamic Linear modules). We use the class name as a
+        heuristic because quantized/dynamic Linear classes usually include
+        'Linear' in their class name.
+        """
+        try:
+            name = module.__class__.__name__.lower()
+        except Exception:
+            return False
+
+        if 'linear' in name:
+            return True
+
+        # Fallback to isinstance check for regular nn.Linear
+        if isinstance(module, nn.Linear):
+            return True
+
+        return False
         
     def set_split_point(self, split_point: int):
         """Set where to split the model between edge and cloud
@@ -229,8 +252,9 @@ class ModelSplitter:
                 
             def _needs_flattening(self, layer, input_tensor):
                 """Check if we need to flatten the input before applying this layer"""
-                # Check if this is a Linear layer expecting 2D input but receiving >2D input
-                if isinstance(layer, nn.Linear) and input_tensor.dim() > 2:
+                # Check if this is a Linear-like layer expecting 2D input but receiving >2D input
+                # Use the outer ModelSplitter's heuristic to detect quantized/dynamic Linear modules
+                if self._is_linear_like(layer) and input_tensor.dim() > 2:
                     return True
                     
                 # Check if this is a Sequential classifier (like AlexNet's classifier)
@@ -243,7 +267,8 @@ class ModelSplitter:
                     
                     # Check if any layer in the sequential is Linear - if so, we need to flatten
                     for sublayer in layer:
-                        if isinstance(sublayer, nn.Linear):
+                        # Check for linear-like sublayers (handles quantized/dynamic Linear)
+                        if self._is_linear_like(sublayer):
                             return True
                 
                 return False
@@ -296,8 +321,8 @@ class ModelSplitter:
                 
             def _needs_flattening(self, layer, input_tensor):
                 """Check if we need to flatten the input before applying this layer"""
-                # Check if this is a Linear layer expecting 2D input but receiving >2D input
-                if isinstance(layer, nn.Linear) and input_tensor.dim() > 2:
+                # Check if this is a Linear-like layer expecting 2D input but receiving >2D input
+                if self._is_linear_like(layer) and input_tensor.dim() > 2:
                     return True
                     
                 # Check if this is a Sequential classifier (like AlexNet's classifier)
@@ -310,7 +335,7 @@ class ModelSplitter:
                     
                     # Check if any layer in the sequential is Linear - if so, we need to flatten
                     for sublayer in layer:
-                        if isinstance(sublayer, nn.Linear):
+                        if self._is_linear_like(sublayer):
                             return True
                 
                 return False
