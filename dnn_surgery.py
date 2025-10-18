@@ -234,6 +234,9 @@ class ModelSplitter:
             
         edge_layers = self.layers[:self.split_point]
         
+        # Capture parent's _is_linear_like method for use in inner class
+        parent_is_linear_like = self._is_linear_like
+        
         class EdgeModel(nn.Module):
             def __init__(self, layers, original_model, model_name):
                 super().__init__()
@@ -249,6 +252,10 @@ class ModelSplitter:
                         x = torch.flatten(x, 1)
                     x = layer(x)
                 return x
+            
+            def _is_linear_like(self, module):
+                """Check if module behaves like a Linear layer (including quantized variants)"""
+                return parent_is_linear_like(module)
                 
             def _needs_flattening(self, layer, input_tensor):
                 """Check if we need to flatten the input before applying this layer"""
@@ -300,6 +307,9 @@ class ModelSplitter:
         cloud_layers = self.layers[self.split_point:]
         split_point = self.split_point
         
+        # Capture parent's _is_linear_like method for use in inner class
+        parent_is_linear_like = self._is_linear_like
+        
         class CloudModel(nn.Module):
             def __init__(self, layers, original_model, model_name, split_point):
                 super().__init__()
@@ -318,6 +328,10 @@ class ModelSplitter:
                         logger.debug(f"Flattened tensor from {original_shape} to {x.shape} before {layer.__class__.__name__}")
                     x = layer(x)
                 return x
+            
+            def _is_linear_like(self, module):
+                """Check if module behaves like a Linear layer (including quantized variants)"""
+                return parent_is_linear_like(module)
                 
             def _needs_flattening(self, layer, input_tensor):
                 """Check if we need to flatten the input before applying this layer"""
