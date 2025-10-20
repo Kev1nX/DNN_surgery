@@ -1117,6 +1117,7 @@ def main():
                 plot_show=args.plot_show,
                 plot_path=args.plot_save or "plots",
                 enable_quantization=args.neurosurgeon_quantize,
+                quantize_transfer=args.quantize_transfer,
                 use_early_split=args.neurosurgeon_early_split,
                 batch_size=args.batch_size,
             )
