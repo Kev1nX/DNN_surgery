@@ -594,36 +594,6 @@ def test_split_points(
 
     return results
 
-def print_performance_summary(results: Dict[int, Dict]):
-    """Print a summary of performance results"""
-    if not results:
-        logger.warning("No results to summarize")
-        return
-    
-    print("\n" + "="*80)
-    print("PERFORMANCE SUMMARY")
-    print("="*80)
-    print(f"{'Split':<6} {'Total(ms)':<12} {'Edge(ms)':<11} {'Cloud(ms)':<12} {'Transfer(ms)':<14} {'Tests':<6}")
-    print("-" * 80)
-    
-    # Sort by total time
-    sorted_results = sorted(results.items(), key=lambda x: x[1]['avg_total_time'])
-    
-    for split_point, metrics in sorted_results:
-        print(f"{split_point:<6} "
-              f"{metrics['avg_total_time']:<12.1f} "
-              f"{metrics['avg_edge_time']:<11.1f} "
-              f"{metrics['avg_cloud_time']:<12.1f} "
-              f"{metrics['avg_transfer_time']:<14.1f} "
-              f"{metrics['num_tests']:<6}")
-    
-    # Find optimal split point
-    optimal_split = sorted_results[0][0]
-    optimal_time = sorted_results[0][1]['avg_total_time']
-    
-    print("-" * 80)
-    print(f"OPTIMAL SPLIT POINT: {optimal_split} (Average time: {optimal_time:.1f}ms)")
-    print("="*80)
 
 def test_all_models_single_split(
     server_address: str,
@@ -670,7 +640,6 @@ def test_all_models_single_split(
             
             # Validate split point
             if split_point < 0 or split_point > num_layers:
-                logger.error(f"Invalid split point {split_point} for {model_name} (has {num_layers} layers)")
                 continue
             
             # Run multiple tests
@@ -1029,151 +998,6 @@ def test_all_models_neurosurgeon(
     
     return all_model_timings
 
-def test_all_models_all_splits(
-    server_address: str,
-    num_tests: int = 3,
-    *,
-    auto_plot: bool = True,
-    plot_show: bool = True,
-    plot_base_path: Optional[str] = None,
-) -> Dict[str, Dict[int, Dict]]:
-    """Test all supported models across all their split points.
-    
-    Args:
-        server_address: Server address
-        num_tests: Number of test runs per split point
-        auto_plot: Whether to generate plots
-        plot_show: Whether to show plots interactively
-        plot_base_path: Base directory for saving plots
-        
-    Returns:
-        Dictionary mapping model names to their test results
-    """
-    initialize_dataset_loader(1)
-    
-    all_model_results = {}
-    all_model_timings = {}  # For multi-model comparison
-    
-    logger.info("="*80)
-    logger.info("COMPREHENSIVE MODEL TESTING")
-    logger.info("Testing all models across all split points")
-    logger.info("="*80)
-    
-    for model_name in SUPPORTED_MODELS:
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Testing model: {model_name}")
-        logger.info('='*80)
-        
-        try:
-            # Get model and create DNN Surgery instance
-            model = get_model(model_name)
-            dnn_surgery = DNNSurgery(model, model_name)
-            
-            # Get number of layers
-            num_layers = len(dnn_surgery.splitter.layers)
-            
-            # Test all split points for this model
-            split_points = list(range(num_layers + 1))
-            logger.info(f"Model has {num_layers} layers, testing {len(split_points)} split points: {split_points}")
-            
-            # Determine save path for this model's individual plot
-            model_plot_path = None
-            if auto_plot and plot_base_path:
-                plot_dir = Path(plot_base_path)
-                plot_dir.mkdir(parents=True, exist_ok=True)
-                model_plot_path = str(plot_dir / f"{model_name}_split_comparison.png")
-            
-            # Run the split point tests
-            results = test_split_points(
-                server_address,
-                model_name,
-                split_points,
-                num_tests=num_tests,
-                auto_plot=auto_plot,
-                plot_show=plot_show,
-                plot_path=model_plot_path,
-            )
-            
-            all_model_results[model_name] = results
-            
-            # Extract timing data for multi-model comparison
-            model_timings = {}
-            for split_point, metrics in results.items():
-                model_timings[split_point] = {
-                    'total_time': metrics['avg_total_time'],
-                    'client_time': metrics.get('avg_edge_time', 0.0),
-                    'server_time': metrics.get('avg_cloud_time', 0.0),
-                    'transfer_time': metrics.get('avg_transfer_time', 0.0),
-                }
-            all_model_timings[model_name] = model_timings
-            
-            logger.info(f"✓ Completed testing {model_name}")
-            
-        except Exception as e:
-            logger.error(f"✗ Failed to test {model_name}: {str(e)}")
-            traceback.print_exc()
-            continue
-    
-    # Generate multi-model comparison plot
-    if auto_plot and all_model_timings:
-        logger.info("\n" + "="*80)
-        logger.info("Generating multi-model comparison plots...")
-        logger.info("="*80)
-        
-        try:
-            plot_dir = Path(plot_base_path) if plot_base_path else Path("plots")
-            plot_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Generate comparison for each metric
-            metrics_to_plot = [
-                ('total_time', 'Total Latency'),
-                ('client_time', 'Client Execution Time'),
-                ('server_time', 'Server Execution Time'),
-                ('transfer_time', 'Data Transfer Time'),
-            ]
-            
-            for metric, metric_name in metrics_to_plot:
-                save_path = str(plot_dir / f"multi_model_comparison_{metric}.png")
-                plot_multi_model_comparison(
-                    all_model_timings,
-                    show=plot_show,
-                    save_path=save_path,
-                    title=f"Multi-Model Comparison: {metric_name}",
-                    metric=metric,
-                )
-                logger.info(f"✓ Saved {metric_name} comparison to {save_path}")
-            
-            # Generate throughput comparison plot
-            throughput_save_path = str(plot_dir / f"multi_model_throughput_comparison.png")
-            plot_multi_model_throughput_comparison(
-                all_model_timings,
-                show=plot_show,
-                save_path=throughput_save_path,
-                title="Multi-Model Throughput Comparison",
-            )
-            logger.info(f"✓ Saved throughput comparison to {throughput_save_path}")
-            
-            logger.info("✓ All comparison plots generated successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to generate multi-model comparison: {str(e)}")
-            traceback.print_exc()
-    
-    # Print summary
-    logger.info("\n" + "="*80)
-    logger.info("COMPREHENSIVE TEST SUMMARY")
-    logger.info("="*80)
-    
-    for model_name, results in all_model_results.items():
-        if results:
-            best_split = min(results.items(), key=lambda x: x[1]['avg_total_time'])
-            logger.info(f"{model_name:20s}: Optimal split={best_split[0]:2d}, Time={best_split[1]['avg_total_time']:.1f}ms")
-        else:
-            logger.info(f"{model_name:20s}: No results")
-    
-    logger.info("="*80)
-    
-    return all_model_results
 
 def main():
     parser = argparse.ArgumentParser(description='DNN Surgery Client')
@@ -1197,8 +1021,6 @@ def main():
                        help='Number of tests per split point when testing specific splits (default: 3)')
     parser.add_argument('--test-connection', action='store_true',
                        help='Test connection to server and exit')
-    parser.add_argument('--test-all-models', action='store_true',
-                       help='Test all supported models across all split points and generate comparison plots')
     parser.add_argument('--test-all-models-split', type=int, default=None,
                        help='Test all models at a specific split point and generate a bar chart comparison (e.g., --test-all-models-split 0)')
     parser.add_argument('--test-all-models-neurosurgeon', action='store_true',
@@ -1209,8 +1031,6 @@ def main():
                        help='Enable early exit with intermediate classifiers (confidence-based exits at shallow layers)')
     parser.add_argument('--use-neurosurgeon', action='store_true', default=True,
                        help='Use NeuroSurgeon optimization (default: True)')
-    parser.add_argument('--no-neurosurgeon', action='store_true',
-                       help='Disable NeuroSurgeon optimization (requires --split-point)')
     parser.add_argument('--quantize', action='store_true',
                        help='Enable INT8 dynamic quantization for edge model (reduces memory and improves speed)')
     parser.add_argument('--no-plot', action='store_true',
@@ -1293,18 +1113,6 @@ def main():
             logger.info("NeuroSurgeon testing complete!")
             sys.exit(0)
         
-        # Test all models across all split points
-        if args.test_all_models:
-            logger.info("Testing all models across all split points...")
-            test_all_models_all_splits(
-                args.server_address,
-                num_tests=args.num_tests,
-                auto_plot=args.auto_plot,
-                plot_show=args.plot_show,
-                plot_base_path=args.plot_save or "plots/comprehensive",
-            )
-            logger.info("Comprehensive testing complete!")
-            sys.exit(0)
         
         # Test multiple split points if specified
         if args.test_splits:
@@ -1320,13 +1128,12 @@ def main():
                 plot_show=args.plot_show,
                 plot_path=args.plot_save,
             )
-            print_performance_summary(results)
             
         # Run batch processing
         elif args.num_batches > 1:
             logger.info(f"Running batch processing: {args.num_batches} batches")
             
-            split_point = args.split_point if args.no_neurosurgeon else None
+            split_point = args.split_point 
             
             if args.neurosurgeon_early_split:
                 logger.info("Early exit enabled for batch processing")
@@ -1379,13 +1186,13 @@ def main():
             
         # Run single inference
         else:
-            if args.no_neurosurgeon:
-                split_point = args.split_point if args.split_point is not None else 2
+            if args.split_point is not None:
+                split_point = args.split_point
                 logger.info(f"Running single inference with manual split point {split_point}")
             else:
                 split_point = None
                 logger.info(f"Running single inference with NeuroSurgeon optimization")
-            
+
             if args.quantize:
                 logger.info("Quantization enabled: Edge model will use INT8 dynamic quantization")
             
