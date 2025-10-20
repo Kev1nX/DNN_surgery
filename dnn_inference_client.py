@@ -48,10 +48,6 @@ class DNNInferenceClient:
             self.edge_model.eval()  # Ensure model is in evaluation mode
             logging.info(f"Initialized edge model: {type(edge_model).__name__}")
         
-        logging.info(f"Client ID: {self.client_id}")
-        logging.info(f"Configured max gRPC message size: {GRPC_SETTINGS.max_message_mb}MB")
-        logging.info(f"Max in-flight RPCs: {self.max_inflight_requests}")
-        
     def process_tensor(self, tensor: torch.Tensor, model_id: str, requires_cloud_processing: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Process one or more tensors with optional edge/cloud pipelining."""
         batch_size = tensor.shape[0]
