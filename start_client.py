@@ -425,6 +425,38 @@ def run_batch_processing(
                     optimal_split_found = timings.get('split_point', 2)
                     should_plot = False
                     logger.info(f"Found optimal split point: {optimal_split_found} (will reuse for remaining batches)")
+                    
+                    # Generate split comparison plot from NeuroSurgeon profiling data
+                    if 'split_analysis' in timings and auto_plot:
+                        split_analysis_data = timings['split_analysis']
+                        all_splits = split_analysis_data.get('all_splits', {})
+                        
+                        if all_splits:
+                            try:
+                                # Convert to format expected by plot_actual_split_comparison
+                                # It expects: Dict[int, Dict[str, Sequence[float]]]
+                                split_component_timings = {}
+                                for split_pt, timing_data in all_splits.items():
+                                    split_component_timings[split_pt] = {
+                                        'edge': [timing_data['edge_time']],
+                                        'transfer': [timing_data['transfer_time']],
+                                        'cloud': [timing_data['cloud_time']],
+                                        'total': [timing_data['total_time']],
+                                    }
+                                
+                                comparison_plot_path = Path(plot_path or "plots") / f"{model_name}_split_comparison_{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
+                                comparison_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                                
+                                plot_actual_split_comparison(
+                                    split_component_timings,
+                                    show=plot_show,
+                                    save_path=str(comparison_plot_path),
+                                    title=f"Measured Inference Timings ({model_name})"
+                                )
+                                logger.info(f"✓ Split comparison chart saved: {comparison_plot_path.name}")
+                                
+                            except Exception as e:
+                                logger.error(f"Failed to generate split comparison plot: {e}")
         predicted_plot_path = timings.get('predicted_split_plot_path')
         actual_plot_path = timings.get('actual_split_plot_path')
         if predicted_plot_path:

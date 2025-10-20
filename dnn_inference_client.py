@@ -440,6 +440,10 @@ def run_distributed_inference(
         # Add split point info
         timings['split_point'] = split_point
         
+        # Add analysis data if available (from NeuroSurgeon optimization)
+        if split_point is not None and 'analysis' in locals():
+            timings['split_analysis'] = analysis
+        
         return result, timings
         
     except Exception as e:
