@@ -32,6 +32,7 @@ class ModelQuantizer:
     
     def __init__(self):
         self._quantized_models = {}
+        self._size_metrics = {}  # Track original and quantized sizes
         logger.info("Initialized ModelQuantizer with dynamic INT8 quantization")
     
     def quantize_model(
@@ -92,8 +93,17 @@ class ModelQuantizer:
                 f"  Memory saved: {(original_size - quantized_size) / 1e6:.2f} MB"
             )
             
-            # Cache the quantized model
+            # Cache the quantized model and size metrics
             self._quantized_models[model_name] = quantized_model
+            self._size_metrics[model_name] = {
+                'original_size_bytes': original_size,
+                'quantized_size_bytes': quantized_size,
+                'original_size_mb': original_size / 1e6,
+                'quantized_size_mb': quantized_size / 1e6,
+                'compression_ratio': compression_ratio,
+                'memory_saved_mb': (original_size - quantized_size) / 1e6,
+                'num_quantizable_layers': num_quantizable,
+            }
             
             return quantized_model
             
@@ -127,9 +137,23 @@ class ModelQuantizer:
         """Retrieve a cached quantized model."""
         return self._quantized_models.get(model_name)
     
+    def get_size_metrics(self, model_name: str = None):
+        """Retrieve size metrics for a specific model or all models.
+        
+        Args:
+            model_name: Optional model name. If None, returns metrics for all models.
+            
+        Returns:
+            Dictionary of size metrics for the specified model, or dict of all metrics.
+        """
+        if model_name is not None:
+            return self._size_metrics.get(model_name)
+        return self._size_metrics.copy()
+    
     def clear_cache(self) -> None:
         """Clear all cached quantized models."""
         self._quantized_models.clear()
+        self._size_metrics.clear()
         logger.info("Cleared quantization cache")
 
 

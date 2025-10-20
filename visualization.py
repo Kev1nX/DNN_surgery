@@ -31,6 +31,8 @@ __all__ = [
     "plot_split_throughput_comparison",
     "plot_multi_model_throughput_comparison",
     "plot_model_throughput_comparison_bar",
+    "plot_quantization_size_reduction",
+    "plot_quantization_comparison_bar",
 ]
 
 
@@ -1117,6 +1119,248 @@ def plot_model_throughput_comparison_bar(
     
     if save_path:
         fig.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+    
+    return fig
+
+
+def plot_quantization_size_reduction(
+    size_metrics: Dict[str, Dict[str, float]],
+    *,
+    show: bool = False,
+    save_path: Optional[str] = None,
+    title: Optional[str] = None,
+) -> object:
+    """Plot model size reduction achieved through quantization.
+    
+    Creates a grouped bar chart showing original vs quantized model sizes,
+    plus a line plot showing compression ratios.
+    
+    Args:
+        size_metrics: Dictionary mapping model names to their size metrics:
+            {
+                'model_name': {
+                    'original_size_mb': float,
+                    'quantized_size_mb': float,
+                    'compression_ratio': float,
+                    'memory_saved_mb': float,
+                    'num_quantizable_layers': int,
+                },
+                ...
+            }
+        show: Whether to display the chart interactively.
+        save_path: Optional filesystem path to persist the chart as an image.
+        title: Optional override for the chart title.
+        
+    Returns:
+        The created ``matplotlib.figure.Figure`` instance.
+    """
+    
+    if not size_metrics:
+        raise ValueError("Cannot plot quantization size reduction without size metrics")
+    
+    if plt is None:
+        raise ImportError(
+            "matplotlib is required to plot quantization metrics. Install with 'pip install matplotlib'."
+        )
+    
+    # Sort models by original size (descending) for better visualization
+    sorted_models = sorted(
+        size_metrics.items(), 
+        key=lambda x: x[1].get('original_size_mb', 0.0),
+        reverse=True
+    )
+    
+    model_names = [name for name, _ in sorted_models]
+    original_sizes = [metrics['original_size_mb'] for _, metrics in sorted_models]
+    quantized_sizes = [metrics['quantized_size_mb'] for _, metrics in sorted_models]
+    compression_ratios = [metrics['compression_ratio'] for _, metrics in sorted_models]
+    memory_saved = [metrics['memory_saved_mb'] for _, metrics in sorted_models]
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    
+    # --- Subplot 1: Model Size Comparison (Grouped Bar Chart) ---
+    x = range(len(model_names))
+    width = 0.35
+    
+    bars1 = ax1.bar([i - width/2 for i in x], original_sizes, width, 
+                     label='Original', color='#ff7f0e', alpha=0.85)
+    bars2 = ax1.bar([i + width/2 for i in x], quantized_sizes, width,
+                     label='Quantized (INT8)', color='#2ca02c', alpha=0.85)
+    
+    # Add value labels on bars
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax1.annotate(f'{height:.1f}',
+                        xy=(bar.get_x() + bar.get_width() / 2, height),
+                        xytext=(0, 3),
+                        textcoords="offset points",
+                        ha='center', va='bottom',
+                        fontsize=9)
+    
+    ax1.set_ylabel('Model Size (MB)', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Model', fontsize=12, fontweight='bold')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(model_names, rotation=45, ha='right')
+    ax1.set_title('Model Size: Original vs Quantized', fontsize=14, fontweight='bold')
+    ax1.legend(loc='upper right', fontsize=10)
+    ax1.grid(axis='y', linestyle=':', linewidth=0.5, alpha=0.7)
+    
+    # --- Subplot 2: Compression Ratio and Memory Saved ---
+    ax2_twin = ax2.twinx()
+    
+    # Bar chart for memory saved
+    bars3 = ax2.bar(x, memory_saved, width=0.6, 
+                    label='Memory Saved', color='#9467bd', alpha=0.85)
+    
+    # Line plot for compression ratio
+    line = ax2_twin.plot(x, compression_ratios, 'o-', 
+                         label='Compression Ratio', color='#d62728', 
+                         linewidth=2.5, markersize=8)
+    
+    # Add value labels
+    for i, (saved, ratio) in enumerate(zip(memory_saved, compression_ratios)):
+        # Memory saved label
+        ax2.annotate(f'{saved:.1f} MB',
+                    xy=(i, saved),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha='center', va='bottom',
+                    fontsize=9, fontweight='bold')
+        # Compression ratio label
+        ax2_twin.annotate(f'{ratio:.2f}x',
+                         xy=(i, ratio),
+                         xytext=(0, 10),
+                         textcoords="offset points",
+                         ha='center', va='bottom',
+                         fontsize=9, color='#d62728', fontweight='bold')
+    
+    ax2.set_ylabel('Memory Saved (MB)', fontsize=12, fontweight='bold')
+    ax2_twin.set_ylabel('Compression Ratio (x)', fontsize=12, fontweight='bold', color='#d62728')
+    ax2.set_xlabel('Model', fontsize=12, fontweight='bold')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(model_names, rotation=45, ha='right')
+    ax2.set_title('Quantization Benefits: Memory Saved & Compression Ratio', fontsize=14, fontweight='bold')
+    ax2.grid(axis='y', linestyle=':', linewidth=0.5, alpha=0.7)
+    
+    # Combine legends
+    lines1, labels1 = ax2.get_legend_handles_labels()
+    lines2, labels2 = ax2_twin.get_legend_handles_labels()
+    ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=10)
+    
+    # Set y-axis colors
+    ax2_twin.tick_params(axis='y', labelcolor='#d62728')
+    ax2_twin.spines['right'].set_color('#d62728')
+    
+    # Overall title
+    if title:
+        fig.suptitle(title, fontsize=16, fontweight='bold', y=0.995)
+    else:
+        fig.suptitle('Model Quantization Size Reduction Analysis', fontsize=16, fontweight='bold', y=0.995)
+    
+    fig.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    if show:
+        plt.show()
+    
+    return fig
+
+
+def plot_quantization_comparison_bar(
+    size_metrics: Dict[str, Dict[str, float]],
+    *,
+    show: bool = False,
+    save_path: Optional[str] = None,
+    title: Optional[str] = None,
+) -> object:
+    """Plot a compact comparison of quantization effects across models.
+    
+    Creates a single stacked bar chart showing size reduction for each model.
+    
+    Args:
+        size_metrics: Dictionary mapping model names to their size metrics.
+        show: Whether to display the chart interactively.
+        save_path: Optional filesystem path to persist the chart as an image.
+        title: Optional override for the chart title.
+        
+    Returns:
+        The created ``matplotlib.figure.Figure`` instance.
+    """
+    
+    if not size_metrics:
+        raise ValueError("Cannot plot quantization comparison without size metrics")
+    
+    if plt is None:
+        raise ImportError(
+            "matplotlib is required to plot quantization comparisons. Install with 'pip install matplotlib'."
+        )
+    
+    # Sort models by memory saved (descending)
+    sorted_models = sorted(
+        size_metrics.items(),
+        key=lambda x: x[1].get('memory_saved_mb', 0.0),
+        reverse=True
+    )
+    
+    model_names = [name for name, _ in sorted_models]
+    quantized_sizes = [metrics['quantized_size_mb'] for _, metrics in sorted_models]
+    memory_saved = [metrics['memory_saved_mb'] for _, metrics in sorted_models]
+    compression_ratios = [metrics['compression_ratio'] for _, metrics in sorted_models]
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    x = range(len(model_names))
+    width = 0.6
+    
+    # Create stacked bars
+    bars_quantized = ax.bar(x, quantized_sizes, width, 
+                           label='Quantized Size', color='#2ca02c', alpha=0.85)
+    bars_saved = ax.bar(x, memory_saved, width, bottom=quantized_sizes,
+                       label='Memory Saved', color='#ff7f0e', alpha=0.85)
+    
+    # Add annotations
+    for i, (quant, saved, ratio) in enumerate(zip(quantized_sizes, memory_saved, compression_ratios)):
+        total = quant + saved
+        # Total size annotation above bar
+        ax.annotate(f'{total:.1f} MB',
+                   xy=(i, total),
+                   xytext=(0, 3),
+                   textcoords="offset points",
+                   ha='center', va='bottom',
+                   fontsize=9, fontweight='bold')
+        # Compression ratio annotation
+        ax.annotate(f'{ratio:.2f}x',
+                   xy=(i, total/2),
+                   xytext=(0, 0),
+                   textcoords="offset points",
+                   ha='center', va='center',
+                   fontsize=10, fontweight='bold',
+                   color='white',
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='#1f77b4', alpha=0.8))
+    
+    ax.set_ylabel('Model Size (MB)', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Model', fontsize=12, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_names, rotation=45, ha='right')
+    
+    if title:
+        plot_title = title
+    else:
+        plot_title = 'Quantization Size Reduction by Model'
+    
+    ax.set_title(plot_title, fontsize=14, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=10)
+    ax.grid(axis='y', linestyle=':', linewidth=0.5, alpha=0.7)
+    
+    fig.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
     if show:
         plt.show()
     
