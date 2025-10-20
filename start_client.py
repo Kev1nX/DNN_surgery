@@ -47,6 +47,8 @@ from visualization import (
     plot_split_throughput_comparison,
     plot_multi_model_throughput_comparison,
     plot_model_throughput_comparison_bar,
+    plot_quantization_size_reduction,
+    plot_quantization_comparison_bar,
 )
 
 # Configure logging
@@ -1003,6 +1005,67 @@ def test_all_models_neurosurgeon(
             Path(plot_path or "plots"), all_model_timings,
             f"NeuroSurgeon Optimal Split ({config_desc})", f"all_models_neurosurgeon{suffix}", plot_show
         )
+        
+        # Generate quantization plots if model quantization was enabled
+        if enable_quantization:
+            logger.info("\n" + "="*80)
+            logger.info("QUANTIZATION METRICS")
+            logger.info("="*80)
+            
+            from quantization import ModelQuantizer
+            quantizer = ModelQuantizer()
+            size_metrics = quantizer.get_size_metrics()
+            
+            if size_metrics:
+                # Log quantization summary
+                for model_name in SUPPORTED_MODELS:
+                    edge_key = f"{model_name}_edge"
+                    cloud_key = f"{model_name}_cloud"
+                    
+                    if edge_key in size_metrics:
+                        metrics = size_metrics[edge_key]
+                        logger.info(f"{model_name} (edge model):")
+                        logger.info(f"  Original: {metrics['original_size_mb']:.2f} MB → Quantized: {metrics['quantized_size_mb']:.2f} MB")
+                        logger.info(f"  Compression: {metrics['compression_ratio']:.2f}x ({metrics['num_quantizable_layers']} layers)")
+                    
+                    if cloud_key in size_metrics:
+                        metrics = size_metrics[cloud_key]
+                        logger.info(f"{model_name} (cloud model):")
+                        logger.info(f"  Original: {metrics['original_size_mb']:.2f} MB → Quantized: {metrics['quantized_size_mb']:.2f} MB")
+                        logger.info(f"  Compression: {metrics['compression_ratio']:.2f}x ({metrics['num_quantizable_layers']} layers)")
+                
+                logger.info("="*80)
+                
+                # Generate quantization visualization plots
+                try:
+                    plot_dir = Path(plot_path or "plots")
+                    plot_dir.mkdir(parents=True, exist_ok=True)
+                    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    
+                    # Bar chart comparison
+                    quant_bar_path = plot_dir / f"quantization_comparison_{timestamp}.png"
+                    plot_quantization_comparison_bar(
+                        size_metrics,
+                        show=plot_show,
+                        save_path=str(quant_bar_path),
+                        title="Model Quantization Compression (INT8)"
+                    )
+                    logger.info(f"✓ Quantization comparison chart saved: {quant_bar_path.name}")
+                    
+                    # Detailed size reduction plot
+                    quant_detail_path = plot_dir / f"quantization_size_reduction_{timestamp}.png"
+                    plot_quantization_size_reduction(
+                        size_metrics,
+                        show=plot_show,
+                        save_path=str(quant_detail_path),
+                        title="Model Size Reduction via Quantization"
+                    )
+                    logger.info(f"✓ Quantization size reduction chart saved: {quant_detail_path.name}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to generate quantization plots: {e}")
+            else:
+                logger.warning("No quantization metrics available to plot")
     
     return all_model_timings
 
