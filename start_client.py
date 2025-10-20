@@ -1216,6 +1216,12 @@ def main():
             if args.neurosurgeon_early_split:
                 logger.info("Early exit enabled for batch processing")
             
+            if args.quantize:
+                logger.info("Model quantization enabled: Edge/cloud models will use INT8 dynamic quantization")
+            
+            if args.quantize_transfer:
+                logger.info("Transfer quantization enabled: Intermediate tensors will be quantized during transfer")
+            
             timings_list = run_batch_processing(
                 args.server_address,
                 args.model,
@@ -1226,6 +1232,8 @@ def main():
                 plot_show=args.plot_show,
                 plot_path=args.plot_save,
                 use_early_exit=args.neurosurgeon_early_split,
+                enable_quantization=args.quantize,
+                quantize_transfer=args.quantize_transfer,
             )
             
             # Print batch summary
