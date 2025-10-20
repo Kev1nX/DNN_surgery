@@ -249,6 +249,18 @@ class ModelSplitter:
                         x = torch.flatten(x, 1)
                     x = layer(x)
                 return x
+            
+            def _is_linear_like(self, module: nn.Module) -> bool:
+                """Return True for modules that behave like Linear layers."""
+                try:
+                    name = module.__class__.__name__.lower()
+                except Exception:
+                    return False
+                if 'linear' in name:
+                    return True
+                if isinstance(module, nn.Linear):
+                    return True
+                return False
                 
             def _needs_flattening(self, layer, input_tensor):
                 """Check if we need to flatten the input before applying this layer"""
@@ -318,6 +330,18 @@ class ModelSplitter:
                         logger.debug(f"Flattened tensor from {original_shape} to {x.shape} before {layer.__class__.__name__}")
                     x = layer(x)
                 return x
+            
+            def _is_linear_like(self, module: nn.Module) -> bool:
+                """Return True for modules that behave like Linear layers."""
+                try:
+                    name = module.__class__.__name__.lower()
+                except Exception:
+                    return False
+                if 'linear' in name:
+                    return True
+                if isinstance(module, nn.Linear):
+                    return True
+                return False
                 
             def _needs_flattening(self, layer, input_tensor):
                 """Check if we need to flatten the input before applying this layer"""
