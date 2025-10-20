@@ -29,6 +29,7 @@ class DNNInferenceClient:
         server_address: str = 'localhost:50051',
         edge_model: Optional[torch.nn.Module] = None,
         max_inflight_requests: Optional[int] = None,
+        quantize_transfer: bool = False,
     ):
         # Configure gRPC options for larger messages (individual tensors)
         options = GRPC_SETTINGS.channel_options
@@ -43,10 +44,14 @@ class DNNInferenceClient:
         self.max_inflight_requests = (
             max_inflight_requests if max_inflight_requests is not None else GRPC_SETTINGS.max_concurrent_rpcs
         )
+        self.quantize_transfer = quantize_transfer
         
         if self.edge_model is not None:
             self.edge_model.eval()  # Ensure model is in evaluation mode
             logging.info(f"Initialized edge model: {type(edge_model).__name__}")
+        
+        if self.quantize_transfer:
+            logging.info("Tensor quantization enabled: Intermediate tensors will be quantized (FP32→INT8) during transfer")
         
     def process_tensor(self, tensor: torch.Tensor, model_id: str, requires_cloud_processing: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Process one or more tensors with optional edge/cloud pipelining."""
@@ -156,7 +161,7 @@ class DNNInferenceClient:
 
                 # Stage S2: async transfer + cloud inference
                 request = dnn_inference_pb2.InferenceRequest(
-                    tensor=tensor_to_proto(sample, ensure_cpu=True),
+                    tensor=tensor_to_proto(sample, ensure_cpu=True, quantize=self.quantize_transfer),
                     model_id=model_id
                 )
 
@@ -373,8 +378,8 @@ def run_distributed_inference(
         if not requires_cloud_processing:
             logging.info(f"Split point {split_point} means all inference on client side - no server communication needed")
         
-        # Create client with edge model
-        client = DNNInferenceClient(server_address, edge_model)
+        # Create client with edge model (pass quantize_transfer from dnn_surgery)
+        client = DNNInferenceClient(server_address, edge_model, quantize_transfer=dnn_surgery.quantize_transfer)
         
         # Run inference
         result, timings = client.process_tensor(input_tensor, model_id, requires_cloud_processing)

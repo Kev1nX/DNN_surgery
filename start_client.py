@@ -282,6 +282,8 @@ def run_batch_processing(
     plot_show: bool = True,
     plot_path: Optional[str] = None,
     use_early_exit: bool = False,
+    enable_quantization: bool = False,
+    quantize_transfer: bool = False,
 ) -> List[Dict]:
     """Run multiple batches and collect timing statistics"""
     validate_model(model_name)
@@ -290,7 +292,7 @@ def run_batch_processing(
     initialize_dataset_loader(batch_size)
     
     model = get_model(model_name)
-    dnn_surgery = DNNSurgery(model, model_name)
+    dnn_surgery = DNNSurgery(model, model_name, enable_quantization=enable_quantization, quantize_transfer=quantize_transfer)
     
     # Setup early exit if requested
     exit_config = None
@@ -769,6 +771,7 @@ def test_all_models_neurosurgeon(
     plot_show: bool = True,
     plot_path: Optional[str] = None,
     enable_quantization: bool = False,
+    quantize_transfer: bool = False,
     use_early_split: bool = False,
     batch_size: int = 1,
 ) -> Dict[str, Dict]:
@@ -784,6 +787,7 @@ def test_all_models_neurosurgeon(
         plot_show: Whether to show plots interactively
         plot_path: Path for saving the plot
         enable_quantization: Whether to enable INT8 quantization for models
+        quantize_transfer: Whether to enable INT8 quantization for intermediate tensor transfers
         use_early_split: Whether to enable early exit with intermediate classifiers
         batch_size: Batch size for each inference run (default: 1)
         
@@ -797,7 +801,9 @@ def test_all_models_neurosurgeon(
     # Build configuration description
     config_parts = []
     if enable_quantization:
-        config_parts.append("Quantization")
+        config_parts.append("Model Quantization")
+    if quantize_transfer:
+        config_parts.append("Transfer Quantization")
     if use_early_split:
         config_parts.append("Early Exit")
     
@@ -807,7 +813,9 @@ def test_all_models_neurosurgeon(
     logger.info(f"TESTING ALL MODELS WITH NEUROSURGEON OPTIMIZATION ({config_desc})")
     logger.info("="*80)
     if enable_quantization:
-        logger.info("Quantization: ENABLED (INT8 dynamic quantization)")
+        logger.info("Model Quantization: ENABLED (INT8 dynamic quantization for model weights)")
+    if quantize_transfer:
+        logger.info("Transfer Quantization: ENABLED (INT8 quantization for intermediate tensors)")
     if use_early_split:
         logger.info("Early Exit: ENABLED (intermediate classifiers with confidence threshold)")
     logger.info(f"Running {num_batches} batch(es) per model (batch_size={batch_size}) for stable measurements")
@@ -821,7 +829,7 @@ def test_all_models_neurosurgeon(
         try:
             # Get model and create DNN Surgery instance
             model = get_model(model_name)
-            dnn_surgery = DNNSurgery(model, model_name, enable_quantization=enable_quantization)
+            dnn_surgery = DNNSurgery(model, model_name, enable_quantization=enable_quantization, quantize_transfer=quantize_transfer)
             
             # Configure early exit if requested
             exit_config = None
@@ -1033,6 +1041,8 @@ def main():
                        help='Use NeuroSurgeon optimization (default: True)')
     parser.add_argument('--quantize', action='store_true',
                        help='Enable INT8 dynamic quantization for edge model (reduces memory and improves speed)')
+    parser.add_argument('--quantize-transfer', action='store_true',
+                       help='Enable INT8 quantization for intermediate tensors during transfer (reduces bandwidth by ~4x)')
     parser.add_argument('--no-plot', action='store_true',
                        help='Disable NeuroSurgeon optimization')
     parser.add_argument(
@@ -1196,10 +1206,13 @@ def main():
             if args.quantize:
                 logger.info("Quantization enabled: Edge model will use INT8 dynamic quantization")
             
+            if args.quantize_transfer:
+                logger.info("Transfer quantization enabled: Intermediate tensors will be quantized (FP32→INT8) during transfer")
+            
             if args.neurosurgeon_early_split:
                 logger.info("Early exit enabled: Will use confidence-based early exits at intermediate layers")
             
-            dnn_surgery = DNNSurgery(get_model(args.model), args.model, enable_quantization=args.quantize)
+            dnn_surgery = DNNSurgery(get_model(args.model), args.model, enable_quantization=args.quantize, quantize_transfer=args.quantize_transfer)
             
             # Run inference (with or without early exit)
             if args.neurosurgeon_early_split:

@@ -379,16 +379,23 @@ class ModelSplitter:
 class DNNSurgery:
     """Main class for distributed DNN inference with optimal splitting using NeuroSurgeon approach"""
     
-    def __init__(self, model: nn.Module, model_name: str = "unknown", enable_quantization: bool = False):
+    def __init__(self, model: nn.Module, model_name: str = "unknown", enable_quantization: bool = False, quantize_transfer: bool = False):
         self.model = model.eval()  # Ensure model is in eval mode
         self.model_name = model_name
         self.splitter = ModelSplitter(model, model_name)
         self.network_profiler = NetworkProfiler()
         self.enable_quantization = enable_quantization
+        self.quantize_transfer = quantize_transfer
         self.quantizer = ModelQuantizer() if enable_quantization else None
         
+        quant_info = []
         if enable_quantization:
-            logger.info(f"Initialized DNNSurgery for model: {model_name} with quantization enabled")
+            quant_info.append("model weights (INT8)")
+        if quantize_transfer:
+            quant_info.append("intermediate tensors (INT8)")
+        
+        if quant_info:
+            logger.info(f"Initialized DNNSurgery for model: {model_name} with quantization enabled: {', '.join(quant_info)}")
         else:
             logger.info(f"Initialized DNNSurgery for model: {model_name}")
     
@@ -444,8 +451,8 @@ class DNNSurgery:
                 quantizer=self.quantizer
             )
             
-            # Create client
-            client = DNNInferenceClient(server_address, edge_model)
+            # Create client with transfer quantization if enabled
+            client = DNNInferenceClient(server_address, edge_model, quantize_transfer=self.quantize_transfer)
             
             # Check if cloud processing is needed
             requires_cloud = self.splitter.get_cloud_model() is not None

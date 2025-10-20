@@ -3,6 +3,14 @@
 Implements dynamic quantization (INT8) for both client and server models.
 Dynamic quantization converts weights to INT8 while keeping activations in FP32,
 providing a good balance between performance and accuracy for inference.
+
+IMPORTANT: This implementation uses DYNAMIC quantization:
+- Quantizes: Model WEIGHTS (Linear, LSTM, GRU layers) → INT8
+- Does NOT quantize: ACTIVATIONS/intermediate tensors → remain FP32
+- Use case: Reduce model size and memory bandwidth for transfer
+
+For full INT8 quantization (including activations), static quantization 
+with calibration is required
 """
 
 import copy
@@ -25,9 +33,14 @@ class ModelQuantizer:
     - Keeps activations in FP32 (maintains accuracy)
     - Reduces memory bandwidth requirements
     - Improves inference speed on CPU
+    
+    Note: Dynamic quantization is optimized for layers with large weight matrices.
+    Convolutional layers (Conv1d, Conv2d, Conv3d) are NOT supported by dynamic
+    quantization and require static quantization instead.
     """
     
-    # Layers that support dynamic quantization
+    # Layers that support dynamic quantization (per PyTorch 2.9+ documentation)
+    # See: https://pytorch.org/docs/stable/generated/torch.ao.quantization.quantize_dynamic.html
     QUANTIZABLE_LAYERS = {nn.Linear, nn.LSTM, nn.GRU, nn.LSTMCell, nn.GRUCell, nn.RNNCell}
     
     def __init__(self):
@@ -155,6 +168,74 @@ class ModelQuantizer:
         self._quantized_models.clear()
         self._size_metrics.clear()
         logger.info("Cleared quantization cache")
+    
+    @staticmethod
+    def quantize_tensor(
+        tensor: torch.Tensor,
+        dtype: torch.dtype = torch.qint8
+    ) -> torch.Tensor:
+        """Quantize a single tensor for efficient transfer/storage.
+        
+        Converts FP32 tensors to INT8 using linear scaling. This reduces
+        tensor size by ~4x for network transfer between edge and cloud.
+        
+        Args:
+            tensor: Input tensor to quantize (must be float type)
+            dtype: Target quantized dtype (default: torch.qint8)
+            
+        Returns:
+            Quantized tensor with built-in scale and zero-point parameters
+            
+        Note:
+            Dequantization is handled by PyTorch's built-in .dequantize() method
+            which reconstructs the FP32 approximation: tensor_fp32 = scale * (tensor_int8 - zero_point)
+        """
+        if not tensor.is_floating_point():
+            raise ValueError(f"Can only quantize float tensors, got {tensor.dtype}")
+        
+        # Calculate scale and zero_point
+        min_val = tensor.min()
+        max_val = tensor.max()
+        
+        # Determine quantization parameters based on dtype
+        if dtype == torch.qint8:
+            qmin, qmax = -128, 127
+        elif dtype == torch.quint8:
+            qmin, qmax = 0, 255
+        else:
+            raise ValueError(f"Unsupported quantization dtype: {dtype}")
+        
+        # Compute scale and zero_point
+        scale = (max_val - min_val) / (qmax - qmin)
+        zero_point = qmin - torch.round(min_val / scale).to(torch.int)
+        
+        # Clamp zero_point to valid range
+        zero_point = torch.clamp(zero_point, qmin, qmax).item()
+        
+        # Quantize the tensor
+        quantized = torch.quantize_per_tensor(
+            tensor,
+            scale=scale.item(),
+            zero_point=int(zero_point),
+            dtype=dtype
+        )
+        
+        return quantized
+    
+    @staticmethod
+    def calculate_tensor_compression_ratio(original: torch.Tensor, quantized: torch.Tensor) -> float:
+        """Calculate compression ratio achieved by tensor quantization.
+        
+        Args:
+            original: Original FP32 tensor
+            quantized: Quantized tensor
+            
+        Returns:
+            Compression ratio (e.g., 4.0 means 4x smaller)
+        """
+        original_size = original.numel() * original.element_size()
+        quantized_size = quantized.numel() * quantized.element_size()
+        return original_size / quantized_size if quantized_size > 0 else 1.0
 
 
 __all__ = ["ModelQuantizer"]

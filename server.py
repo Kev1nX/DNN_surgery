@@ -171,9 +171,9 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                     error_message=error_msg
                 )
                 
-            # Convert proto to tensor
+            # Convert proto to tensor (automatically dequantizes if quantized)
             request_start_time = time.perf_counter()
-            input_tensor = proto_to_tensor(request.tensor, device=self.device)
+            input_tensor = proto_to_tensor(request.tensor, device=self.device, dequantize=True)
             
             # Log input tensor stats
             logging.info("=== Cloud Model Processing ===")
