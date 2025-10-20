@@ -326,7 +326,6 @@ def run_distributed_inference(
             logging.info(f"NeuroSurgeon optimal split point: {split_point}")
             logging.info(f"Predicted total time: {analysis['min_total_time']:.2f}ms")
             split_summary = analysis.get("split_summary")
-            logging.info("Split timing summary:\n%s", analysis.get("split_summary_table", "(none)"))
         else:
             logging.info(f"Using manual split point: {split_point}")
             success = dnn_surgery._send_split_decision_to_server(split_point, server_address)
