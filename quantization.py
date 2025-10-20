@@ -3,19 +3,10 @@
 Implements dynamic quantization (INT8) for both client and server models.
 Dynamic quantization converts weights to INT8 while keeping activations in FP32,
 providing a good balance between performance and accuracy for inference.
-
-IMPORTANT: This implementation uses DYNAMIC quantization:
-- Quantizes: Model WEIGHTS (Linear, LSTM, GRU layers) → INT8
-- Does NOT quantize: ACTIVATIONS/intermediate tensors → remain FP32
-- Use case: Reduce model size and memory bandwidth for transfer
-
-For full INT8 quantization (including activations), static quantization 
-with calibration is required
 """
 
-import copy
 import logging
-from typing import Optional
+from typing import Optional, Set
 import torch
 import torch.nn as nn
 from torch.quantization import quantize_dynamic
@@ -33,19 +24,13 @@ class ModelQuantizer:
     - Keeps activations in FP32 (maintains accuracy)
     - Reduces memory bandwidth requirements
     - Improves inference speed on CPU
-    
-    Note: Dynamic quantization is optimized for layers with large weight matrices.
-    Convolutional layers (Conv1d, Conv2d, Conv3d) are NOT supported by dynamic
-    quantization and require static quantization instead.
     """
     
-    # Layers that support dynamic quantization (per PyTorch 2.9+ documentation)
-    # See: https://pytorch.org/docs/stable/generated/torch.ao.quantization.quantize_dynamic.html
+    # Layers that support dynamic quantization
     QUANTIZABLE_LAYERS = {nn.Linear, nn.LSTM, nn.GRU, nn.LSTMCell, nn.GRUCell, nn.RNNCell}
     
     def __init__(self):
         self._quantized_models = {}
-        self._size_metrics = {}  # Track original and quantized sizes
         logger.info("Initialized ModelQuantizer with dynamic INT8 quantization")
     
     def quantize_model(
@@ -106,17 +91,8 @@ class ModelQuantizer:
                 f"  Memory saved: {(original_size - quantized_size) / 1e6:.2f} MB"
             )
             
-            # Cache the quantized model and size metrics
+            # Cache the quantized model
             self._quantized_models[model_name] = quantized_model
-            self._size_metrics[model_name] = {
-                'original_size_bytes': original_size,
-                'quantized_size_bytes': quantized_size,
-                'original_size_mb': original_size / 1e6,
-                'quantized_size_mb': quantized_size / 1e6,
-                'compression_ratio': compression_ratio,
-                'memory_saved_mb': (original_size - quantized_size) / 1e6,
-                'num_quantizable_layers': num_quantizable,
-            }
             
             return quantized_model
             
@@ -126,11 +102,26 @@ class ModelQuantizer:
             raise RuntimeError(error_msg) from e
     
     def _prepare_model_copy(self, model: nn.Module) -> nn.Module:
-        """Create a deep copy of the model for quantization."""
+        """Create a deep copy of the model for quantization.
+        
+        Args:
+            model: Original model
+            
+        Returns:
+            Deep copy of the model
+        """
+        import copy
         return copy.deepcopy(model)
     
     def _count_quantizable_layers(self, model: nn.Module) -> int:
-        """Count the number of quantizable layers in the model."""
+        """Count the number of quantizable layers in the model.
+        
+        Args:
+            model: Model to analyze
+            
+        Returns:
+            Number of quantizable layers
+        """
         count = 0
         for module in model.modules():
             if type(module) in self.QUANTIZABLE_LAYERS:
@@ -138,7 +129,14 @@ class ModelQuantizer:
         return count
     
     def _calculate_model_size(self, model: nn.Module) -> int:
-        """Calculate the size of a model in bytes."""
+        """Calculate the size of a model in bytes.
+        
+        Args:
+            model: Model to measure
+            
+        Returns:
+            Size in bytes
+        """
         total_size = 0
         for param in model.parameters():
             total_size += param.numel() * param.element_size()
@@ -147,95 +145,89 @@ class ModelQuantizer:
         return total_size
     
     def get_quantized_model(self, model_name: str) -> Optional[nn.Module]:
-        """Retrieve a cached quantized model."""
-        return self._quantized_models.get(model_name)
-    
-    def get_size_metrics(self, model_name: str = None):
-        """Retrieve size metrics for a specific model or all models.
+        """Retrieve a cached quantized model.
         
         Args:
-            model_name: Optional model name. If None, returns metrics for all models.
+            model_name: Name of the quantized model
             
         Returns:
-            Dictionary of size metrics for the specified model, or dict of all metrics.
+            Quantized model if found, None otherwise
         """
-        if model_name is not None:
-            return self._size_metrics.get(model_name)
-        return self._size_metrics.copy()
+        return self._quantized_models.get(model_name)
     
     def clear_cache(self) -> None:
         """Clear all cached quantized models."""
         self._quantized_models.clear()
-        self._size_metrics.clear()
         logger.info("Cleared quantization cache")
-    
-    @staticmethod
-    def quantize_tensor(
-        tensor: torch.Tensor,
-        dtype: torch.dtype = torch.qint8
-    ) -> torch.Tensor:
-        """Quantize a single tensor for efficient transfer/storage.
-        
-        Converts FP32 tensors to INT8 using linear scaling. This reduces
-        tensor size by ~4x for network transfer between edge and cloud.
-        
-        Args:
-            tensor: Input tensor to quantize (must be float type)
-            dtype: Target quantized dtype (default: torch.qint8)
-            
-        Returns:
-            Quantized tensor with built-in scale and zero-point parameters
-            
-        Note:
-            Dequantization is handled by PyTorch's built-in .dequantize() method
-            which reconstructs the FP32 approximation: tensor_fp32 = scale * (tensor_int8 - zero_point)
-        """
-        if not tensor.is_floating_point():
-            raise ValueError(f"Can only quantize float tensors, got {tensor.dtype}")
-        
-        # Calculate scale and zero_point
-        min_val = tensor.min()
-        max_val = tensor.max()
-        
-        # Determine quantization parameters based on dtype
-        if dtype == torch.qint8:
-            qmin, qmax = -128, 127
-        elif dtype == torch.quint8:
-            qmin, qmax = 0, 255
-        else:
-            raise ValueError(f"Unsupported quantization dtype: {dtype}")
-        
-        # Compute scale and zero_point
-        scale = (max_val - min_val) / (qmax - qmin)
-        zero_point = qmin - torch.round(min_val / scale).to(torch.int)
-        
-        # Clamp zero_point to valid range
-        zero_point = torch.clamp(zero_point, qmin, qmax).item()
-        
-        # Quantize the tensor
-        quantized = torch.quantize_per_tensor(
-            tensor,
-            scale=scale.item(),
-            zero_point=int(zero_point),
-            dtype=dtype
-        )
-        
-        return quantized
-    
-    @staticmethod
-    def calculate_tensor_compression_ratio(original: torch.Tensor, quantized: torch.Tensor) -> float:
-        """Calculate compression ratio achieved by tensor quantization.
-        
-        Args:
-            original: Original FP32 tensor
-            quantized: Quantized tensor
-            
-        Returns:
-            Compression ratio (e.g., 4.0 means 4x smaller)
-        """
-        original_size = original.numel() * original.element_size()
-        quantized_size = quantized.numel() * quantized.element_size()
-        return original_size / quantized_size if quantized_size > 0 else 1.0
 
 
-__all__ = ["ModelQuantizer"]
+def quantize_for_inference(
+    model: nn.Module,
+    model_name: str = "model"
+) -> nn.Module:
+    """Convenience function to quantize a model for inference.
+    
+    Args:
+        model: PyTorch model to quantize
+        model_name: Name identifier for logging
+        
+    Returns:
+        Quantized model ready for inference
+        
+    Example:
+        >>> model = models.resnet18(pretrained=True)
+        >>> quantized_model = quantize_for_inference(model, "resnet18")
+        >>> result = quantized_model(input_tensor)
+    """
+    quantizer = ModelQuantizer()
+    return quantizer.quantize_model(model, model_name, inplace=False)
+
+
+def compare_model_sizes(
+    original_model: nn.Module,
+    quantized_model: nn.Module,
+    model_name: str = "model"
+) -> dict:
+    """Compare sizes and compression ratio between original and quantized models.
+    
+    Args:
+        original_model: Original FP32 model
+        quantized_model: Quantized INT8 model
+        model_name: Name for logging
+        
+    Returns:
+        Dictionary with size comparison metrics
+    """
+    quantizer = ModelQuantizer()
+    
+    original_size = quantizer._calculate_model_size(original_model)
+    quantized_size = quantizer._calculate_model_size(quantized_model)
+    
+    compression_ratio = original_size / quantized_size if quantized_size > 0 else 1.0
+    memory_saved = original_size - quantized_size
+    
+    comparison = {
+        "model_name": model_name,
+        "original_size_mb": original_size / 1e6,
+        "quantized_size_mb": quantized_size / 1e6,
+        "compression_ratio": compression_ratio,
+        "memory_saved_mb": memory_saved / 1e6,
+        "size_reduction_percent": (memory_saved / original_size * 100) if original_size > 0 else 0
+    }
+    
+    logger.info(
+        f"Size comparison for {model_name}:\n"
+        f"  Original: {comparison['original_size_mb']:.2f} MB\n"
+        f"  Quantized: {comparison['quantized_size_mb']:.2f} MB\n"
+        f"  Compression: {compression_ratio:.2f}x\n"
+        f"  Saved: {comparison['memory_saved_mb']:.2f} MB ({comparison['size_reduction_percent']:.1f}%)"
+    )
+    
+    return comparison
+
+
+__all__ = [
+    "ModelQuantizer",
+    "quantize_for_inference",
+    "compare_model_sizes",
+]
