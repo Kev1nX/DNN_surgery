@@ -316,6 +316,7 @@ def run_batch_processing(
     
     all_timings = []
     optimal_split_found = None
+    reusable_client = None  # Client instance to reuse across batches
     
     logger.info(f"Starting batch processing: {num_batches} batches of size {batch_size}")
     
@@ -399,17 +400,20 @@ def run_batch_processing(
             else:
                 # Standard inference without early exit
                 if optimal_split_found is not None:
-                    # Reuse previously found optimal split
-                    result, timings = run_distributed_inference(
-                        model_name,
-                        input_tensor,
-                        dnn_surgery,
-                        optimal_split_found,
-                        server_address,
-                        auto_plot=False,
-                        plot_show=plot_show,
-                        plot_path=plot_path,
-                    )
+                    # Reuse previously found optimal split with persistent client
+                    if reusable_client is None:
+                        # Create client once for this split point
+                        dnn_surgery.splitter.set_split_point(optimal_split_found)
+                        edge_model = dnn_surgery.splitter.get_edge_model(
+                            quantize=enable_quantization,
+                            quantizer=dnn_surgery.quantizer
+                        )
+                        reusable_client = DNNInferenceClient(server_address, edge_model, quantize_transfer=quantize_transfer)
+                    
+                    # Reuse client for this batch
+                    requires_cloud = dnn_surgery.splitter.get_cloud_model() is not None
+                    result, timings = reusable_client.process_tensor(input_tensor, model_name, requires_cloud)
+                    timings['split_point'] = optimal_split_found
                 else:
                     # Find optimal split for first batch
                     result, timings = run_distributed_inference(
