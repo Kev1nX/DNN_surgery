@@ -292,7 +292,7 @@ class ModelSplitter:
             if quantizer is None:
                 logger.warning("Quantization requested but no quantizer provided. Returning non-quantized edge model.")
             else:
-                edge_model = quantizer.quantize_edge_model(edge_model, self.model_name)
+                edge_model = quantizer.quantize_model(edge_model, f"{self.model_name}_edge", inplace=False)
         
         return edge_model
         
@@ -371,7 +371,7 @@ class ModelSplitter:
             if quantizer is None:
                 logger.warning("Quantization requested but no quantizer provided. Returning non-quantized cloud model.")
             else:
-                cloud_model = quantizer.quantize_cloud_model(cloud_model, self.model_name)
+                cloud_model = quantizer.quantize_model(cloud_model, f"{self.model_name}_cloud", inplace=False)
         
         return cloud_model
 
