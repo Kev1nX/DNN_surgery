@@ -982,12 +982,15 @@ def test_all_models_neurosurgeon(
             if use_early_split and early_exit_counts:
                 logger.info(f"  Early exits: {np.mean(early_exit_rates)*100:.1f}% (avg {np.mean(early_exit_counts):.1f}/batch)")
             
-            # Collect quantization metrics if enabled
+            # Collect quantization metrics if enabled (edge models only)
             if enable_quantization:
                 model_metrics = dnn_surgery.quantizer.get_size_metrics()
                 if model_metrics:
-                    all_quantization_metrics.update(model_metrics)
-                    logger.info(f"  Quantization metrics collected: {len(model_metrics)} entries")
+                    # Filter to only include edge model metrics (cloud models are never quantized)
+                    edge_metrics = {k: v for k, v in model_metrics.items() if '_edge' in k}
+                    if edge_metrics:
+                        all_quantization_metrics.update(edge_metrics)
+                        logger.info(f"  Quantization metrics collected: {len(edge_metrics)} edge model entries")
             
         except Exception as e:
             logger.error(f"Failed to test {model_name}: {str(e)}")
