@@ -50,31 +50,39 @@ def tensor_to_proto(
     if ensure_cpu and tensor.device.type != "cpu":
         tensor = tensor.cpu()
 
+    # Store original shape BEFORE quantization (quantized tensors can have shape issues)
+    original_shape = list(tensor.shape)
+    original_dtype = str(tensor.dtype)
+
     # Apply quantization if requested and tensor is float
-    original_dtype = tensor.dtype
     was_quantized = False
     if quantize and tensor.is_floating_point():
         try:
             from quantization import ModelQuantizer
+            # Quantize the tensor - this preserves shape but changes dtype
             tensor = ModelQuantizer.quantize_tensor(tensor)
             was_quantized = True
             logger.debug(
-                "Quantized tensor for transfer - original dtype=%s, quantized dtype=%s",
+                "Quantized tensor for transfer - shape=%s, original dtype=%s, quantized dtype=%s",
+                tuple(original_shape),
                 original_dtype,
                 tensor.dtype,
             )
         except Exception as e:
             logger.warning("Failed to quantize tensor for transfer: %s. Sending as FP32.", e)
+            was_quantized = False
 
+    # Serialize the tensor (quantized or FP32)
     buffer = io.BytesIO()
     torch.save(tensor, buffer)
     tensor_bytes = buffer.getvalue()
 
-    shape = dnn_inference_pb2.TensorShape(dimensions=list(tensor.shape))
+    # Use original shape (before quantization) to avoid shape corruption
+    shape = dnn_inference_pb2.TensorShape(dimensions=original_shape)
 
     logger.debug(
         "Serialized tensor - shape=%s, dtype=%s, bytes=%d, quantized=%s",
-        tuple(tensor.shape),
+        tuple(original_shape),
         tensor.dtype,
         len(tensor_bytes),
         was_quantized,
@@ -83,7 +91,7 @@ def tensor_to_proto(
     return dnn_inference_pb2.Tensor(
         data=tensor_bytes,
         shape=shape,
-        dtype=str(tensor.dtype),
+        dtype=original_dtype if was_quantized else str(tensor.dtype),
         requires_grad=tensor.requires_grad,
     )
 
@@ -110,16 +118,38 @@ def proto_to_tensor(
     buffer = io.BytesIO(proto.data)
     tensor = torch.load(buffer, map_location=map_location)
 
-    # Automatically dequantize if tensor is quantized
-    was_quantized = tensor.is_quantized if hasattr(tensor, 'is_quantized') else False
+    # Check if tensor is quantized and needs dequantization
+    was_quantized = hasattr(tensor, 'is_quantized') and tensor.is_quantized
+    
     if dequantize and was_quantized:
         original_dtype = tensor.dtype
         tensor = tensor.dequantize()
         logger.debug(
-            "Dequantized tensor - original dtype=%s, dequantized dtype=%s",
+            "Dequantized tensor - original dtype=%s, dequantized dtype=%s, shape=%s",
             original_dtype,
             tensor.dtype,
+            tuple(tensor.shape),
         )
+        
+        # Verify shape matches proto metadata
+        expected_shape = tuple(proto.shape.dimensions)
+        if tuple(tensor.shape) != expected_shape:
+            logger.warning(
+                "Shape mismatch after dequantization! Expected %s but got %s. "
+                "This may indicate quantization corruption.",
+                expected_shape,
+                tuple(tensor.shape),
+            )
+            # Try to reshape if dimensions match
+            if tensor.numel() == torch.prod(torch.tensor(expected_shape)).item():
+                logger.info("Reshaping tensor from %s to %s", tuple(tensor.shape), expected_shape)
+                tensor = tensor.reshape(expected_shape)
+            else:
+                logger.error(
+                    "Cannot reshape - element count mismatch: %d vs %d",
+                    tensor.numel(),
+                    torch.prod(torch.tensor(expected_shape)).item(),
+                )
 
     if device is not None:
         tensor = tensor.to(device)
