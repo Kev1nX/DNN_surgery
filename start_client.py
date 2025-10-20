@@ -409,11 +409,16 @@ def run_batch_processing(
                             quantizer=dnn_surgery.quantizer
                         )
                         reusable_client = DNNInferenceClient(server_address, edge_model, quantize_transfer=quantize_transfer)
+                        logger.info(f"Created reusable client for split point {optimal_split_found}")
                     
                     # Reuse client for this batch
                     requires_cloud = dnn_surgery.splitter.get_cloud_model() is not None
                     result, timings = reusable_client.process_tensor(input_tensor, model_name, requires_cloud)
+                    
+                    # Add split point and timing summary
                     timings['split_point'] = optimal_split_found
+                    timing_summary = reusable_client.get_timing_summary()
+                    timings.update(timing_summary)
                 else:
                     # Find optimal split for first batch
                     result, timings = run_distributed_inference(
