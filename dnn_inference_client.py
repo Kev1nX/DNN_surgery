@@ -129,10 +129,6 @@ class DNNInferenceClient:
                 sample_metrics = {'edge_time': 0.0, 'transfer_time': 0.0, 'cloud_time': 0.0}
 
                 logging.info(f"Processing sample {idx + 1}/{batch_size} with shape {sample.shape}")
-                logging.info(
-                    f"Input tensor stats - Min: {sample.min().item():.3f}, Max: {sample.max().item():.3f}, "
-                    f"Mean: {sample.mean().item():.3f}"
-                )
 
                 # Stage S1: edge inference
                 if self.edge_model is not None:

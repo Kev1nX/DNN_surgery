@@ -178,8 +178,6 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             # Log input tensor stats
             logging.info("=== Cloud Model Processing ===")
             logging.info(f"Input tensor shape: {input_tensor.shape}")
-            logging.info(f"Input tensor stats - Min: {input_tensor.min().item():.3f}, Max: {input_tensor.max().item():.3f}, Mean: {input_tensor.mean().item():.3f}")
-            
             # Run inference with timing
             compute_start_time = time.perf_counter()
             with torch.no_grad():
