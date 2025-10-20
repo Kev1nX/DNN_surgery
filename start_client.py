@@ -799,6 +799,7 @@ def test_all_models_neurosurgeon(
     initialize_dataset_loader(batch_size)
     
     all_model_timings = {}
+    all_quantization_metrics = {}  # Collect quantization metrics from all models
     
     # Build configuration description
     config_parts = []
@@ -942,6 +943,13 @@ def test_all_models_neurosurgeon(
             if use_early_split and early_exit_counts:
                 logger.info(f"  Early exits: {np.mean(early_exit_rates)*100:.1f}% (avg {np.mean(early_exit_counts):.1f}/batch)")
             
+            # Collect quantization metrics if enabled
+            if enable_quantization:
+                model_metrics = dnn_surgery.quantizer.get_size_metrics()
+                if model_metrics:
+                    all_quantization_metrics.update(model_metrics)
+                    logger.info(f"  Quantization metrics collected: {len(model_metrics)} entries")
+            
         except Exception as e:
             logger.error(f"Failed to test {model_name}: {str(e)}")
             import traceback
@@ -1012,24 +1020,20 @@ def test_all_models_neurosurgeon(
             logger.info("QUANTIZATION METRICS")
             logger.info("="*80)
             
-            from quantization import ModelQuantizer
-            quantizer = ModelQuantizer()
-            size_metrics = quantizer.get_size_metrics()
-            
-            if size_metrics:
+            if all_quantization_metrics:
                 # Log quantization summary
                 for model_name in SUPPORTED_MODELS:
                     edge_key = f"{model_name}_edge"
                     cloud_key = f"{model_name}_cloud"
                     
-                    if edge_key in size_metrics:
-                        metrics = size_metrics[edge_key]
+                    if edge_key in all_quantization_metrics:
+                        metrics = all_quantization_metrics[edge_key]
                         logger.info(f"{model_name} (edge model):")
                         logger.info(f"  Original: {metrics['original_size_mb']:.2f} MB → Quantized: {metrics['quantized_size_mb']:.2f} MB")
                         logger.info(f"  Compression: {metrics['compression_ratio']:.2f}x ({metrics['num_quantizable_layers']} layers)")
                     
-                    if cloud_key in size_metrics:
-                        metrics = size_metrics[cloud_key]
+                    if cloud_key in all_quantization_metrics:
+                        metrics = all_quantization_metrics[cloud_key]
                         logger.info(f"{model_name} (cloud model):")
                         logger.info(f"  Original: {metrics['original_size_mb']:.2f} MB → Quantized: {metrics['quantized_size_mb']:.2f} MB")
                         logger.info(f"  Compression: {metrics['compression_ratio']:.2f}x ({metrics['num_quantizable_layers']} layers)")
@@ -1045,7 +1049,7 @@ def test_all_models_neurosurgeon(
                     # Bar chart comparison
                     quant_bar_path = plot_dir / f"quantization_comparison_{timestamp}.png"
                     plot_quantization_comparison_bar(
-                        size_metrics,
+                        all_quantization_metrics,
                         show=plot_show,
                         save_path=str(quant_bar_path),
                         title="Model Quantization Compression (INT8)"
@@ -1055,7 +1059,7 @@ def test_all_models_neurosurgeon(
                     # Detailed size reduction plot
                     quant_detail_path = plot_dir / f"quantization_size_reduction_{timestamp}.png"
                     plot_quantization_size_reduction(
-                        size_metrics,
+                        all_quantization_metrics,
                         show=plot_show,
                         save_path=str(quant_detail_path),
                         title="Model Size Reduction via Quantization"
@@ -1064,8 +1068,10 @@ def test_all_models_neurosurgeon(
                     
                 except Exception as e:
                     logger.error(f"Failed to generate quantization plots: {e}")
+                    import traceback
+                    traceback.print_exc()
             else:
-                logger.warning("No quantization metrics available to plot")
+                logger.warning("No quantization metrics collected from any model")
     
     return all_model_timings
 
