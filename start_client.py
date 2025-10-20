@@ -316,7 +316,6 @@ def run_batch_processing(
     
     all_timings = []
     optimal_split_found = None
-    reusable_client = None  # Client instance to reuse across batches
     
     logger.info(f"Starting batch processing: {num_batches} batches of size {batch_size}")
     
@@ -400,25 +399,17 @@ def run_batch_processing(
             else:
                 # Standard inference without early exit
                 if optimal_split_found is not None:
-                    # Reuse previously found optimal split with persistent client
-                    if reusable_client is None:
-                        # Create client once for this split point
-                        dnn_surgery.splitter.set_split_point(optimal_split_found)
-                        edge_model = dnn_surgery.splitter.get_edge_model(
-                            quantize=enable_quantization,
-                            quantizer=dnn_surgery.quantizer
-                        )
-                        reusable_client = DNNInferenceClient(server_address, edge_model, quantize_transfer=quantize_transfer)
-                        logger.info(f"Created reusable client for split point {optimal_split_found}")
-                    
-                    # Reuse client for this batch
-                    requires_cloud = dnn_surgery.splitter.get_cloud_model() is not None
-                    result, timings = reusable_client.process_tensor(input_tensor, model_name, requires_cloud)
-                    
-                    # Add split point and timing summary
-                    timings['split_point'] = optimal_split_found
-                    timing_summary = reusable_client.get_timing_summary()
-                    timings.update(timing_summary)
+                    # Reuse previously found optimal split
+                    result, timings = run_distributed_inference(
+                        model_name,
+                        input_tensor,
+                        dnn_surgery,
+                        optimal_split_found,
+                        server_address,
+                        auto_plot=False,
+                        plot_show=plot_show,
+                        plot_path=plot_path,
+                    )
                 else:
                     # Find optimal split for first batch
                     result, timings = run_distributed_inference(
@@ -434,38 +425,6 @@ def run_batch_processing(
                     optimal_split_found = timings.get('split_point', 2)
                     should_plot = False
                     logger.info(f"Found optimal split point: {optimal_split_found} (will reuse for remaining batches)")
-                    
-                    # Generate split comparison plot from NeuroSurgeon profiling data
-                    if 'split_analysis' in timings and auto_plot:
-                        split_analysis_data = timings['split_analysis']
-                        all_splits = split_analysis_data.get('all_splits', {})
-                        
-                        if all_splits:
-                            try:
-                                # Convert to format expected by plot_actual_split_comparison
-                                # It expects: Dict[int, Dict[str, Sequence[float]]]
-                                split_component_timings = {}
-                                for split_pt, timing_data in all_splits.items():
-                                    split_component_timings[split_pt] = {
-                                        'edge': [timing_data['edge_time']],
-                                        'transfer': [timing_data['transfer_time']],
-                                        'cloud': [timing_data['cloud_time']],
-                                        'total': [timing_data['total_time']],
-                                    }
-                                
-                                comparison_plot_path = Path(plot_path or "plots") / f"{model_name}_split_comparison_{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
-                                comparison_plot_path.parent.mkdir(parents=True, exist_ok=True)
-                                
-                                plot_actual_split_comparison(
-                                    split_component_timings,
-                                    show=plot_show,
-                                    save_path=str(comparison_plot_path),
-                                    title=f"Measured Inference Timings ({model_name})"
-                                )
-                                logger.info(f"✓ Split comparison chart saved: {comparison_plot_path.name}")
-                                
-                            except Exception as e:
-                                logger.error(f"Failed to generate split comparison plot: {e}")
         predicted_plot_path = timings.get('predicted_split_plot_path')
         actual_plot_path = timings.get('actual_split_plot_path')
         if predicted_plot_path:
@@ -982,6 +941,12 @@ def test_all_models_neurosurgeon(
             if use_early_split and early_exit_counts:
                 logger.info(f"  Early exits: {np.mean(early_exit_rates)*100:.1f}% (avg {np.mean(early_exit_counts):.1f}/batch)")
             
+            # Collect quantization metrics if enabled
+            if enable_quantization:
+                model_metrics = dnn_surgery.quantizer.get_size_metrics()
+                if model_metrics:
+                    all_quantization_metrics.update(model_metrics)
+                    logger.info(f"  Quantization metrics collected: {len(model_metrics)} entries")
             
         except Exception as e:
             logger.error(f"Failed to test {model_name}: {str(e)}")
@@ -1046,6 +1011,65 @@ def test_all_models_neurosurgeon(
             Path(plot_path or "plots"), all_model_timings,
             f"NeuroSurgeon Optimal Split ({config_desc})", f"all_models_neurosurgeon{suffix}", plot_show
         )
+        
+        # Generate quantization plots if model quantization was enabled
+        if enable_quantization:
+            logger.info("\n" + "="*80)
+            logger.info("QUANTIZATION METRICS")
+            logger.info("="*80)
+            
+            if all_quantization_metrics:
+                # Log quantization summary
+                for model_name in SUPPORTED_MODELS:
+                    edge_key = f"{model_name}_edge"
+                    cloud_key = f"{model_name}_cloud"
+                    
+                    if edge_key in all_quantization_metrics:
+                        metrics = all_quantization_metrics[edge_key]
+                        logger.info(f"{model_name} (edge model):")
+                        logger.info(f"  Original: {metrics['original_size_mb']:.2f} MB → Quantized: {metrics['quantized_size_mb']:.2f} MB")
+                        logger.info(f"  Compression: {metrics['compression_ratio']:.2f}x ({metrics['num_quantizable_layers']} layers)")
+                    
+                    if cloud_key in all_quantization_metrics:
+                        metrics = all_quantization_metrics[cloud_key]
+                        logger.info(f"{model_name} (cloud model):")
+                        logger.info(f"  Original: {metrics['original_size_mb']:.2f} MB → Quantized: {metrics['quantized_size_mb']:.2f} MB")
+                        logger.info(f"  Compression: {metrics['compression_ratio']:.2f}x ({metrics['num_quantizable_layers']} layers)")
+                
+                logger.info("="*80)
+                
+                # Generate quantization visualization plots
+                try:
+                    plot_dir = Path(plot_path or "plots")
+                    plot_dir.mkdir(parents=True, exist_ok=True)
+                    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    
+                    # Bar chart comparison
+                    quant_bar_path = plot_dir / f"quantization_comparison_{timestamp}.png"
+                    plot_quantization_comparison_bar(
+                        all_quantization_metrics,
+                        show=plot_show,
+                        save_path=str(quant_bar_path),
+                        title="Model Quantization Compression (INT8)"
+                    )
+                    logger.info(f"✓ Quantization comparison chart saved: {quant_bar_path.name}")
+                    
+                    # Detailed size reduction plot
+                    quant_detail_path = plot_dir / f"quantization_size_reduction_{timestamp}.png"
+                    plot_quantization_size_reduction(
+                        all_quantization_metrics,
+                        show=plot_show,
+                        save_path=str(quant_detail_path),
+                        title="Model Size Reduction via Quantization"
+                    )
+                    logger.info(f"✓ Quantization size reduction chart saved: {quant_detail_path.name}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to generate quantization plots: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                logger.warning("No quantization metrics collected from any model")
     
     return all_model_timings
 

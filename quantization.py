@@ -5,8 +5,9 @@ Dynamic quantization converts weights to INT8 while keeping activations in FP32,
 providing a good balance between performance and accuracy for inference.
 """
 
+import copy
 import logging
-from typing import Optional, Set
+from typing import Optional
 import torch
 import torch.nn as nn
 from torch.quantization import quantize_dynamic
@@ -31,6 +32,7 @@ class ModelQuantizer:
     
     def __init__(self):
         self._quantized_models = {}
+        self._size_metrics = {}  # Track original and quantized sizes
         logger.info("Initialized ModelQuantizer with dynamic INT8 quantization")
     
     def quantize_model(
@@ -91,8 +93,17 @@ class ModelQuantizer:
                 f"  Memory saved: {(original_size - quantized_size) / 1e6:.2f} MB"
             )
             
-            # Cache the quantized model
+            # Cache the quantized model and size metrics
             self._quantized_models[model_name] = quantized_model
+            self._size_metrics[model_name] = {
+                'original_size_bytes': original_size,
+                'quantized_size_bytes': quantized_size,
+                'original_size_mb': original_size / 1e6,
+                'quantized_size_mb': quantized_size / 1e6,
+                'compression_ratio': compression_ratio,
+                'memory_saved_mb': (original_size - quantized_size) / 1e6,
+                'num_quantizable_layers': num_quantizable,
+            }
             
             return quantized_model
             
@@ -102,26 +113,11 @@ class ModelQuantizer:
             raise RuntimeError(error_msg) from e
     
     def _prepare_model_copy(self, model: nn.Module) -> nn.Module:
-        """Create a deep copy of the model for quantization.
-        
-        Args:
-            model: Original model
-            
-        Returns:
-            Deep copy of the model
-        """
-        import copy
+        """Create a deep copy of the model for quantization."""
         return copy.deepcopy(model)
     
     def _count_quantizable_layers(self, model: nn.Module) -> int:
-        """Count the number of quantizable layers in the model.
-        
-        Args:
-            model: Model to analyze
-            
-        Returns:
-            Number of quantizable layers
-        """
+        """Count the number of quantizable layers in the model."""
         count = 0
         for module in model.modules():
             if type(module) in self.QUANTIZABLE_LAYERS:
@@ -129,14 +125,7 @@ class ModelQuantizer:
         return count
     
     def _calculate_model_size(self, model: nn.Module) -> int:
-        """Calculate the size of a model in bytes.
-        
-        Args:
-            model: Model to measure
-            
-        Returns:
-            Size in bytes
-        """
+        """Calculate the size of a model in bytes."""
         total_size = 0
         for param in model.parameters():
             total_size += param.numel() * param.element_size()
@@ -145,89 +134,27 @@ class ModelQuantizer:
         return total_size
     
     def get_quantized_model(self, model_name: str) -> Optional[nn.Module]:
-        """Retrieve a cached quantized model.
+        """Retrieve a cached quantized model."""
+        return self._quantized_models.get(model_name)
+    
+    def get_size_metrics(self, model_name: str = None):
+        """Retrieve size metrics for a specific model or all models.
         
         Args:
-            model_name: Name of the quantized model
+            model_name: Optional model name. If None, returns metrics for all models.
             
         Returns:
-            Quantized model if found, None otherwise
+            Dictionary of size metrics for the specified model, or dict of all metrics.
         """
-        return self._quantized_models.get(model_name)
+        if model_name is not None:
+            return self._size_metrics.get(model_name)
+        return self._size_metrics.copy()
     
     def clear_cache(self) -> None:
         """Clear all cached quantized models."""
         self._quantized_models.clear()
+        self._size_metrics.clear()
         logger.info("Cleared quantization cache")
 
 
-def quantize_for_inference(
-    model: nn.Module,
-    model_name: str = "model"
-) -> nn.Module:
-    """Convenience function to quantize a model for inference.
-    
-    Args:
-        model: PyTorch model to quantize
-        model_name: Name identifier for logging
-        
-    Returns:
-        Quantized model ready for inference
-        
-    Example:
-        >>> model = models.resnet18(pretrained=True)
-        >>> quantized_model = quantize_for_inference(model, "resnet18")
-        >>> result = quantized_model(input_tensor)
-    """
-    quantizer = ModelQuantizer()
-    return quantizer.quantize_model(model, model_name, inplace=False)
-
-
-def compare_model_sizes(
-    original_model: nn.Module,
-    quantized_model: nn.Module,
-    model_name: str = "model"
-) -> dict:
-    """Compare sizes and compression ratio between original and quantized models.
-    
-    Args:
-        original_model: Original FP32 model
-        quantized_model: Quantized INT8 model
-        model_name: Name for logging
-        
-    Returns:
-        Dictionary with size comparison metrics
-    """
-    quantizer = ModelQuantizer()
-    
-    original_size = quantizer._calculate_model_size(original_model)
-    quantized_size = quantizer._calculate_model_size(quantized_model)
-    
-    compression_ratio = original_size / quantized_size if quantized_size > 0 else 1.0
-    memory_saved = original_size - quantized_size
-    
-    comparison = {
-        "model_name": model_name,
-        "original_size_mb": original_size / 1e6,
-        "quantized_size_mb": quantized_size / 1e6,
-        "compression_ratio": compression_ratio,
-        "memory_saved_mb": memory_saved / 1e6,
-        "size_reduction_percent": (memory_saved / original_size * 100) if original_size > 0 else 0
-    }
-    
-    logger.info(
-        f"Size comparison for {model_name}:\n"
-        f"  Original: {comparison['original_size_mb']:.2f} MB\n"
-        f"  Quantized: {comparison['quantized_size_mb']:.2f} MB\n"
-        f"  Compression: {compression_ratio:.2f}x\n"
-        f"  Saved: {comparison['memory_saved_mb']:.2f} MB ({comparison['size_reduction_percent']:.1f}%)"
-    )
-    
-    return comparison
-
-
-__all__ = [
-    "ModelQuantizer",
-    "quantize_for_inference",
-    "compare_model_sizes",
-]
+__all__ = ["ModelQuantizer"]
