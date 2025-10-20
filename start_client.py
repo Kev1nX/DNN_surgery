@@ -11,8 +11,6 @@ import os
 # Suppress warnings BEFORE importing torch
 warnings.filterwarnings('ignore')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ['OMP_NUM_THREADS'] = '1'  # Suppress OpenMP warnings
-os.environ['MKL_NUM_THREADS'] = '1'  # Suppress MKL warnings
 
 from collections import defaultdict
 from datetime import datetime
