@@ -296,15 +296,14 @@ class ModelSplitter:
         
         return edge_model
         
-    def get_cloud_model(self, quantize: bool = False, quantizer: Optional[ModelQuantizer] = None) -> Optional[nn.Module]:
+    def get_cloud_model(self) -> Optional[nn.Module]:
         """Get the cloud part of the model using the original model's forward logic
         
-        Args:
-            quantize: Whether to apply quantization to the cloud model
-            quantizer: ModelQuantizer instance (required if quantize=True)
-            
+        Note: Cloud models are NOT quantized since servers typically have sufficient resources.
+        Only edge models benefit from quantization for resource-constrained devices.
+        
         Returns:
-            Cloud model (optionally quantized)
+            Cloud model (always FP32, never quantized)
         """
         if self.split_point >= len(self.layers):
             return None
@@ -366,13 +365,7 @@ class ModelSplitter:
                 
         cloud_model = CloudModel(cloud_layers, self.model, self.model_name, split_point)
         
-        # Apply quantization if requested
-        if quantize:
-            if quantizer is None:
-                logger.warning("Quantization requested but no quantizer provided. Returning non-quantized cloud model.")
-            else:
-                cloud_model = quantizer.quantize_model(cloud_model, f"{self.model_name}_cloud", inplace=False)
-        
+        # Cloud models are never quantized - servers have sufficient resources
         return cloud_model
 
 
@@ -390,12 +383,13 @@ class DNNSurgery:
         
         quant_info = []
         if enable_quantization:
-            quant_info.append("model weights (INT8)")
+            quant_info.append("edge model weights (INT8)")
         if quantize_transfer:
             quant_info.append("intermediate tensors (INT8)")
         
         if quant_info:
             logger.info(f"Initialized DNNSurgery for model: {model_name} with quantization enabled: {', '.join(quant_info)}")
+            logger.info("Note: Cloud models are never quantized - servers have sufficient resources")
         else:
             logger.info(f"Initialized DNNSurgery for model: {model_name}")
     

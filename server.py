@@ -417,10 +417,8 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             # Create a DNN Surgery instance for this model and split point
             splitter = ModelSplitter(original_model, model_name)
             splitter.set_split_point(split_point)
-            cloud_model = splitter.get_cloud_model(
-                quantize=self.enable_quantization,
-                quantizer=self.quantizer
-            )
+            # Cloud models are never quantized - servers have sufficient resources
+            cloud_model = splitter.get_cloud_model()
             
             # Store the client's split decision
             self.client_split_points[model_name] = split_point

@@ -1060,20 +1060,13 @@ def test_all_models_neurosurgeon(
             logger.info("="*80)
             
             if all_quantization_metrics:
-                # Log quantization summary
+                # Log quantization summary (edge models only - cloud models are never quantized)
                 for model_name in SUPPORTED_MODELS:
                     edge_key = f"{model_name}_edge"
-                    cloud_key = f"{model_name}_cloud"
                     
                     if edge_key in all_quantization_metrics:
                         metrics = all_quantization_metrics[edge_key]
                         logger.info(f"{model_name} (edge model):")
-                        logger.info(f"  Original: {metrics['original_size_mb']:.2f} MB → Quantized: {metrics['quantized_size_mb']:.2f} MB")
-                        logger.info(f"  Compression: {metrics['compression_ratio']:.2f}x ({metrics['num_quantizable_layers']} layers)")
-                    
-                    if cloud_key in all_quantization_metrics:
-                        metrics = all_quantization_metrics[cloud_key]
-                        logger.info(f"{model_name} (cloud model):")
                         logger.info(f"  Original: {metrics['original_size_mb']:.2f} MB → Quantized: {metrics['quantized_size_mb']:.2f} MB")
                         logger.info(f"  Compression: {metrics['compression_ratio']:.2f}x ({metrics['num_quantizable_layers']} layers)")
                 
