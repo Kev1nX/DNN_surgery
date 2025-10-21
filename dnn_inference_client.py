@@ -127,6 +127,9 @@ class DNNInferenceClient:
 
             logging.info(f"Successfully processed tensor {idx + 1}/{batch_size} with model {model_id}")
             results[idx] = result_tensor
+            
+            # Clean up intermediate tensors to prevent memory accumulation
+            del result_tensor
 
         try:
             for idx in range(batch_size):

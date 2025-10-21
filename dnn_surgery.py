@@ -466,7 +466,8 @@ class DNNSurgery:
             
             # Run inference and measure
             try:
-                _, timings = client.process_tensor(input_tensor, self.model_name, requires_cloud)
+                with torch.no_grad():  # Ensure no gradients are tracked
+                    _, timings = client.process_tensor(input_tensor, self.model_name, requires_cloud)
                 
                 edge_time = timings.get('edge_time', 0.0)
                 transfer_time = timings.get('transfer_time', 0.0)
@@ -491,7 +492,10 @@ class DNNSurgery:
                     'cloud_time': 0.0,
                     'total_time': float('inf')
                 }
-        
+            finally:
+                # Clean up memory after each split point test
+                del edge_model
+                del client
         # Find optimal split point
         optimal_split = min(split_analysis.keys(), key=lambda k: split_analysis[k]['total_time'])
         min_time = split_analysis[optimal_split]['total_time']
