@@ -698,7 +698,10 @@ def find_optimal_split_with_early_exit(
         
         # Use standard client WITHOUT early exits
         client = DNNInferenceClient(server_address, edge_model)
-        requires_cloud = dnn_surgery.splitter.get_cloud_model() is not None
+        requires_cloud = dnn_surgery.splitter.get_cloud_model(
+            quantize=dnn_surgery.enable_quantization,
+            quantizer=dnn_surgery.quantizer
+        ) is not None
         dnn_surgery._send_split_decision_to_server(split_point, server_address)  # pylint: disable=protected-access
         
         try:
@@ -809,8 +812,14 @@ def run_distributed_inference_with_early_exit(
             logger.error("Failed to send manual split decision to server")
 
     dnn_surgery.splitter.set_split_point(split_point)
-    edge_model = dnn_surgery.splitter.get_edge_model()
-    cloud_model = dnn_surgery.splitter.get_cloud_model()
+    edge_model = dnn_surgery.splitter.get_edge_model(
+        quantize=dnn_surgery.enable_quantization,
+        quantizer=dnn_surgery.quantizer
+    )
+    cloud_model = dnn_surgery.splitter.get_cloud_model(
+        quantize=dnn_surgery.enable_quantization,
+        quantizer=dnn_surgery.quantizer
+    )
     requires_cloud_processing = cloud_model is not None
 
     if not requires_cloud_processing:

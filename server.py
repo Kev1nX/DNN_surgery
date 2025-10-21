@@ -148,7 +148,10 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                         )
                     splitter = ModelSplitter(base_model, request.model_id)
                     splitter.set_split_point(split_point)
-                    model = splitter.get_cloud_model()
+                    model = splitter.get_cloud_model(
+                        quantize=self.enable_quantization,
+                        quantizer=self.quantizer
+                    )
                     if model is None:
                         logging.warning(
                             "Split point %s results in no cloud model for %s; using full model",
@@ -417,8 +420,11 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             # Create a DNN Surgery instance for this model and split point
             splitter = ModelSplitter(original_model, model_name)
             splitter.set_split_point(split_point)
-            # Cloud models are never quantized - servers have sufficient resources
-            cloud_model = splitter.get_cloud_model()
+            # Apply quantization to cloud model if enabled
+            cloud_model = splitter.get_cloud_model(
+                quantize=self.enable_quantization,
+                quantizer=self.quantizer
+            )
             
             # Store the client's split decision
             self.client_split_points[model_name] = split_point

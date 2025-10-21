@@ -367,8 +367,11 @@ def run_distributed_inference(
             quantizer=dnn_surgery.quantizer
         )
         
-        # Check if cloud processing is needed (cloud models are never quantized)
-        cloud_model = dnn_surgery.splitter.get_cloud_model()
+        # Check if cloud processing is needed (with quantization if enabled)
+        cloud_model = dnn_surgery.splitter.get_cloud_model(
+            quantize=dnn_surgery.enable_quantization,
+            quantizer=dnn_surgery.quantizer
+        )
         requires_cloud_processing = cloud_model is not None
         
         if not requires_cloud_processing:
