@@ -5,13 +5,6 @@ import logging
 import sys
 import time
 import traceback
-import warnings
-import os
-
-# Suppress warnings BEFORE importing torch
-warnings.filterwarnings('ignore')
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -29,21 +22,16 @@ from torchvision.models import (
     MobileNet_V3_Large_Weights,
 )
 
-# Disable PyTorch warnings after import
-torch.set_warn_always(False)
-
 from dataset.imagenet_loader import ImageNetMiniLoader
 from dnn_inference_client import DNNInferenceClient, resolve_plot_paths
 from dnn_surgery import DNNSurgery
-from early_exit import EarlyExitInferenceClient, EarlyExitConfig, run_distributed_inference_with_early_exit
+from early_exit import EarlyExitConfig, run_distributed_inference_with_early_exit
 from visualization import (
     plot_actual_inference_breakdown,
     plot_actual_split_comparison,
-    plot_multi_model_comparison,
     plot_model_comparison_bar,
     plot_throughput_from_timing,
     plot_split_throughput_comparison,
-    plot_multi_model_throughput_comparison,
     plot_model_throughput_comparison_bar,
     plot_quantization_size_reduction,
     plot_quantization_comparison_bar,
@@ -1138,7 +1126,6 @@ def test_all_models_neurosurgeon(
             
         except Exception as e:
             logger.error(f"Failed to test {model_name}: {str(e)}")
-            import traceback
             traceback.print_exc()
             continue
     
@@ -1254,7 +1241,6 @@ def test_all_models_neurosurgeon(
                     
                 except Exception as e:
                     logger.error(f"Failed to generate quantization plots: {e}")
-                    import traceback
                     traceback.print_exc()
             else:
                 logger.warning("No quantization metrics collected from any model")

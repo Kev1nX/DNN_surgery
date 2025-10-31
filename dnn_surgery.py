@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import time
 import logging
-from typing import List, Dict, Tuple, Optional, TYPE_CHECKING
+from typing import List, Dict, Tuple, Optional
 import uuid
 import grpc
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
@@ -14,8 +14,7 @@ from quantization import ModelQuantizer
 import warnings
 warnings.filterwarnings('ignore')
 
-if TYPE_CHECKING:
-    from dnn_inference_client import DNNInferenceClient
+from dnn_inference_client import DNNInferenceClient
 def cuda_sync():
     """Helper function to synchronize CUDA operations if available"""
     if torch.cuda.is_available():
@@ -468,9 +467,6 @@ class DNNSurgery:
         logger.info(f"Testing {num_splits} split points (0 to {num_splits - 1})")
         
         split_analysis = {}
-        
-        # Import at runtime to avoid circular dependency
-        from dnn_inference_client import DNNInferenceClient
         
         # Test each split point by running actual inference
         for split_point in range(num_splits):
