@@ -57,7 +57,7 @@ def main():
                        default=['all'],
                        help='Models to register (default: all)')
     parser.add_argument('--quantize', action='store_true',
-                       help='Enable INT8 post-training quantization (PTQ) for models (reduces memory and improves speed)')
+                       help='Enable INT8 post-training quantization (PTQ) for models')
     
     args = parser.parse_args()
     

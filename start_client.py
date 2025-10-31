@@ -33,7 +33,7 @@ from torchvision.models import (
 torch.set_warn_always(False)
 
 from dataset.imagenet_loader import ImageNetMiniLoader
-from dnn_inference_client import DNNInferenceClient, resolve_plot_paths, run_distributed_inference
+from dnn_inference_client import DNNInferenceClient, resolve_plot_paths
 from dnn_surgery import DNNSurgery
 from early_exit import EarlyExitInferenceClient, EarlyExitConfig, run_distributed_inference_with_early_exit
 from visualization import (
@@ -47,6 +47,7 @@ from visualization import (
     plot_model_throughput_comparison_bar,
     plot_quantization_size_reduction,
     plot_quantization_comparison_bar,
+    plot_split_timing,
 )
 
 # Configure logging
@@ -104,6 +105,176 @@ def get_calibration_dataloader(batch_size: int = 4, num_workers: int = 0):
         _calibration_dataloader, _ = calibration_loader.get_loader(train=False)
     
     return _calibration_dataloader
+
+def run_distributed_inference(
+    model_id: str,
+    input_tensor: torch.Tensor,
+    dnn_surgery: DNNSurgery,
+    split_point: int | None = None,
+    server_address: str = "localhost:50051",
+    *,
+    auto_plot: bool = True,
+    plot_show: bool = True,
+    plot_path: str | None = None,
+    calibration_dataloader = None,
+    num_calibration_batches: int = 10,
+) -> Tuple[torch.Tensor, Dict]:
+    """Run distributed inference with NeuroSurgeon optimization
+    
+    Args:
+        model_id: Model identifier
+        input_tensor: Input tensor
+        dnn_surgery: DNNSurgery instance for model splitting
+        split_point: Optional manual split point (if None, will use NeuroSurgeon optimization)
+        server_address: Server address
+        calibration_dataloader: Optional DataLoader for quantization calibration.
+            Required if quantization is enabled and quantizer not yet initialized.
+        num_calibration_batches: Number of batches to use for calibration (default: 10)
+        
+    Returns:
+        Tuple of (result tensor, timing dictionary)
+    """
+    try:
+        split_summary: Optional[List[Dict[str, float]]] = None
+        predicted_plot_path: Optional[Path] = None
+        actual_plot_path: Optional[Path] = None
+        predicted_plot_path_resolved: Optional[str] = None
+        actual_plot_path_resolved: Optional[str] = None
+
+        # Use NeuroSurgeon approach if no manual split point provided
+        if split_point is None:
+            optimal_split, analysis = dnn_surgery.find_optimal_split(
+                input_tensor, 
+                server_address,
+                calibration_dataloader=calibration_dataloader,
+                num_calibration_batches=num_calibration_batches
+            )
+            split_point = optimal_split
+            logger.info(f"NeuroSurgeon optimal split point: {split_point}")
+            logger.info(f"Predicted total time: {analysis['min_total_time']:.2f}ms")
+            split_summary = analysis.get("split_summary")
+        else:
+            logger.info(f"Using manual split point: {split_point}")
+            success = dnn_surgery._send_split_decision_to_server(split_point, server_address)
+            if not success:
+                logger.error("Failed to send manual split decision to server")
+
+        if auto_plot:
+            predicted_plot_path, actual_plot_path = resolve_plot_paths(model_id, split_point, plot_path)
+
+            if split_summary is None:
+                logger.warning("Split summary not available; skipping predicted split chart")
+            else:
+                logger.info("Auto-plot enabled; generating split timing chart")
+                try:
+                    predicted_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                    plot_split_timing(
+                        split_summary,
+                        show=plot_show,
+                        save_path=str(predicted_plot_path),
+                        title=f"Predicted Split Timing ({model_id})",
+                    )
+                    predicted_plot_path_resolved = str(predicted_plot_path.resolve())
+                    logger.info(
+                        "Predicted split timing plot saved to %s",
+                        predicted_plot_path_resolved,
+                    )
+                except ImportError as plt_error:
+                    logger.warning(
+                        "Auto-plot requested but matplotlib is unavailable: %s",
+                        plt_error,
+                    )
+                except Exception as plot_error:
+                    logger.error("Failed to render predicted split chart: %s", plot_error)
+
+        # Set split point and get edge model (with quantization if enabled)
+        dnn_surgery.splitter.set_split_point(split_point)
+        edge_model = dnn_surgery.splitter.get_edge_model(
+            quantize=dnn_surgery.enable_quantization,
+            quantizer=dnn_surgery.quantizer
+        )
+        
+        # Check if cloud processing is needed (with quantization if enabled)
+        cloud_model = dnn_surgery.splitter.get_cloud_model(
+            quantize=dnn_surgery.enable_quantization,
+            quantizer=dnn_surgery.quantizer
+        )
+        requires_cloud_processing = cloud_model is not None
+        
+        if not requires_cloud_processing:
+            logger.info(f"Split point {split_point} means all inference on client side - no server communication needed")
+        
+        # Create client with edge model (pass quantize_transfer from dnn_surgery)
+        client = DNNInferenceClient(server_address, edge_model, quantize_transfer=dnn_surgery.quantize_transfer)
+        
+        # Run inference
+        result, timings = client.process_tensor(input_tensor, model_id, requires_cloud_processing)
+        
+        # Get timing summary
+        timing_summary = client.get_timing_summary()
+        timings.update(timing_summary)
+
+        total_metrics = {
+            "edge_time": timings.get("edge_time", 0.0),
+            "transfer_time": timings.get("transfer_time", 0.0),
+            "cloud_time": timings.get("cloud_time", 0.0),
+            "total_batch_processing_time": timings.get("total_batch_processing_time"),
+        }
+
+        if auto_plot and actual_plot_path is not None:
+            try:
+                actual_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                plot_actual_inference_breakdown(
+                    total_metrics,
+                    show=plot_show,
+                    save_path=str(actual_plot_path),
+                    title=f"Measured Inference Breakdown ({model_id})",
+                )
+                actual_plot_path_resolved = str(actual_plot_path.resolve())
+                logger.info(
+                    "Measured inference plot saved to %s",
+                    actual_plot_path_resolved,
+                )
+                
+                # Generate companion throughput plot
+                throughput_plot_path = actual_plot_path.with_name(
+                    actual_plot_path.stem.replace("_actual", "_throughput") + actual_plot_path.suffix
+                )
+                plot_throughput_from_timing(
+                    total_metrics,
+                    show=plot_show,
+                    save_path=str(throughput_plot_path),
+                    title=f"Inference Throughput ({model_id})",
+                )
+                logger.info(
+                    "Throughput plot saved to %s",
+                    throughput_plot_path.resolve(),
+                )
+            except ImportError as plt_error:
+                logger.warning(
+                    "Auto-plot requested but matplotlib is unavailable: %s",
+                    plt_error,
+                )
+            except Exception as plot_error:
+                logger.error("Failed to render measured inference chart: %s", plot_error)
+
+        if predicted_plot_path_resolved:
+            timings['predicted_split_plot_path'] = predicted_plot_path_resolved
+        if actual_plot_path_resolved:
+            timings['actual_split_plot_path'] = actual_plot_path_resolved
+        
+        # Add split point info
+        timings['split_point'] = split_point
+        
+        # Add analysis data if available (from NeuroSurgeon optimization)
+        if split_point is not None and 'analysis' in locals():
+            timings['split_analysis'] = analysis
+        
+        return result, timings
+        
+    except Exception as e:
+        logger.error(f"Distributed inference failed: {str(e)}")
+        raise
 
 def get_input_tensor(model_name: str, batch_size: int = 1) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     """Get images from ImageNet mini dataset
