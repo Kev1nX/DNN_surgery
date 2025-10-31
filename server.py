@@ -48,9 +48,10 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
         
         # Quantization support
         self.enable_quantization = enable_quantization
-        self.quantizer = ModelQuantizer() if enable_quantization else None
+        self.quantizer = None  # Will be initialized with calibration data when needed
+        self._calibration_cache = {}  # Cache calibration data per model
         
-        quant_status = "with quantization enabled" if enable_quantization else "without quantization"
+        quant_status = "with PTQ enabled" if enable_quantization else "without quantization"
         logging.info(f"Initializing DNNInferenceServicer with device: {self.device} {quant_status}")
         
     def MeasureBandwidth(self, request: dnn_inference_pb2.BandwidthProbeRequest,
@@ -87,6 +88,36 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                 server_overhead_ms=0.0
             )
 
+    def _initialize_quantizer_for_model(self, model_id: str, calibration_data: torch.Tensor) -> None:
+        """Initialize quantizer with calibration data for a specific model.
+        
+        Args:
+            model_id: Model identifier
+            calibration_data: Representative input tensor for calibration
+        """
+        if not self.enable_quantization:
+            return
+        
+        # Store calibration data for this model
+        self._calibration_cache[model_id] = calibration_data.detach().clone()
+        
+        # Create calibration function specific to this model
+        def calibration_fn(model: nn.Module) -> None:
+            """Run calibration on the model with representative data."""
+            model.eval()
+            with torch.no_grad():
+                for _ in range(5):  # Run multiple batches for better calibration
+                    _ = model(self._calibration_cache[model_id])
+        
+        # Initialize quantizer if not already done
+        if self.quantizer is None:
+            self.quantizer = ModelQuantizer(calibration_fn=calibration_fn)
+            logging.info(f"Initialized PTQ quantizer for model {model_id} (calibration data shape: {calibration_data.shape})")
+        else:
+            # Update calibration function for existing quantizer
+            self.quantizer._calibration_fn = calibration_fn
+            logging.info(f"Updated PTQ quantizer calibration for model {model_id}")
+    
     def register_model(self, model_id: str, model: torch.nn.Module) -> None:
         """Register a model for inference
         
@@ -177,6 +208,11 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             # Convert proto to tensor (automatically dequantizes if quantized)
             request_start_time = time.perf_counter()
             input_tensor = proto_to_tensor(request.tensor, device=self.device, dequantize=True)
+            
+            # Store calibration data if quantization is enabled and not yet stored
+            if self.enable_quantization and request.model_id not in self._calibration_cache:
+                self._calibration_cache[request.model_id] = input_tensor.detach().clone().cpu()
+                logging.info(f"Stored calibration data for {request.model_id} (shape: {input_tensor.shape})")
             
             # Log input tensor stats
             logging.info("=== Cloud Model Processing ===")
@@ -416,6 +452,18 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                     success=False,
                     message=error_msg
                 )
+
+            # Initialize quantizer with calibration data if available and not yet initialized
+            if self.enable_quantization and self.quantizer is None:
+                if model_name in self._calibration_cache:
+                    self._initialize_quantizer_for_model(model_name, self._calibration_cache[model_name])
+                else:
+                    logging.warning(
+                        f"PTQ enabled but no calibration data available for {model_name}. "
+                        "Using default calibration. For better accuracy, send calibration data first."
+                    )
+                    # Use default calibration
+                    self.quantizer = ModelQuantizer()
 
             # Create a DNN Surgery instance for this model and split point
             splitter = ModelSplitter(original_model, model_name)

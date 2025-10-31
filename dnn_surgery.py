@@ -7,6 +7,8 @@ import uuid
 import grpc
 import gRPC.protobuf.dnn_inference_pb2 as dnn_inference_pb2
 import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
+from torch.utils.data import DataLoader
+from dnn_inference_client import DNNInferenceClient
 from config import GRPC_SETTINGS
 from visualization import build_split_timing_summary, format_split_summary
 from quantization import ModelQuantizer
@@ -386,19 +388,31 @@ class DNNSurgery:
         self.network_profiler = NetworkProfiler()
         self.enable_quantization = enable_quantization
         self.quantize_transfer = quantize_transfer
-        self.quantizer = ModelQuantizer() if enable_quantization else None
+        self.quantizer = None
+        self._calibration_dataloader = None  # Store calibration dataloader for PTQ
+
+    
+    def _initialize_quantizer_with_calibration(self, calibration_dataloader: DataLoader, num_calibration_batches: int = 10) -> None:
+        """Initialize quantizer with calibration DataLoader for PTQ.
         
-        quant_info = []
-        if enable_quantization:
-            quant_info.append("edge model weights (INT8)")
-            quant_info.append("cloud model weights (INT8)")
-        if quantize_transfer:
-            quant_info.append("intermediate tensors (INT8)")
+        Args:
+            calibration_dataloader: DataLoader providing representative calibration data.
+                Should yield batches of (input_tensor, labels) tuples.
+            num_calibration_batches: Number of batches to use for calibration (default: 10)
+        """
+        if not self.enable_quantization:
+            return
         
-        if quant_info:
-            logger.info(f"Initialized DNNSurgery for model: {model_name} with quantization enabled: {', '.join(quant_info)}")
-        else:
-            logger.info(f"Initialized DNNSurgery for model: {model_name}")
+        # Store calibration dataloader
+        self._calibration_dataloader = calibration_dataloader
+        
+        # Initialize quantizer with calibration dataloader
+        self.quantizer = ModelQuantizer(
+            calibration_dataloader=calibration_dataloader,
+            num_calibration_batches=num_calibration_batches
+        )
+        logger.info(f"Initialized PTQ quantizer with calibration DataLoader "
+                   f"({num_calibration_batches} batches)")
     
     def get_split_layer_names(self) -> List[str]:
         """Get layer names for all possible split points
@@ -420,18 +434,32 @@ class DNNSurgery:
         layer_names.append("Output")  # Split point after last layer
         return layer_names
     
-    def find_optimal_split(self, input_tensor: torch.Tensor, server_address: str) -> Tuple[int, Dict]:
+    def find_optimal_split(self, input_tensor: torch.Tensor, server_address: str, 
+                          calibration_dataloader: Optional[DataLoader] = None,
+                          num_calibration_batches: int = 10) -> Tuple[int, Dict]:
         """Find optimal split point by measuring actual inference at each split point
         
         Args:
             input_tensor: Input tensor for inference
             server_address: Server address
+            calibration_dataloader: Optional DataLoader for quantization calibration.
+                Required if enable_quantization=True and quantizer not yet initialized.
+            num_calibration_batches: Number of batches to use for calibration (default: 10)
             
         Returns:
             Tuple of (optimal_split_point, timing_analysis)
         """
-        # Import here to avoid circular dependency
-        from dnn_inference_client import DNNInferenceClient
+
+        
+        # Initialize quantizer with calibration dataloader if quantization is enabled
+        if self.enable_quantization and self.quantizer is None:
+            if calibration_dataloader is None:
+                raise ValueError(
+                    "calibration_dataloader is required when enable_quantization=True "
+                    "and quantizer not yet initialized. Please provide a DataLoader with "
+                    "representative calibration data."
+                )
+            self._initialize_quantizer_with_calibration(calibration_dataloader, num_calibration_batches)
         
         num_splits = len(self.splitter.layers) + 1
         logger.info(f"=== Finding Optimal Split Point ===")

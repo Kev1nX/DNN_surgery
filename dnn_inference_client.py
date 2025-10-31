@@ -302,6 +302,8 @@ def run_distributed_inference(
     auto_plot: bool = True,
     plot_show: bool = True,
     plot_path: str | None = None,
+    calibration_dataloader = None,
+    num_calibration_batches: int = 10,
 ) -> Tuple[torch.Tensor, Dict]:
     """Run distributed inference with NeuroSurgeon optimization
     
@@ -311,6 +313,9 @@ def run_distributed_inference(
         dnn_surgery: DNNSurgery instance for model splitting
         split_point: Optional manual split point (if None, will use NeuroSurgeon optimization)
         server_address: Server address
+        calibration_dataloader: Optional DataLoader for quantization calibration.
+            Required if quantization is enabled and quantizer not yet initialized.
+        num_calibration_batches: Number of batches to use for calibration (default: 10)
         
     Returns:
         Tuple of (result tensor, timing dictionary)
@@ -324,7 +329,12 @@ def run_distributed_inference(
 
         # Use NeuroSurgeon approach if no manual split point provided
         if split_point is None:
-            optimal_split, analysis = dnn_surgery.find_optimal_split(input_tensor, server_address)
+            optimal_split, analysis = dnn_surgery.find_optimal_split(
+                input_tensor, 
+                server_address,
+                calibration_dataloader=calibration_dataloader,
+                num_calibration_batches=num_calibration_batches
+            )
             split_point = optimal_split
             logging.info(f"NeuroSurgeon optimal split point: {split_point}")
             logging.info(f"Predicted total time: {analysis['min_total_time']:.2f}ms")

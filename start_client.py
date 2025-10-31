@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 _dataset_loader = None
 _dataset_iterator = None
 _class_mapping = None
+_calibration_dataloader = None
 
 def initialize_dataset_loader(batch_size: int = 1) -> None:
     """Initialize the dataset loader for ImageNet mini dataset"""
@@ -83,6 +84,26 @@ def initialize_dataset_loader(batch_size: int = 1) -> None:
     except Exception as e:
         logger.error(f"Failed to initialize dataset: {str(e)}")
         raise RuntimeError(f"ImageNet mini dataset is required but failed to load: {str(e)}")
+
+def get_calibration_dataloader(batch_size: int = 4, num_workers: int = 0):
+    """Get a calibration DataLoader for quantization.
+    
+    Args:
+        batch_size: Batch size for calibration (default: 4)
+        num_workers: Number of worker processes (default: 0)
+        
+    Returns:
+        DataLoader for calibration data
+    """
+    global _calibration_dataloader
+    
+    if _calibration_dataloader is None:
+        logger.info(f"Creating calibration DataLoader (batch_size={batch_size})...")
+        calibration_loader = ImageNetMiniLoader(batch_size=batch_size, num_workers=num_workers)
+        # Use validation set for calibration
+        _calibration_dataloader, _ = calibration_loader.get_loader(train=False)
+    
+    return _calibration_dataloader
 
 def get_input_tensor(model_name: str, batch_size: int = 1) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
     """Get images from ImageNet mini dataset
@@ -246,6 +267,11 @@ def run_single_inference(
     logger.info(f"Using ImageNet images with true labels: {true_labels.tolist()}")
     logger.info(f"True classes: {class_names}")
     
+    # Get calibration dataloader if quantization is enabled
+    calibration_dataloader = None
+    if dnn_surgery.enable_quantization:
+        calibration_dataloader = get_calibration_dataloader(batch_size=4)
+    
     # Run distributed inference
     result, timings = run_distributed_inference(
         model_name,
@@ -256,6 +282,8 @@ def run_single_inference(
         auto_plot=auto_plot,
         plot_show=plot_show,
         plot_path=plot_path,
+        calibration_dataloader=calibration_dataloader,
+        num_calibration_batches=10,
     )
     
     # Add true label information to timing results for analysis
@@ -293,6 +321,11 @@ def run_batch_processing(
     
     model = get_model(model_name)
     dnn_surgery = DNNSurgery(model, model_name, enable_quantization=enable_quantization, quantize_transfer=quantize_transfer)
+    
+    # Get calibration dataloader if quantization is enabled
+    calibration_dataloader = None
+    if enable_quantization:
+        calibration_dataloader = get_calibration_dataloader(batch_size=4)
     
     # Setup early exit if requested
     exit_config = None
@@ -409,6 +442,8 @@ def run_batch_processing(
                         auto_plot=False,
                         plot_show=plot_show,
                         plot_path=plot_path,
+                        calibration_dataloader=calibration_dataloader,
+                        num_calibration_batches=10,
                     )
                 else:
                     # Find optimal split for first batch
@@ -421,6 +456,8 @@ def run_batch_processing(
                         auto_plot=should_plot,
                         plot_show=plot_show,
                         plot_path=plot_path,
+                        calibration_dataloader=calibration_dataloader,
+                        num_calibration_batches=10,
                     )
                     optimal_split_found = timings.get('split_point', 2)
                     should_plot = False
@@ -810,23 +847,7 @@ def test_all_models_neurosurgeon(
     
     config_desc = " + ".join(config_parts) if config_parts else "Standard"
     
-    logger.info("="*80)
-    logger.info(f"TESTING ALL MODELS WITH NEUROSURGEON OPTIMIZATION ({config_desc})")
-    logger.info("="*80)
-    if enable_quantization:
-        logger.info("Model Quantization: ENABLED (INT8 dynamic quantization for model weights)")
-    if quantize_transfer:
-        logger.info("Transfer Quantization: ENABLED (INT8 quantization for intermediate tensors)")
-    if use_early_split:
-        logger.info("Early Exit: ENABLED (intermediate classifiers with confidence threshold)")
-    logger.info(f"Running {num_batches} batch(es) per model (batch_size={batch_size}) for stable measurements")
-    logger.info("="*80)
-    
     for model_name in SUPPORTED_MODELS:
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Testing model: {model_name} with NeuroSurgeon")
-        logger.info('='*80)
-        
         try:
             # Get model and create DNN Surgery instance
             model = get_model(model_name)
@@ -893,8 +914,6 @@ def test_all_models_neurosurgeon(
                 # Store optimal split from first batch
                 if batch_idx == 0:
                     optimal_split = timings.get('split_point')
-                    logger.info(f"{'Early exit configuration' if use_early_split else 'NeuroSurgeon'} determined optimal split point: {optimal_split}")
-                
                 # Collect timing metrics
                 edge_times.append(timings.get('edge_time', 0))
                 transfer_times.append(timings.get('transfer_time', 0))
@@ -905,9 +924,7 @@ def test_all_models_neurosurgeon(
                 batch_correct, batch_total = _calculate_batch_accuracy(result, true_labels, batch_idx + 1)
                 correct_predictions += batch_correct
                 total_samples += batch_total
-                
-                logger.info(f"  Batch {batch_idx + 1}/{num_batches}: Total={total_times[-1]:.1f}ms (Edge={edge_times[-1]:.1f}ms, Transfer={transfer_times[-1]:.1f}ms, Cloud={cloud_times[-1]:.1f}ms)")
-        
+
             # Calculate averages and statistics
             avg_edge = np.mean(edge_times) if edge_times else 0.0
             avg_transfer = np.mean(transfer_times) if transfer_times else 0.0
@@ -1215,7 +1232,7 @@ def main():
                 logger.info("Early exit enabled for batch processing")
             
             if args.neurosurgeon_quantize:
-                logger.info("Model quantization enabled: Edge/cloud models will use INT8 dynamic quantization")
+                logger.info("Model quantization enabled: Edge/cloud models will use INT8 post-training static quantization (PTQ)")
             
             if args.quantize_transfer:
                 logger.info("Transfer quantization enabled: Intermediate tensors will be quantized during transfer")
@@ -1278,7 +1295,7 @@ def main():
                 logger.info(f"Running single inference with NeuroSurgeon optimization")
 
             if args.neurosurgeon_quantize:
-                logger.info("Quantization enabled: Edge model will use INT8 dynamic quantization")
+                logger.info("Quantization enabled: Edge/cloud models will use INT8 post-training static quantization (PTQ)")
             
             if args.quantize_transfer:
                 logger.info("Transfer quantization enabled: Intermediate tensors will be quantized (FP32→INT8) during transfer")

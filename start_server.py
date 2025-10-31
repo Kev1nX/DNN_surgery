@@ -57,7 +57,7 @@ def main():
                        default=['all'],
                        help='Models to register (default: all)')
     parser.add_argument('--quantize', action='store_true',
-                       help='Enable INT8 dynamic quantization for models (reduces memory and improves speed)')
+                       help='Enable INT8 post-training quantization (PTQ) for models (reduces memory and improves speed)')
     
     args = parser.parse_args()
     
@@ -68,7 +68,7 @@ def main():
         logger.info("Starting DNN Surgery Server...")
         logger.info(f"Device available: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
         if args.quantize:
-            logger.info("Quantization enabled: Models will use INT8 dynamic quantization")
+            logger.info("Quantization enabled: Models will use INT8 post-training static quantization (PTQ)")
         
         # Start the server
         server, servicer = serve(port=args.port, max_workers=args.max_workers, enable_quantization=args.quantize)
