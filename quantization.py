@@ -3,72 +3,84 @@
 
 import copy
 import logging
-from typing import Optional, Callable
+from pathlib import Path
+from typing import Optional
 import torch
 import torch.nn as nn
 import types
 from torch.quantization import prepare, convert, get_default_qconfig, fuse_modules, QuantStub, DeQuantStub
 from torch.utils.data import DataLoader
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class ModelQuantizer:
     """Handles model quantization for edge and cloud deployment.
+    
+    Quantizes full models offline and saves them to disk. At runtime, loads
+    pre-quantized models and splits them (no runtime quantization).
     """
     
-    # Layers that support static quantization
     QUANTIZABLE_LAYERS = {nn.Linear, nn.Conv2d, nn.BatchNorm2d, nn.ReLU, nn.ReLU6}
     
-    def __init__(self, calibration_dataloader: Optional[DataLoader] = None, num_calibration_batches: int = 10):
+    def __init__(self, calibration_dataloader: Optional[DataLoader] = None, num_calibration_batches: int = 10, checkpoint_dir: str = "checkpoints/quantized"):
         """Initialize ModelQuantizer with post-training static quantization.
         
         Args:
             calibration_dataloader: DataLoader providing representative calibration data.
-                Should yield batches of (input_tensor, labels) tuples.
             num_calibration_batches: Number of batches to use for calibration (default: 10)
+            checkpoint_dir: Directory to save/load quantized models (default: checkpoints/quantized)
         """
         self._quantized_models = {}
-        self._size_metrics = {}  # Track original and quantized sizes
+        self._size_metrics = {}
         self._calibration_dataloader = calibration_dataloader
         self._num_calibration_batches = num_calibration_batches
-        logger.info(f"Initialized ModelQuantizer with post-training static INT8 quantization "
-                   f"({num_calibration_batches} calibration batches)")
+        self._checkpoint_dir = Path(checkpoint_dir)
+        self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Initialized ModelQuantizer: {num_calibration_batches} calibration batches, checkpoint_dir={checkpoint_dir}")
     
-    def quantize_model(
+    def load_or_quantize_model(self, model: nn.Module, model_name: str, calibration_dataloader: Optional[DataLoader] = None) -> nn.Module:
+        """Load pre-quantized model from disk, or quantize and save if not exists.
+        
+        Args:
+            model: PyTorch model to quantize (only used if checkpoint doesn't exist)
+            model_name: Model identifier for checkpoint naming
+            calibration_dataloader: DataLoader for calibration (only used if quantizing)
+            
+        Returns:
+            Quantized full model ready for splitting
+        """
+        checkpoint_path = self._checkpoint_dir / f"{model_name}_quantized.pt"
+        
+        if checkpoint_path.exists():
+            logger.info(f"Loading pre-quantized model from {checkpoint_path}")
+            try:
+                quantized_model = torch.load(checkpoint_path, map_location='cpu')
+                quantized_model.eval()
+                logger.info(f"Successfully loaded quantized {model_name}")
+                return quantized_model
+            except Exception as e:
+                logger.warning(f"Failed to load checkpoint: {e}. Re-quantizing...")
+        quantized_model = self._quantize_model(model, model_name, calibration_dataloader)
+        
+        logger.info(f"Saving quantized model to {checkpoint_path}")
+        torch.save(quantized_model, checkpoint_path)
+        
+        return quantized_model
+    
+    def _quantize_model(
         self,
         model: nn.Module,
         model_name: str = "unknown",
-        inplace: bool = False,
         calibration_dataloader: Optional[DataLoader] = None
     ) -> nn.Module:
-        """Apply post-training static INT8 quantization to a model.
-        
-        Args:
-            model: PyTorch model to quantize
-            model_name: Name identifier for the model
-            inplace: If True, modify the model in-place; otherwise create a copy
-            calibration_dataloader: Optional DataLoader for this specific model.
-                If None, uses the instance's calibration dataloader.
-            
-        Returns:
-            Quantized model with QuantStub/DeQuantStub wrappers
-            
-        Raises:
-            RuntimeError: If quantization fails
-        """
         try:
-            if not inplace:
-                model = self._prepare_model_copy(model)
-            
-            # Wrap model with QuantStub and DeQuantStub for proper quantized tensor handling
+            model = self._prepare_model_copy(model)
             model = self._wrap_with_quant_stubs(model)
             
             # Ensure model is in eval mode and on CPU (required for quantization)
             model.eval()
-            original_device = next(model.parameters()).device
             model = model.cpu()
             
             torch.backends.quantized.engine = 'fbgemm'
@@ -313,6 +325,15 @@ class ModelQuantizer:
         for buffer in model.buffers():
             total_size += buffer.numel() * buffer.element_size()
         return total_size
+    
+    def has_quantized_checkpoint(self, model_name: str) -> bool:
+        """Check if a pre-quantized checkpoint exists for the model."""
+        checkpoint_path = self._checkpoint_dir / f"{model_name}_quantized.pt"
+        return checkpoint_path.exists()
+    
+    def get_checkpoint_path(self, model_name: str) -> Path:
+        """Get the checkpoint path for a model."""
+        return self._checkpoint_dir / f"{model_name}_quantized.pt"
     
     def get_quantized_model(self, model_name: str) -> Optional[nn.Module]:
         """Retrieve a cached quantized model."""

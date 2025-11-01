@@ -230,16 +230,7 @@ class ModelSplitter:
         self.split_point = split_point
         logger.info(f"Split point set to layer {split_point}")
         
-    def get_edge_model(self, quantize: bool = False, quantizer: Optional[ModelQuantizer] = None) -> Optional[nn.Module]:
-        """Get the edge part of the model using the original model's forward logic
-        
-        Args:
-            quantize: Whether to apply quantization to the edge model
-            quantizer: ModelQuantizer instance (required if quantize=True)
-            
-        Returns:
-            Edge model (optionally quantized)
-        """
+    def get_edge_model(self) -> Optional[nn.Module]:
         if self.split_point == 0:
             return None
             
@@ -297,26 +288,9 @@ class ModelSplitter:
                 return False
                 
         edge_model = EdgeModel(edge_layers, self.model, self.model_name)
-        
-        # Apply quantization if requested
-        if quantize:
-            if quantizer is None:
-                logger.warning("Quantization requested but no quantizer provided. Returning non-quantized edge model.")
-            else:
-                edge_model = quantizer.quantize_model(edge_model, f"{self.model_name}_edge", inplace=False)
-        
         return edge_model
         
-    def get_cloud_model(self, quantize: bool = False, quantizer: Optional[ModelQuantizer] = None) -> Optional[nn.Module]:
-        """Get the cloud part of the model using the original model's forward logic
-        
-        Args:
-            quantize: Whether to apply quantization to the cloud model
-            quantizer: ModelQuantizer instance (required if quantize=True)
-            
-        Returns:
-            Cloud model (optionally quantized)
-        """
+    def get_cloud_model(self) -> Optional[nn.Module]:
         if self.split_point >= len(self.layers):
             return None
             
@@ -376,14 +350,6 @@ class ModelSplitter:
                 return False
                 
         cloud_model = CloudModel(cloud_layers, self.model, self.model_name, split_point)
-        
-        # Apply quantization if requested
-        if quantize:
-            if quantizer is None:
-                logger.warning("Quantization requested but no quantizer provided. Returning non-quantized cloud model.")
-            else:
-                cloud_model = quantizer.quantize_model(cloud_model, f"{self.model_name}_cloud", inplace=False)
-        
         return cloud_model
 
 
@@ -391,37 +357,48 @@ class DNNSurgery:
     """Main class for distributed DNN inference with optimal splitting using NeuroSurgeon approach"""
     
     def __init__(self, model: nn.Module, model_name: str = "unknown", enable_quantization: bool = False, quantize_transfer: bool = False):
-        self.model = model.eval()  # Ensure model is in eval mode
         self.model_name = model_name
-        self.splitter = ModelSplitter(model, model_name)
-        self.network_profiler = NetworkProfiler()
         self.enable_quantization = enable_quantization
         self.quantize_transfer = quantize_transfer
         self.quantizer = None
-        self._calibration_dataloader = None  # Store calibration dataloader for PTQ
-
+        self._calibration_dataloader = None
+        
+        if enable_quantization:
+            logger.info(f"Quantization enabled for {model_name}")
+            self.quantizer = ModelQuantizer()
+            if self.quantizer.has_quantized_checkpoint(model_name):
+                logger.info(f"Using pre-quantized checkpoint for {model_name}")
+                self.model = self.quantizer.load_or_quantize_model(model, model_name, None)
+            else:
+                logger.info(f"No pre-quantized checkpoint found. Will quantize on first run with calibration data.")
+                self.model = model.eval()
+        else:
+            self.model = model.eval()
+        
+        self.splitter = ModelSplitter(self.model, model_name)
+        self.network_profiler = NetworkProfiler()
     
     def _initialize_quantizer_with_calibration(self, calibration_dataloader: DataLoader, num_calibration_batches: int = 10) -> None:
-        """Initialize quantizer with calibration DataLoader for PTQ.
+        """Initialize quantizer and quantize full model if not already quantized.
         
         Args:
             calibration_dataloader: DataLoader providing representative calibration data.
-                Should yield batches of (input_tensor, labels) tuples.
             num_calibration_batches: Number of batches to use for calibration (default: 10)
         """
         if not self.enable_quantization:
             return
         
-        # Store calibration dataloader
         self._calibration_dataloader = calibration_dataloader
         
-        # Initialize quantizer with calibration dataloader
-        self.quantizer = ModelQuantizer(
-            calibration_dataloader=calibration_dataloader,
-            num_calibration_batches=num_calibration_batches
-        )
-        logger.info(f"Initialized PTQ quantizer with calibration DataLoader "
-                   f"({num_calibration_batches} batches)")
+        if not self.quantizer.has_quantized_checkpoint(self.model_name):
+            logger.info(f"Quantizing full model {self.model_name} with calibration data...")
+            self.model = self.quantizer.load_or_quantize_model(
+                self.model, 
+                self.model_name, 
+                calibration_dataloader
+            )
+            self.splitter = ModelSplitter(self.model, self.model_name)
+            logger.info(f"Full model quantized and saved. Future runs will use checkpoint.")
     
     def get_split_layer_names(self) -> List[str]:
         """Get layer names for all possible split points
@@ -483,21 +460,9 @@ class DNNSurgery:
             # Configure split point
             self.splitter.set_split_point(split_point)
             
-            # Get edge model
-            edge_model = self.splitter.get_edge_model(
-                quantize=self.enable_quantization,
-                quantizer=self.quantizer
-            )
-            
-            # Create client with transfer quantization if enabled
+            edge_model = self.splitter.get_edge_model()
             client = DNNInferenceClient(server_address, edge_model, quantize_transfer=self.quantize_transfer)
-            
-            # Check if cloud processing is needed (don't quantize, just check existence)
-            # Cloud model runs on server without quantization for accuracy
-            requires_cloud = self.splitter.get_cloud_model(
-                quantize=False,
-                quantizer=None
-            ) is not None
+            requires_cloud = self.splitter.get_cloud_model() is not None
             
             # Configure server with this split point
             self._send_split_decision_to_server(split_point, server_address)
