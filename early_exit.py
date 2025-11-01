@@ -713,9 +713,10 @@ def find_optimal_split_with_early_exit(
         
         # Use standard client WITHOUT early exits
         client = DNNInferenceClient(server_address, edge_model)
+        # Check if cloud processing needed (don't quantize - server handles cloud model)
         requires_cloud = dnn_surgery.splitter.get_cloud_model(
-            quantize=dnn_surgery.enable_quantization,
-            quantizer=dnn_surgery.quantizer
+            quantize=False,
+            quantizer=None
         ) is not None
         dnn_surgery._send_split_decision_to_server(split_point, server_address)  # pylint: disable=protected-access
         
@@ -853,9 +854,10 @@ def run_distributed_inference_with_early_exit(
         quantize=dnn_surgery.enable_quantization,
         quantizer=dnn_surgery.quantizer
     )
+    # Check if cloud processing needed (don't quantize - server handles cloud model)
     cloud_model = dnn_surgery.splitter.get_cloud_model(
-        quantize=dnn_surgery.enable_quantization,
-        quantizer=dnn_surgery.quantizer
+        quantize=False,
+        quantizer=None
     )
     requires_cloud_processing = cloud_model is not None
 

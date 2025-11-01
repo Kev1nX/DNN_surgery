@@ -175,17 +175,17 @@ def run_distributed_inference(
                 except Exception as plot_error:
                     logger.error("Failed to render predicted split chart: %s", plot_error)
 
-        # Set split point and get edge model (with quantization if enabled)
+        # Set split point and get edge model
         dnn_surgery.splitter.set_split_point(split_point)
         edge_model = dnn_surgery.splitter.get_edge_model(
             quantize=dnn_surgery.enable_quantization,
             quantizer=dnn_surgery.quantizer
         )
         
-        # Check if cloud processing is needed (with quantization if enabled)
+        # Only edge models are quantized 
         cloud_model = dnn_surgery.splitter.get_cloud_model(
-            quantize=dnn_surgery.enable_quantization,
-            quantizer=dnn_surgery.quantizer
+            quantize=False,
+            quantizer=None
         )
         requires_cloud_processing = cloud_model is not None
         

@@ -492,10 +492,11 @@ class DNNSurgery:
             # Create client with transfer quantization if enabled
             client = DNNInferenceClient(server_address, edge_model, quantize_transfer=self.quantize_transfer)
             
-            # Check if cloud processing is needed
+            # Check if cloud processing is needed (don't quantize, just check existence)
+            # Cloud model runs on server without quantization for accuracy
             requires_cloud = self.splitter.get_cloud_model(
-                quantize=self.enable_quantization,
-                quantizer=self.quantizer
+                quantize=False,
+                quantizer=None
             ) is not None
             
             # Configure server with this split point
