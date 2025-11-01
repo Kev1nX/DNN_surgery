@@ -6,7 +6,7 @@ import logging
 from typing import Optional, Callable
 import torch
 import torch.nn as nn
-from torch.ao.quantization import prepare, convert, get_default_qconfig, fuse_modules
+from torch.quantization import prepare, convert, get_default_qconfig, QuantStub, DeQuantStub
 from torch.utils.data import DataLoader
 
 # Configure logging
@@ -53,7 +53,7 @@ class ModelQuantizer:
                 If None, uses the instance's calibration dataloader.
             
         Returns:
-            Quantized model
+            Quantized model with QuantStub/DeQuantStub wrappers
             
         Raises:
             RuntimeError: If quantization fails
@@ -62,14 +62,20 @@ class ModelQuantizer:
             if not inplace:
                 model = self._prepare_model_copy(model)
             
+            # Wrap model with QuantStub and DeQuantStub for proper quantized tensor handling
+            model = self._wrap_with_quant_stubs(model)
+            
             # Ensure model is in eval mode and on CPU (required for quantization)
             model.eval()
             original_device = next(model.parameters()).device
             model = model.cpu()
             
-            # Use x86 backend (recommended for server/x86 CPUs in PyTorch 2.7+)
-            # x86 is the new recommended default, replaces fbgemm
-            torch.backends.quantized.engine = 'x86'
+            # Use x86 backend (fbgemm for x86, qnnpack for ARM)
+            # Try fbgemm first (better for x86), fallback to qnnpack
+            try:
+                torch.backends.quantized.engine = 'fbgemm'
+            except RuntimeError:
+                torch.backends.quantized.engine = 'qnnpack'
             
             # Count quantizable layers before quantization
             num_quantizable = self._count_quantizable_layers(model)
@@ -82,8 +88,10 @@ class ModelQuantizer:
             # Fuse modules for better performance (Conv+BN+ReLU, Conv+ReLU, etc.)
             model = self._fuse_modules(model, model_name)
             
-            # Set quantization configuration for x86 backend (PyTorch 2.7+)
-            model.qconfig = get_default_qconfig('x86')
+            # Set quantization configuration based on backend
+            backend = torch.backends.quantized.engine
+            model.qconfig = get_default_qconfig(backend)
+            logger.info(f"Using quantization backend: {backend}")
             
             # Prepare model for quantization (insert observers)
             model = prepare(model, inplace=True)
@@ -141,6 +149,33 @@ class ModelQuantizer:
         """Create a deep copy of the model for quantization."""
         return copy.deepcopy(model)
     
+    def _wrap_with_quant_stubs(self, model: nn.Module) -> nn.Module:
+        """Wrap model with QuantStub and DeQuantStub for proper quantized tensor handling.
+        
+        This is required to convert FP32 input tensors to quantized tensors before
+        processing by quantized layers, and convert back to FP32 at the output.
+        
+        Args:
+            model: Model to wrap
+            
+        Returns:
+            Wrapped model with quant/dequant stubs
+        """
+        class QuantizedModelWrapper(nn.Module):
+            def __init__(self, wrapped_model):
+                super().__init__()
+                self.quant = QuantStub()  # Converts FP32 -> INT8 quantized
+                self.model = wrapped_model
+                self.dequant = DeQuantStub()  # Converts INT8 quantized -> FP32
+            
+            def forward(self, x):
+                x = self.quant(x)  # Quantize input
+                x = self.model(x)  # Process with quantized model
+                x = self.dequant(x)  # Dequantize output
+                return x
+        
+        return QuantizedModelWrapper(model)
+    
     def _fuse_modules(self, model: nn.Module, model_name: str) -> nn.Module:
         """Fuse common module patterns for better quantization performance.
         
@@ -152,6 +187,7 @@ class ModelQuantizer:
             Model with fused modules
         """
         try:
+            from torch.quantization import fuse_modules
             
             # Common fusion patterns - try to fuse but don't fail if not possible
             fused_count = 0
