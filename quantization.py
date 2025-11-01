@@ -6,7 +6,8 @@ import logging
 from typing import Optional, Callable
 import torch
 import torch.nn as nn
-from torch.quantization import prepare, convert, get_default_qconfig, QuantStub, DeQuantStub
+import types
+from torch.quantization import prepare, convert, get_default_qconfig, fuse_modules, QuantStub, DeQuantStub
 from torch.utils.data import DataLoader
 
 # Configure logging
@@ -70,12 +71,7 @@ class ModelQuantizer:
             original_device = next(model.parameters()).device
             model = model.cpu()
             
-            # Use x86 backend (fbgemm for x86, qnnpack for ARM)
-            # Try fbgemm first (better for x86), fallback to qnnpack
-            try:
-                torch.backends.quantized.engine = 'fbgemm'
-            except RuntimeError:
-                torch.backends.quantized.engine = 'qnnpack'
+            torch.backends.quantized.engine = 'fbgemm'
             
             # Count quantizable layers before quantization
             num_quantizable = self._count_quantizable_layers(model)
@@ -150,31 +146,33 @@ class ModelQuantizer:
         return copy.deepcopy(model)
     
     def _wrap_with_quant_stubs(self, model: nn.Module) -> nn.Module:
-        """Wrap model with QuantStub and DeQuantStub for proper quantized tensor handling.
+        """Add QuantStub and DeQuantStub to model for proper quantized tensor handling.
         
         This is required to convert FP32 input tensors to quantized tensors before
         processing by quantized layers, and convert back to FP32 at the output.
+        add stubs into the model's forward method
         
-        Args:
-            model: Model to wrap
-            
-        Returns:
-            Wrapped model with quant/dequant stubs
+
         """
-        class QuantizedModelWrapper(nn.Module):
-            def __init__(self, wrapped_model):
-                super().__init__()
-                self.quant = QuantStub()  # Converts FP32 -> INT8 quantized
-                self.model = wrapped_model
-                self.dequant = DeQuantStub()  # Converts INT8 quantized -> FP32
-            
-            def forward(self, x):
-                x = self.quant(x)  # Quantize input
-                x = self.model(x)  # Process with quantized model
-                x = self.dequant(x)  # Dequantize output
-                return x
+        # Add stubs as model attributes
+        model.quant = QuantStub()  # Converts FP32 -> INT8 quantized
+        model.dequant = DeQuantStub()  # Converts INT8 quantized -> FP32
         
-        return QuantizedModelWrapper(model)
+        # Store original forward method
+        original_forward = model.forward
+        
+        # Create new forward that uses stubs
+        def forward_with_stubs(self, x):
+            x = self.quant(x)  # Quantize input
+            x = original_forward(x)  # Process with model
+            x = self.dequant(x)  # Dequantize output
+            return x
+        
+        # Replace forward method (bind to model instance)
+
+        model.forward = types.MethodType(forward_with_stubs, model)
+        
+        return model
     
     def _fuse_modules(self, model: nn.Module, model_name: str) -> nn.Module:
         """Fuse common module patterns for better quantization performance.
@@ -187,8 +185,6 @@ class ModelQuantizer:
             Model with fused modules
         """
         try:
-            from torch.quantization import fuse_modules
-            
             # Common fusion patterns - try to fuse but don't fail if not possible
             fused_count = 0
             
