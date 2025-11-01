@@ -6,7 +6,7 @@ import logging
 from typing import Optional, Callable
 import torch
 import torch.nn as nn
-from torch.quantization import prepare, convert, get_default_qconfig
+from torch.ao.quantization import prepare, convert, get_default_qconfig, fuse_modules
 from torch.utils.data import DataLoader
 
 # Configure logging
@@ -67,12 +67,9 @@ class ModelQuantizer:
             original_device = next(model.parameters()).device
             model = model.cpu()
             
-            # Use x86 backend (fbgemm for x86, qnnpack for ARM)
-            # Try fbgemm first (better for x86), fallback to qnnpack
-            try:
-                torch.backends.quantized.engine = 'fbgemm'
-            except RuntimeError:
-                torch.backends.quantized.engine = 'qnnpack'
+            # Use x86 backend (recommended for server/x86 CPUs in PyTorch 2.7+)
+            # x86 is the new recommended default, replaces fbgemm
+            torch.backends.quantized.engine = 'x86'
             
             # Count quantizable layers before quantization
             num_quantizable = self._count_quantizable_layers(model)
@@ -85,10 +82,8 @@ class ModelQuantizer:
             # Fuse modules for better performance (Conv+BN+ReLU, Conv+ReLU, etc.)
             model = self._fuse_modules(model, model_name)
             
-            # Set quantization configuration based on backend
-            backend = torch.backends.quantized.engine
-            model.qconfig = get_default_qconfig(backend)
-            logger.info(f"Using quantization backend: {backend}")
+            # Set quantization configuration for x86 backend (PyTorch 2.7+)
+            model.qconfig = get_default_qconfig('x86')
             
             # Prepare model for quantization (insert observers)
             model = prepare(model, inplace=True)
@@ -157,7 +152,6 @@ class ModelQuantizer:
             Model with fused modules
         """
         try:
-            from torch.quantization import fuse_modules
             
             # Common fusion patterns - try to fuse but don't fail if not possible
             fused_count = 0
