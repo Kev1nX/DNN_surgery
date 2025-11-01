@@ -180,10 +180,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                     splitter = ModelSplitter(base_model, request.model_id)
                     splitter.set_split_point(split_point)
                     # Server should NOT quantize - only client quantizes edge models
-                    model = splitter.get_cloud_model(
-                        quantize=False,
-                        quantizer=None
-                    )
+                    model = splitter.get_cloud_model()
                     if model is None:
                         logging.warning(
                             "Split point %s results in no cloud model for %s; using full model",
@@ -471,10 +468,7 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             splitter.set_split_point(split_point)
             # Server should NOT quantize cloud models - only client quantizes edge models
             # Cloud models run on server with full precision for accuracy
-            cloud_model = splitter.get_cloud_model(
-                quantize=False,
-                quantizer=None
-            )
+            cloud_model = splitter.get_cloud_model()
             
             # Store the client's split decision
             self.client_split_points[model_name] = split_point
