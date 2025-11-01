@@ -62,8 +62,13 @@ class ModelQuantizer:
             if not inplace:
                 model = self._prepare_model_copy(model)
             
-            # Ensure model is in eval mode
+            # Ensure model is in eval mode and on CPU (required for quantization)
             model.eval()
+            original_device = next(model.parameters()).device
+            model = model.cpu()
+            
+            # Set QNNPACK backend
+            torch.backends.quantized.engine = 'qnnpack'
             
             # Count quantizable layers before quantization
             num_quantizable = self._count_quantizable_layers(model)
