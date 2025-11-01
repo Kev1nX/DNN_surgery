@@ -141,6 +141,9 @@ class DNNInferenceClient:
                     logging.info("=== Edge Model Processing ===")
                     edge_start = time.perf_counter()
                     with torch.no_grad():
+                        # Ensure input is on same device as model (CPU for quantized models)
+                        model_device = next(self.edge_model.parameters()).device
+                        sample = sample.to(model_device)
                         sample = self.edge_model(sample)
                     edge_end = time.perf_counter()
 
