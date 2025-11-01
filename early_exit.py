@@ -707,9 +707,10 @@ def find_optimal_split_with_early_exit(
         
         dnn_surgery.splitter.set_split_point(split_point)
         edge_model = dnn_surgery.splitter.get_edge_model()
+        
         client = DNNInferenceClient(server_address, edge_model)
         requires_cloud = dnn_surgery.splitter.get_cloud_model() is not None
-        dnn_surgery._send_split_decision_to_server(split_point, server_address)  # pylint: disable=protected-access
+        dnn_surgery._send_split_decision_to_server(split_point, server_address)
         
         try:
             _, timings = client.process_tensor(input_tensor, dnn_surgery.model_name, requires_cloud)

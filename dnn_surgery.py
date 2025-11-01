@@ -366,11 +366,9 @@ class DNNSurgery:
         if enable_quantization:
             logger.info(f"Quantization enabled for {model_name}")
             self.quantizer = ModelQuantizer()
-            self._model_is_quantized = False  # Track if model has been quantized
             if self.quantizer.has_quantized_checkpoint(model_name):
                 logger.info(f"Using pre-quantized checkpoint for {model_name}")
                 self.model = self.quantizer.load_or_quantize_model(model, model_name, None)
-                self._model_is_quantized = True
             else:
                 logger.info(f"No pre-quantized checkpoint found. Will quantize on first run with calibration data.")
                 self.model = model.eval()
@@ -392,7 +390,7 @@ class DNNSurgery:
         
         self._calibration_dataloader = calibration_dataloader
         
-        if not self._model_is_quantized:
+        if not self.quantizer.has_quantized_checkpoint(self.model_name):
             logger.info(f"Quantizing full model {self.model_name} with calibration data...")
             self.model = self.quantizer.load_or_quantize_model(
                 self.model, 
@@ -400,7 +398,6 @@ class DNNSurgery:
                 calibration_dataloader
             )
             self.splitter = ModelSplitter(self.model, self.model_name)
-            self._model_is_quantized = True
             logger.info(f"Full model quantized and saved. Future runs will use checkpoint.")
     
     def get_split_layer_names(self) -> List[str]:
@@ -441,11 +438,11 @@ class DNNSurgery:
 
         
         # Initialize quantizer with calibration dataloader if quantization is enabled
-        if self.enable_quantization and not self._model_is_quantized:
+        if self.enable_quantization and self.quantizer is None:
             if calibration_dataloader is None:
                 raise ValueError(
                     "calibration_dataloader is required when enable_quantization=True "
-                    "and model not yet quantized. Please provide a DataLoader with "
+                    "and quantizer not yet initialized. Please provide a DataLoader with "
                     "representative calibration data."
                 )
             self._initialize_quantizer_with_calibration(calibration_dataloader, num_calibration_batches)
