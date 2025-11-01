@@ -53,25 +53,19 @@ class ModelQuantizer:
         """
         checkpoint_path = self._checkpoint_dir / f"{model_name}_quantized.pt"
         
-        logger.info(f"Checking for quantized checkpoint: {checkpoint_path}")
-        logger.info(f"Checkpoint exists: {checkpoint_path.exists()}")
-        
         if checkpoint_path.exists():
             logger.info(f"Loading pre-quantized model from {checkpoint_path}")
             try:
-                quantized_model = torch.load(checkpoint_path, map_location='cpu')
+                quantized_model = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
                 quantized_model.eval()
                 logger.info(f"Successfully loaded quantized {model_name}")
                 return quantized_model
             except Exception as e:
                 logger.warning(f"Failed to load checkpoint: {e}. Re-quantizing...")
-        
-        logger.info(f"No checkpoint found. Starting quantization for {model_name}...")
         quantized_model = self._quantize_model(model, model_name, calibration_dataloader)
         
         logger.info(f"Saving quantized model to {checkpoint_path}")
         torch.save(quantized_model, checkpoint_path)
-        logger.info(f"Successfully saved quantized model to {checkpoint_path}")
         
         return quantized_model
     
@@ -82,14 +76,13 @@ class ModelQuantizer:
         calibration_dataloader: Optional[DataLoader] = None
     ) -> nn.Module:
         try:
-            logger.info(f"Starting quantization process for {model_name}")
             model = self._prepare_model_copy(model)
-            logger.info("Model copied successfully")
-            
             model = self._wrap_with_quant_stubs(model)
-            logger.info("QuantStub/DeQuantStub added to model")
             
- 
+            # Ensure model is in eval mode and on CPU (required for quantization)
+            model.eval()
+            model = model.cpu()
+            
             torch.backends.quantized.engine = 'fbgemm'
             
             # Count quantizable layers before quantization
@@ -107,31 +100,24 @@ class ModelQuantizer:
             backend = torch.backends.quantized.engine
             model.qconfig = get_default_qconfig(backend)
             logger.info(f"Using quantization backend: {backend}")
-            logger.info(f"QConfig: {model.qconfig}")
             
             # Prepare model for quantization (insert observers)
-            logger.info("Calling prepare() to insert observers...")
             model = prepare(model, inplace=True)
-            logger.info("Observers inserted successfully")
             
             # Calibrate the model with representative data
             dataloader = calibration_dataloader or self._calibration_dataloader
             if dataloader is not None:
                 logger.info(f"Running calibration for {model_name} using DataLoader...")
                 self._calibrate_with_dataloader(model, dataloader)
-                logger.info("Calibration completed")
             else:
                 logger.warning(
                     f"No calibration dataloader provided for {model_name}. "
                     "Using default random data calibration."
                 )
                 self._default_calibration(model)
-                logger.info("Default calibration completed")
             
             # Convert to quantized model
-            logger.info("Calling convert() to quantize the model...")
             quantized_model = convert(model, inplace=True)
-            logger.info("Model successfully converted to quantized INT8 format")
             
             # Calculate compression ratio
             original_size = self._calculate_model_size(model)
