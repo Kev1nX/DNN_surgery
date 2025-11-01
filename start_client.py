@@ -9,7 +9,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
-
+import gc
 import numpy as np
 import torch
 import torchvision.models as models
@@ -655,6 +655,10 @@ def run_batch_processing(
                 correct = "✓" if pred_class == true_class else "✗"
                 logger.info(f"  Image {i}: Predicted={pred_class}, True={true_class} ({true_name}), "
                           f"Confidence={conf:.3f} {correct}")
+        
+        # Clean up tensors and free memory after each batch
+        del input_tensor, result, true_labels
+        gc.collect()
     
     return all_timings
 
@@ -1012,6 +1016,11 @@ def test_all_models_neurosurgeon(
             model = get_model(model_name)
             dnn_surgery = DNNSurgery(model, model_name, enable_quantization=enable_quantization, quantize_transfer=quantize_transfer)
             
+            # Get calibration dataloader if quantization is enabled
+            calibration_dataloader = None
+            if enable_quantization:
+                calibration_dataloader = get_calibration_dataloader(batch_size=4)
+            
             # Configure early exit if requested
             exit_config = None
             if use_early_split:
@@ -1044,45 +1053,62 @@ def test_all_models_neurosurgeon(
                 # Determine split point: None for first batch (NeuroSurgeon optimization), reuse optimal_split for subsequent batches
                 current_split = None if batch_idx == 0 else optimal_split
                 
-                if use_early_split:
-                    result, timings = run_distributed_inference_with_early_exit(
-                        model_name,
-                        input_tensor,
-                        dnn_surgery,
-                        exit_config=exit_config,
-                        split_point=current_split,  # None for first batch, then reuse optimal split
-                        server_address=server_address,
-                        auto_plot=False,  # Disable auto-plotting during batch runs
-                        plot_show=False,
-                        plot_path=None,
-                    )
-                    early_exit_counts.append(timings.get('early_exit_count', 0))
-                    early_exit_rates.append(timings.get('early_exit_rate', 0.0))
-                else:
-                    result, timings = run_distributed_inference(
-                        model_name,
-                        input_tensor,
-                        dnn_surgery,
-                        split_point=current_split,
-                        server_address=server_address,
-                        auto_plot=False,
-                        plot_show=False,
-                        plot_path=None,
-                    )
+                # Wrap inference in no_grad to prevent gradient tracking
+                with torch.no_grad():
+                    if use_early_split:
+                        result, timings = run_distributed_inference_with_early_exit(
+                            model_name,
+                            input_tensor,
+                            dnn_surgery,
+                            exit_config=exit_config,
+                            split_point=current_split,  # None for first batch, then reuse optimal split
+                            server_address=server_address,
+                            auto_plot=False,  # Disable auto-plotting during batch runs
+                            plot_show=False,
+                            plot_path=None,
+                            calibration_dataloader=calibration_dataloader,
+                            num_calibration_batches=10,
+                        )
+                        early_exit_counts.append(timings.get('early_exit_count', 0))
+                        early_exit_rates.append(timings.get('early_exit_rate', 0.0))
+                    else:
+                        result, timings = run_distributed_inference(
+                            model_name,
+                            input_tensor,
+                            dnn_surgery,
+                            split_point=current_split,
+                            server_address=server_address,
+                            auto_plot=False,
+                            plot_show=False,
+                            plot_path=None,
+                            calibration_dataloader=calibration_dataloader,
+                            num_calibration_batches=10,
+                        )
                 
-                # Store optimal split from first batch
-                if batch_idx == 0:
-                    optimal_split = timings.get('split_point')
-                # Collect timing metrics
-                edge_times.append(timings.get('edge_time', 0))
-                transfer_times.append(timings.get('transfer_time', 0))
-                cloud_times.append(timings.get('cloud_time', 0))
-                total_times.append(timings.get('edge_time', 0) + timings.get('transfer_time', 0) + timings.get('cloud_time', 0))
+                    # Store optimal split from first batch
+                    if batch_idx == 0:
+                        optimal_split = timings.get('split_point')
+                    
+                    # Collect timing metrics
+                    edge_times.append(timings.get('edge_time', 0))
+                    transfer_times.append(timings.get('transfer_time', 0))
+                    cloud_times.append(timings.get('cloud_time', 0))
+                    total_times.append(timings.get('edge_time', 0) + timings.get('transfer_time', 0) + timings.get('cloud_time', 0))
+                    
+                    # Calculate accuracy for this batch
+                    batch_correct, batch_total = _calculate_batch_accuracy(result, true_labels, batch_idx + 1)
+                    correct_predictions += batch_correct
+                    total_samples += batch_total
+                    
+                    # Clean up batch tensors immediately
+                    del result, input_tensor, true_labels
                 
-                # Calculate accuracy for this batch
-                batch_correct, batch_total = _calculate_batch_accuracy(result, true_labels, batch_idx + 1)
-                correct_predictions += batch_correct
-                total_samples += batch_total
+                # Force garbage collection every few batches to prevent memory buildup
+                if (batch_idx + 1) % 5 == 0:
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             # Calculate averages and statistics
             avg_edge = np.mean(edge_times) if edge_times else 0.0
@@ -1128,6 +1154,17 @@ def test_all_models_neurosurgeon(
             logger.error(f"Failed to test {model_name}: {str(e)}")
             traceback.print_exc()
             continue
+        finally:
+            # Clean up model and DNN surgery instance after each model test
+            if 'model' in locals():
+                del model
+            if 'dnn_surgery' in locals():
+                del dnn_surgery
+            # Force garbage collection and clear CUDA cache
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
     # Print summary
     logger.info("\n" + "="*80)

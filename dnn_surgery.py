@@ -20,6 +20,14 @@ def cuda_sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
+def cleanup_memory():
+    """Helper function to aggressively clean up memory"""
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -523,8 +531,12 @@ class DNNSurgery:
                 }
             finally:
                 # Clean up memory after each split point test
-                del edge_model
-                del client
+                if 'edge_model' in locals():
+                    del edge_model
+                if 'client' in locals():
+                    del client
+                cleanup_memory()
+        
         # Find optimal split point
         optimal_split = min(split_analysis.keys(), key=lambda k: split_analysis[k]['total_time'])
         min_time = split_analysis[optimal_split]['total_time']

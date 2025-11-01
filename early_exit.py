@@ -655,6 +655,8 @@ def find_optimal_split_with_early_exit(
     input_tensor: torch.Tensor,
     server_address: str,
     exit_config: EarlyExitConfig,
+    calibration_dataloader = None,
+    num_calibration_batches: int = 10,
 ) -> Tuple[int, Dict]:
     """Find optimal split point for baseline inference (without early exits).
     
@@ -670,11 +672,24 @@ def find_optimal_split_with_early_exit(
         input_tensor: Input tensor for profiling.
         server_address: Server address for distributed inference.
         exit_config: Early exit configuration (not used for split selection).
+        calibration_dataloader: Optional DataLoader for quantization calibration.
+            Required if quantization is enabled and quantizer not yet initialized.
+        num_calibration_batches: Number of batches to use for calibration (default: 10)
 
     Returns:
         Tuple of (optimal_split_point, timing_analysis).
     """
     from dnn_inference_client import DNNInferenceClient
+    
+    # Initialize quantizer with calibration dataloader if quantization is enabled
+    if dnn_surgery.enable_quantization and dnn_surgery.quantizer is None:
+        if calibration_dataloader is None:
+            raise ValueError(
+                "calibration_dataloader is required when enable_quantization=True "
+                "and quantizer not yet initialized. Please provide a DataLoader with "
+                "representative calibration data."
+            )
+        dnn_surgery._initialize_quantizer_with_calibration(calibration_dataloader, num_calibration_batches)
     
     num_splits = len(dnn_surgery.splitter.layers) + 1
     logger.info("=== Finding Optimal Split Point (Baseline without Early Exits) ===")
@@ -730,6 +745,17 @@ def find_optimal_split_with_early_exit(
                 'cloud_time': 0.0,
                 'total_time': float('inf'),
             }
+        finally:
+            # Clean up memory after each split point test
+            if 'edge_model' in locals():
+                del edge_model
+            if 'client' in locals():
+                del client
+            # Force garbage collection and clear CUDA cache
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
     # Find optimal split among valid candidates
     optimal_split = min(split_analysis.keys(), key=lambda k: split_analysis[k]['total_time'])
@@ -768,6 +794,8 @@ def run_distributed_inference_with_early_exit(
     auto_plot: bool = True,
     plot_show: bool = True,
     plot_path: Optional[str] = None,
+    calibration_dataloader = None,
+    num_calibration_batches: int = 10,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Run distributed inference with optional early exits on the edge.
     
@@ -781,6 +809,9 @@ def run_distributed_inference_with_early_exit(
         auto_plot: Whether to automatically generate plots (default: True)
         plot_show: Whether to display plots interactively (default: True)
         plot_path: Optional path to save plots (default: None, uses "plots/" directory)
+        calibration_dataloader: Optional DataLoader for quantization calibration.
+            Required if quantization is enabled and quantizer not yet initialized.
+        num_calibration_batches: Number of batches to use for calibration (default: 10)
         
     Returns:
         Tuple of (result tensor, timing dictionary)
@@ -793,7 +824,9 @@ def run_distributed_inference_with_early_exit(
             # Use early exit profiling when early exit is enabled (regardless of explicit exit points)
             logger.info("Early exit enabled - using early exit profiling to find optimal split")
             optimal_split, analysis = find_optimal_split_with_early_exit(
-                dnn_surgery, input_tensor, server_address, exit_config
+                dnn_surgery, input_tensor, server_address, exit_config,
+                calibration_dataloader=calibration_dataloader,
+                num_calibration_batches=num_calibration_batches
             )
             split_point = optimal_split
             logger.info("NeuroSurgeon optimal split point (with early exits): %s", split_point)
@@ -801,7 +834,11 @@ def run_distributed_inference_with_early_exit(
         else:
             # Standard profiling without early exits
             logger.info("Early exit disabled - using standard profiling")
-            optimal_split, analysis = dnn_surgery.find_optimal_split(input_tensor, server_address)
+            optimal_split, analysis = dnn_surgery.find_optimal_split(
+                input_tensor, server_address,
+                calibration_dataloader=calibration_dataloader,
+                num_calibration_batches=num_calibration_batches
+            )
             split_point = optimal_split
             logger.info("NeuroSurgeon optimal split point: %s", split_point)
             logger.info("Predicted total time: %.2fms", analysis['min_total_time'])

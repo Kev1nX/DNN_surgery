@@ -110,8 +110,7 @@ class ModelQuantizer:
                 f"  Memory saved: {(original_size - quantized_size) / 1e6:.2f} MB"
             )
             
-            # Cache the quantized model and size metrics
-            self._quantized_models[model_name] = quantized_model
+            # Cache only size metrics (not the model itself to save memory)
             self._size_metrics[model_name] = {
                 'original_size_bytes': original_size,
                 'quantized_size_bytes': quantized_size,
@@ -121,6 +120,9 @@ class ModelQuantizer:
                 'memory_saved_mb': (original_size - quantized_size) / 1e6,
                 'num_quantizable_layers': num_quantizable,
             }
+            
+            # Don't cache the quantized model to save memory (can be regenerated if needed)
+            # Only cache if explicitly requested via get_quantized_model
             
             return quantized_model
             

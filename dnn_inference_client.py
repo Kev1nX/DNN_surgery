@@ -225,6 +225,28 @@ class DNNInferenceClient:
             summary['max_cloud_time'] = max(self.cloud_times)
             
         return summary
+    
+    def cleanup(self):
+        """Clean up resources and close gRPC channel"""
+        try:
+            if hasattr(self, 'channel') and self.channel is not None:
+                self.channel.close()
+        except Exception as e:
+            logging.warning(f"Error closing gRPC channel: {e}")
+        
+        # Clear timing history
+        self.edge_times.clear()
+        self.transfer_times.clear()
+        self.cloud_times.clear()
+    
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - cleanup resources"""
+        self.cleanup()
+        return False
 
 
 def resolve_plot_paths(
