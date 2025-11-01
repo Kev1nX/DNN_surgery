@@ -67,8 +67,12 @@ class ModelQuantizer:
             original_device = next(model.parameters()).device
             model = model.cpu()
             
-            # Set QNNPACK backend
-            torch.backends.quantized.engine = 'qnnpack'
+            # Use x86 backend (fbgemm for x86, qnnpack for ARM)
+            # Try fbgemm first (better for x86), fallback to qnnpack
+            try:
+                torch.backends.quantized.engine = 'fbgemm'
+            except RuntimeError:
+                torch.backends.quantized.engine = 'qnnpack'
             
             # Count quantizable layers before quantization
             num_quantizable = self._count_quantizable_layers(model)
@@ -81,8 +85,10 @@ class ModelQuantizer:
             # Fuse modules for better performance (Conv+BN+ReLU, Conv+ReLU, etc.)
             model = self._fuse_modules(model, model_name)
             
-            # Set quantization configuration
-            model.qconfig = get_default_qconfig('qnnpack')  # QNNPACK backend (ARM/mobile optimized, also works on x86)
+            # Set quantization configuration based on backend
+            backend = torch.backends.quantized.engine
+            model.qconfig = get_default_qconfig(backend)
+            logger.info(f"Using quantization backend: {backend}")
             
             # Prepare model for quantization (insert observers)
             model = prepare(model, inplace=True)
