@@ -77,7 +77,7 @@ class ModelQuantizer:
             model = self._fuse_modules(model, model_name)
             
             # Set quantization configuration
-            model.qconfig = get_default_qconfig('fbgemm')  # For x86 CPUs
+            model.qconfig = get_default_qconfig('qnnpack')  # QNNPACK backend (ARM/mobile optimized, also works on x86)
             
             # Prepare model for quantization (insert observers)
             model = prepare(model, inplace=True)
