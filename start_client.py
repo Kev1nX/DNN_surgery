@@ -630,8 +630,20 @@ def test_all_models_single_split(
                     'num_tests': len(total_times),
                 }
             
+            # Clean up model and DNNSurgery to free memory
+            del model, dnn_surgery
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
         except Exception as e:
             logger.error(f"Failed to test {model_name}: {str(e)}")
+            # Clean up on error as well
+            try:
+                del model, dnn_surgery
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except:
+                pass
             continue
     
     # Print summary
@@ -669,6 +681,8 @@ def _calculate_batch_accuracy(result: torch.Tensor, true_labels: torch.Tensor, b
     correct = (predicted == true_labels).sum().item()
     total = len(true_labels)
     logger.debug(f"Batch {batch_idx}: {correct}/{total} correct")
+    # Clean up intermediate tensors
+    del probs, predicted
     return correct, total
 
 def _save_comparison_plots(plot_dir: Path, model_timings: Dict, title_prefix: str, filename_prefix: str, 
@@ -738,12 +752,6 @@ def test_all_models_neurosurgeon(
     logger.info("="*80)
     logger.info(f"TESTING ALL MODELS WITH NEUROSURGEON OPTIMIZATION ({config_desc})")
     logger.info("="*80)
-    if enable_quantization:
-        logger.info("Model Quantization: ENABLED (INT8 dynamic quantization for model weights)")
-    if quantize_transfer:
-        logger.info("Transfer Quantization: ENABLED (INT8 quantization for intermediate tensors)")
-    if use_early_split:
-        logger.info("Early Exit: ENABLED (intermediate classifiers with confidence threshold)")
     logger.info(f"Running {num_batches} batch(es) per model (batch_size={batch_size}) for stable measurements")
     logger.info("="*80)
     
@@ -829,6 +837,11 @@ def test_all_models_neurosurgeon(
                 batch_correct, batch_total = _calculate_batch_accuracy(result, true_labels, batch_idx + 1)
                 correct_predictions += batch_correct
                 total_samples += batch_total
+                
+                # Explicitly clean up tensors to prevent memory accumulation
+                del result, input_tensor, true_labels
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
             # Calculate averages and statistics
             avg_edge = np.mean(edge_times) if edge_times else 0.0
@@ -863,8 +876,20 @@ def test_all_models_neurosurgeon(
                 if model_metrics:
                     all_quantization_metrics.update(model_metrics)
             
+            # Clean up model and DNNSurgery to free memory
+            del model, dnn_surgery
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
         except Exception as e:
             logger.error(f"Failed to test {model_name}: {str(e)}")
+            # Clean up on error as well
+            try:
+                del model, dnn_surgery
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except:
+                pass
             continue
     
     # Print summary
