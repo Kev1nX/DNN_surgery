@@ -63,11 +63,6 @@ class DNNInferenceClient:
         pending_requests: Deque[Tuple[int, grpc.Future, float, Dict[str, float]]] = deque()
         max_concurrency = max(1, min(batch_size, self.max_inflight_requests))
 
-        if is_batch:
-            logging.info(
-                f"Processing batched tensor of shape {tensor.shape} (batch_size={batch_size}) with model {model_id}"
-            )
-
         def _finalize_request(idx: int, future: grpc.Future, send_time: float, sample_metrics: Dict[str, float]) -> None:
             try:
                 response = future.result()
@@ -111,21 +106,6 @@ class DNNInferenceClient:
             self.transfer_times.append(transfer_time)
             self.cloud_times.append(cloud_time)
 
-            logging.info(f"Cloud processing time (server reported): {cloud_time:.2f}ms")
-            logging.info(f"Transfer time (measured): {transfer_time:.2f}ms")
-            if server_total_time > 0:
-                logging.info(f"Server total handling time: {server_total_time:.2f}ms")
-            logging.info(f"Total time: {total_time:.2f}ms")
-            logging.info(f"Output tensor stats - Shape: {result_tensor.shape}")
-
-            if result_tensor.dim() == 2:
-                probs = torch.softmax(result_tensor, dim=1)
-                max_prob, pred = probs.max(1)
-                logging.info(
-                    f"Prediction confidence: {max_prob.item():.3f}, Predicted class: {pred.item()}"
-                )
-
-            logging.info(f"Successfully processed tensor {idx + 1}/{batch_size} with model {model_id}")
             results[idx] = result_tensor
             
             # Clean up intermediate tensors to prevent memory accumulation
@@ -150,13 +130,6 @@ class DNNInferenceClient:
                     sample_metrics['edge_time'] = edge_time
                     aggregated_timings['edge_time'] += edge_time
                     self.edge_times.append(edge_time)
-
-                    logging.info(f"Edge inference completed in {edge_time:.2f}ms")
-                    logging.info(f"Intermediate tensor shape: {sample.shape}")
-                    logging.info(
-                        f"Intermediate tensor stats - Min: {sample.min().item():.3f}, "
-                        f"Max: {sample.max().item():.3f}, Mean: {sample.mean().item():.3f}"
-                    )
 
                 if not requires_cloud_processing:
                     results[idx] = sample
@@ -193,11 +166,6 @@ class DNNInferenceClient:
         avg_timings = {key: (value / batch_size) for key, value in aggregated_timings.items()}
         avg_timings['total_batch_processing_time'] = sum(aggregated_timings.values())
         avg_timings['batch_size'] = batch_size
-
-        logging.info(
-            f"Batch processing completed. Total time: {avg_timings['total_batch_processing_time']:.2f}ms, "
-            f"Average per sample: {avg_timings['total_batch_processing_time']/batch_size:.2f}ms"
-        )
 
         return batched_result, avg_timings
     

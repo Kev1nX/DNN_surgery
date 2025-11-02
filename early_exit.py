@@ -450,23 +450,6 @@ class EarlyExitInferenceClient(DNNInferenceClient):
         self.transfer_times.append(transfer_time)
         self.cloud_times.append(cloud_time)
 
-        logger.info("Cloud processing time (server reported): %.2fms", cloud_time)
-        logger.info("Transfer time (measured): %.2fms", transfer_time)
-        if server_total_time > 0:
-            logger.info("Server total handling time: %.2fms", server_total_time)
-        logger.info("Total time: %.2fms", total_time)
-        logger.info("Output tensor stats - Shape: %s", result_tensor.shape)
-
-        if result_tensor.dim() == 2:
-            probs = torch.softmax(result_tensor, dim=1)
-            max_prob, pred = probs.max(1)
-            logger.info(
-                "Prediction confidence: %.3f, Predicted class: %s",
-                max_prob.item(),
-                pred.item(),
-            )
-
-        logger.info("Successfully processed tensor %s/%s with model %s", idx + 1, batch_size, model_id)
         results[idx] = result_tensor
 
     def process_tensor(
@@ -504,14 +487,6 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                 sample = tensor if not is_batch else tensor[idx:idx + 1]
                 sample_metrics = {'edge_time': 0.0, 'transfer_time': 0.0, 'cloud_time': 0.0}
 
-                logger.info("Processing sample %s/%s with shape %s", idx + 1, batch_size, sample.shape)
-                logger.info(
-                    "Input tensor stats - Min: %.3f, Max: %.3f, Mean: %.3f",
-                    sample.min().item(),
-                    sample.max().item(),
-                    sample.mean().item(),
-                )
-
                 processed_sample, decision, edge_time = self._forward_edge_with_exits(sample)
                 sample_metrics['edge_time'] = edge_time
                 aggregated_timings['edge_time'] += edge_time
@@ -521,23 +496,12 @@ class EarlyExitInferenceClient(DNNInferenceClient):
                 if decision.triggered:
                     current_exit_count += 1
                     results[idx] = decision.logits
-                    logger.info(
-                        "✓ Sample %d/%d exited early at layer %d with entropy %.3f (prediction: %d)",
-                        idx + 1,
-                        batch_size,
-                        decision.layer_index if decision.layer_index is not None else -1,
-                        decision.entropy,
-                        decision.prediction if decision.prediction is not None else -1,
-                    )
                     # No transfer/cloud times when exiting on the edge
                     continue
 
                 if not requires_cloud_processing:
                     results[idx] = processed_sample
-                    logger.info("✗ Sample %d/%d did NOT exit early - all processing on edge (no cloud model)", idx + 1, batch_size)
                     continue
-                
-                logger.info("✗ Sample %d/%d did NOT exit early - sending to cloud for processing", idx + 1, batch_size)
 
                 request = dnn_inference_pb2.InferenceRequest(
                     tensor=tensor_to_proto(processed_sample, ensure_cpu=True),

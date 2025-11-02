@@ -4,13 +4,6 @@ import argparse
 import logging
 import sys
 import time
-import traceback
-import warnings
-import os
-
-# Suppress warnings BEFORE importing torch
-warnings.filterwarnings('ignore')
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 from collections import defaultdict
 from datetime import datetime
@@ -135,9 +128,6 @@ def get_input_tensor(model_name: str, batch_size: int = 1) -> Tuple[torch.Tensor
         # Get class names for the labels
         class_names = [_class_mapping[label.item()] for label in labels]
         
-        logger.info(f"Loaded images - Shape: {images.shape}, Labels: {labels.tolist()}")
-        logger.info(f"Class names: {class_names}")
-        
         return images, labels, class_names
         
     except Exception as e:
@@ -237,15 +227,6 @@ def run_single_inference(
     input_tensor, true_labels, class_names = get_input_tensor(model_name, batch_size)
     
     
-    if split_point is None:
-        logger.info(f"Running NeuroSurgeon optimization for model={model_name}, batch_size={batch_size}")
-    else:
-        logger.info(f"Running inference: model={model_name}, split_point={split_point}, batch_size={batch_size}")
-    
-    # Log information about the input
-    logger.info(f"Using ImageNet images with true labels: {true_labels.tolist()}")
-    logger.info(f"True classes: {class_names}")
-    
     # Run distributed inference
     result, timings = run_distributed_inference(
         model_name,
@@ -262,13 +243,6 @@ def run_single_inference(
     timings['true_labels'] = true_labels.tolist()
     timings['class_names'] = class_names
 
-    predicted_plot_path = timings.get('predicted_split_plot_path')
-    actual_plot_path = timings.get('actual_split_plot_path')
-    if predicted_plot_path:
-        logger.info("Predicted split timing chart saved to %s", predicted_plot_path)
-    if actual_plot_path:
-        logger.info("Measured inference chart saved to %s", actual_plot_path)
-    
     return result, timings
 
 def run_batch_processing(
@@ -332,43 +306,32 @@ def run_batch_processing(
             result, timings = client.process_tensor(input_tensor, model_name)
             if auto_plot and should_plot:
                 _, manual_actual_path = resolve_plot_paths(model_name, split_point, plot_path)
-                try:
-                    manual_actual_path.parent.mkdir(parents=True, exist_ok=True)
-                    timing_data = {
-                        "edge_time": timings.get("edge_time", 0.0),
-                        "transfer_time": timings.get("transfer_time", 0.0),
-                        "cloud_time": timings.get("cloud_time", 0.0),
-                        "total_batch_processing_time": timings.get("total_batch_processing_time"),
-                    }
-                    plot_actual_inference_breakdown(
-                        timing_data,
-                        show=plot_show,
-                        save_path=str(manual_actual_path),
-                        title=f"Measured Inference Breakdown ({model_name}, split {split_point})",
-                    )
-                    manual_actual_path_resolved = str(manual_actual_path.resolve())
-                    timings['actual_split_plot_path'] = manual_actual_path_resolved
-                    logger.info("Measured inference chart saved to %s", manual_actual_path_resolved)
-                    
-                    # Generate companion throughput plot
-                    manual_throughput_path = manual_actual_path.with_name(
-                        manual_actual_path.stem.replace("_actual", "_throughput") + manual_actual_path.suffix
-                    )
-                    plot_throughput_from_timing(
-                        timing_data,
-                        show=plot_show,
-                        save_path=str(manual_throughput_path),
-                        title=f"Inference Throughput ({model_name}, split {split_point})",
-                    )
-                    logger.info("Throughput chart saved to %s", manual_throughput_path.resolve())
-                except ImportError as plt_error:
-                    logger.warning(
-                        "Auto-plot requested but matplotlib is unavailable: %s",
-                        plt_error,
-                    )
-                except Exception as plot_error:
-                    logger.error("Failed to render measured inference chart: %s", plot_error)
-                should_plot = False
+                manual_actual_path.parent.mkdir(parents=True, exist_ok=True)
+                timing_data = {
+                    "edge_time": timings.get("edge_time", 0.0),
+                    "transfer_time": timings.get("transfer_time", 0.0),
+                    "cloud_time": timings.get("cloud_time", 0.0),
+                    "total_batch_processing_time": timings.get("total_batch_processing_time"),
+                }
+                plot_actual_inference_breakdown(
+                    timing_data,
+                    show=plot_show,
+                    save_path=str(manual_actual_path),
+                    title=f"Measured Inference Breakdown ({model_name}, split {split_point})",
+                )
+                manual_actual_path_resolved = str(manual_actual_path.resolve())
+                timings['actual_split_plot_path'] = manual_actual_path_resolved
+                
+                # Generate companion throughput plot
+                manual_throughput_path = manual_actual_path.with_name(
+                    manual_actual_path.stem.replace("_actual", "_throughput") + manual_actual_path.suffix
+                )
+                plot_throughput_from_timing(
+                    timing_data,
+                    show=plot_show,
+                    save_path=str(manual_throughput_path),
+                    title=f"Inference Throughput ({model_name}, split {split_point})",
+                )
         else:
             # Use NeuroSurgeon (either find optimal or reuse)
             if use_early_exit:
@@ -395,7 +358,6 @@ def run_batch_processing(
                     )
                     optimal_split_found = timings.get('split_point', 2)
                     should_plot = False
-                    logger.info(f"Found optimal split point with early exit: {optimal_split_found} (will reuse for remaining batches)")
             else:
                 # Standard inference without early exit
                 if optimal_split_found is not None:
@@ -424,14 +386,6 @@ def run_batch_processing(
                     )
                     optimal_split_found = timings.get('split_point', 2)
                     should_plot = False
-                    logger.info(f"Found optimal split point: {optimal_split_found} (will reuse for remaining batches)")
-        predicted_plot_path = timings.get('predicted_split_plot_path')
-        actual_plot_path = timings.get('actual_split_plot_path')
-        if predicted_plot_path:
-            logger.info("Predicted split timing chart saved to %s", predicted_plot_path)
-        if actual_plot_path:
-            logger.info("Measured inference chart saved to %s", actual_plot_path)
-        
         total_time = time.time() - start_time
         
         timings['total_wall_time'] = total_time * 1000  # Convert to ms
@@ -443,22 +397,6 @@ def run_batch_processing(
             
         all_timings.append(timings)
         
-        logger.info(f"Batch {batch_idx + 1}/{num_batches} completed in {total_time*1000:.1f}ms")
-        
-        # Show prediction vs true labels
-        if result.dim() == 2:
-            probs = torch.softmax(result, dim=1)
-            confidence, predicted_class = probs.max(1)
-            
-            for i in range(len(predicted_class)):
-                pred_class = predicted_class[i].item()
-                conf = confidence[i].item()
-                
-                true_class = true_labels[i].item()
-                true_name = class_names[i]
-                correct = "✓" if pred_class == true_class else "✗"
-                logger.info(f"  Image {i}: Predicted={pred_class}, True={true_class} ({true_name}), "
-                          f"Confidence={conf:.3f} {correct}")
     
     return all_timings
 
@@ -651,8 +589,6 @@ def test_all_models_single_split(
             total_times = []
             
             for test_idx in range(num_tests):
-                logger.info(f"  Test run {test_idx + 1}/{num_tests}")
-                
                 try:
                     result, timings = run_single_inference(
                         server_address,
@@ -675,11 +611,6 @@ def test_all_models_single_split(
                     cloud_times.append(cloud_time)
                     total_times.append(total_time)
                     
-                    logger.info(
-                        f"    Edge: {edge_time:.2f}ms | Transfer: {transfer_time:.2f}ms | "
-                        f"Cloud: {cloud_time:.2f}ms | Total: {total_time:.2f}ms"
-                    )
-                    
                 except Exception as e:
                     logger.error(f"  Test failed: {str(e)}")
                     continue
@@ -698,12 +629,6 @@ def test_all_models_single_split(
                     'total_time': avg_total,
                     'num_tests': len(total_times),
                 }
-                
-                logger.info(f"\n{model_name} Average times:")
-                logger.info(
-                    f"  Edge: {avg_edge:.2f}ms | Transfer: {avg_transfer:.2f}ms | "
-                    f"Cloud: {avg_cloud:.2f}ms | Total: {avg_total:.2f}ms"
-                )
             
         except Exception as e:
             logger.error(f"Failed to test {model_name}: {str(e)}")
@@ -893,7 +818,6 @@ def test_all_models_neurosurgeon(
                 # Store optimal split from first batch
                 if batch_idx == 0:
                     optimal_split = timings.get('split_point')
-                    logger.info(f"{'Early exit configuration' if use_early_split else 'NeuroSurgeon'} determined optimal split point: {optimal_split}")
                 
                 # Collect timing metrics
                 edge_times.append(timings.get('edge_time', 0))
@@ -905,8 +829,6 @@ def test_all_models_neurosurgeon(
                 batch_correct, batch_total = _calculate_batch_accuracy(result, true_labels, batch_idx + 1)
                 correct_predictions += batch_correct
                 total_samples += batch_total
-                
-                logger.info(f"  Batch {batch_idx + 1}/{num_batches}: Total={total_times[-1]:.1f}ms (Edge={edge_times[-1]:.1f}ms, Transfer={transfer_times[-1]:.1f}ms, Cloud={cloud_times[-1]:.1f}ms)")
         
             # Calculate averages and statistics
             avg_edge = np.mean(edge_times) if edge_times else 0.0
@@ -935,23 +857,14 @@ def test_all_models_neurosurgeon(
                 all_model_timings[model_name]['avg_early_exit_count'] = np.mean(early_exit_counts)
                 all_model_timings[model_name]['avg_early_exit_rate'] = np.mean(early_exit_rates)
             
-            # Simplified logging
-            logger.info(f"✓ {model_name}: split={optimal_split}, time={avg_total:.1f}±{std_total:.1f}ms, "
-                       f"accuracy={accuracy:.1f}%, breakdown: E={avg_edge:.1f} T={avg_transfer:.1f} C={avg_cloud:.1f}ms")
-            if use_early_split and early_exit_counts:
-                logger.info(f"  Early exits: {np.mean(early_exit_rates)*100:.1f}% (avg {np.mean(early_exit_counts):.1f}/batch)")
-            
             # Collect quantization metrics if enabled
             if enable_quantization:
                 model_metrics = dnn_surgery.quantizer.get_size_metrics()
                 if model_metrics:
                     all_quantization_metrics.update(model_metrics)
-                    logger.info(f"  Quantization metrics collected: {len(model_metrics)} entries")
             
         except Exception as e:
             logger.error(f"Failed to test {model_name}: {str(e)}")
-            import traceback
-            traceback.print_exc()
             continue
     
     # Print summary
@@ -1066,8 +979,6 @@ def test_all_models_neurosurgeon(
                     
                 except Exception as e:
                     logger.error(f"Failed to generate quantization plots: {e}")
-                    import traceback
-                    traceback.print_exc()
             else:
                 logger.warning("No quantization metrics collected from any model")
     
