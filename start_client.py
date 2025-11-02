@@ -29,6 +29,7 @@ from dataset.imagenet_loader import ImageNetMiniLoader
 from dnn_inference_client import DNNInferenceClient, resolve_plot_paths, run_distributed_inference
 from dnn_surgery import DNNSurgery
 from early_exit import EarlyExitInferenceClient, EarlyExitConfig, run_distributed_inference_with_early_exit
+from static_quantization import StaticQuantizer
 from visualization import (
     plot_actual_inference_breakdown,
     plot_actual_split_comparison,
@@ -713,6 +714,7 @@ def test_all_models_neurosurgeon(
     quantize_transfer: bool = False,
     use_early_split: bool = False,
     batch_size: int = 1,
+    enable_static_quantization: bool = False,
 ) -> Dict[str, Dict]:
     """Test all supported models using NeuroSurgeon-determined optimal split points.
     
@@ -725,10 +727,11 @@ def test_all_models_neurosurgeon(
         auto_plot: Whether to generate plots
         plot_show: Whether to show plots interactively
         plot_path: Path for saving the plot
-        enable_quantization: Whether to enable INT8 quantization for models
+        enable_quantization: Whether to enable INT8 dynamic quantization for models
         quantize_transfer: Whether to enable INT8 quantization for intermediate tensor transfers
         use_early_split: Whether to enable early exit with intermediate classifiers
         batch_size: Batch size for each inference run (default: 1)
+        enable_static_quantization: Whether to enable INT8 static quantization (edge model only)
         
     Returns:
         Dictionary mapping model names to their optimal split timing results
@@ -737,11 +740,14 @@ def test_all_models_neurosurgeon(
     
     all_model_timings = {}
     all_quantization_metrics = {}  # Collect quantization metrics from all models
+    all_static_quantization_metrics = {}  # Collect static quantization metrics
     
     # Build configuration description
     config_parts = []
     if enable_quantization:
-        config_parts.append("Model Quantization")
+        config_parts.append("Dynamic Quantization")
+    if enable_static_quantization:
+        config_parts.append("Static Quantization")
     if quantize_transfer:
         config_parts.append("Transfer Quantization")
     if use_early_split:
@@ -764,6 +770,12 @@ def test_all_models_neurosurgeon(
             # Get model and create DNN Surgery instance
             model = get_model(model_name)
             dnn_surgery = DNNSurgery(model, model_name, enable_quantization=enable_quantization, quantize_transfer=quantize_transfer)
+            
+            # Initialize static quantizer if enabled
+            static_quantizer = None
+            if enable_static_quantization:
+                logger.info(f"Static quantization enabled for {model_name} (edge model only)")
+                static_quantizer = StaticQuantizer()
             
             # Configure early exit if requested
             exit_config = None
@@ -823,9 +835,47 @@ def test_all_models_neurosurgeon(
                         plot_path=None,
                     )
                 
-                # Store optimal split from first batch
+                # Store optimal split from first batch and apply static quantization if enabled
                 if batch_idx == 0:
                     optimal_split = timings.get('split_point')
+                    
+                    # Apply static quantization after finding optimal split
+                    if enable_static_quantization and static_quantizer is not None:
+                        logger.info(f"Applying static quantization to edge model at split {optimal_split}")
+                        
+                        # Get the edge model at optimal split point
+                        dnn_surgery.splitter.set_split_point(optimal_split)
+                        edge_model = dnn_surgery.splitter.get_edge_model()
+                        
+                        # Prepare calibration data from dataset
+                        from dataset.imagenet_loader import _get_dataset_loader
+                        train_loader = _get_dataset_loader()
+                        
+                        # Create calibration data for edge
+                        edge_calibration = []
+                        for calib_idx, (data, target) in enumerate(train_loader):
+                            if calib_idx >= 10:  # Use 10 batches for calibration
+                                break
+                            edge_calibration.append((data.cpu(), target))
+                        
+                        # Quantize edge model
+                        quantized_edge = static_quantizer.quantize_model(
+                            edge_model,
+                            edge_calibration,
+                            f"{model_name}_edge",
+                            backend="fbgemm"
+                        )
+                        
+                        # Update DNNSurgery to use quantized edge model
+                        # Note: Cloud model stays FP32 to avoid skip connection issues
+                        dnn_surgery.splitter.layers[:optimal_split] = list(quantized_edge.modules())[1:]  # Skip wrapper
+                        
+                        # Collect static quantization metrics
+                        static_metrics = static_quantizer.get_size_metrics()
+                        if static_metrics:
+                            all_static_quantization_metrics.update(static_metrics)
+                        
+                        logger.info(f"Static quantization applied successfully (edge only, cloud remains FP32)")
                 
                 # Collect timing metrics
                 edge_times.append(timings.get('edge_time', 0))
@@ -1006,6 +1056,23 @@ def test_all_models_neurosurgeon(
                     logger.error(f"Failed to generate quantization plots: {e}")
             else:
                 logger.warning("No quantization metrics collected from any model")
+        
+        # Generate static quantization metrics report if enabled
+        if enable_static_quantization and all_static_quantization_metrics:
+            logger.info("\n" + "="*80)
+            logger.info("STATIC QUANTIZATION METRICS (Edge Model Only)")
+            logger.info("="*80)
+            
+            for model_name in SUPPORTED_MODELS:
+                edge_key = f"{model_name}_edge"
+                if edge_key in all_static_quantization_metrics:
+                    metrics = all_static_quantization_metrics[edge_key]
+                    logger.info(f"{model_name} (edge model - static quantized):")
+                    logger.info(f"  Original: {metrics['original_size_mb']:.2f} MB → Quantized: {metrics['quantized_size_mb']:.2f} MB")
+                    logger.info(f"  Compression: {metrics['compression_ratio']:.2f}x")
+                    logger.info(f"  Note: Cloud model kept as FP32 to avoid skip connection issues")
+            
+            logger.info("="*80)
     
     return all_model_timings
 
@@ -1037,7 +1104,9 @@ def main():
     parser.add_argument('--test-all-models-neurosurgeon', action='store_true',
                        help='Test all models using NeuroSurgeon-determined optimal split points and generate comparison plots')
     parser.add_argument('--neurosurgeon-quantize', action='store_true',
-                       help='Enable INT8 model quantization (weights) for edge/cloud models - works with all testing modes')
+                       help='Enable INT8 dynamic model quantization (weights) for edge/cloud models - works with all testing modes')
+    parser.add_argument('--static-quantize', action='store_true',
+                       help='Enable INT8 static quantization (weights+activations) for edge model only - requires calibration, works with ResNet')
     parser.add_argument('--neurosurgeon-early-split', action='store_true',
                        help='Enable early exit with intermediate classifiers (confidence-based exits at shallow layers)')
     parser.add_argument('--use-neurosurgeon', action='store_true', default=True,
@@ -1121,6 +1190,7 @@ def main():
                 quantize_transfer=args.quantize_transfer,
                 use_early_split=args.neurosurgeon_early_split,
                 batch_size=args.batch_size,
+                enable_static_quantization=args.static_quantize,
             )
             logger.info("NeuroSurgeon testing complete!")
             sys.exit(0)
