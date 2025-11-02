@@ -10,6 +10,7 @@ import gRPC.protobuf.dnn_inference_pb2_grpc as dnn_inference_pb2_grpc
 from config import GRPC_SETTINGS
 from visualization import build_split_timing_summary, format_split_summary
 from quantization import ModelQuantizer
+from static_quantization import StaticQuantizer
 import warnings
 warnings.filterwarnings('ignore')
 def cuda_sync():
@@ -219,15 +220,26 @@ class ModelSplitter:
         self.split_point = split_point
         logger.info(f"Split point set to layer {split_point}")
         
-    def get_edge_model(self, quantize: bool = False, quantizer: Optional[ModelQuantizer] = None) -> Optional[nn.Module]:
+    def get_edge_model(
+        self, 
+        quantize: bool = False, 
+        quantizer: Optional[ModelQuantizer] = None,
+        static_quantize: bool = False,
+        static_quantizer: Optional[StaticQuantizer] = None,
+        calibration_data: Optional[torch.utils.data.DataLoader] = None
+    ) -> Optional[nn.Module]:
         """Get the edge part of the model using the original model's forward logic
         
         Args:
-            quantize: Whether to apply quantization to the edge model
+            quantize: Whether to apply dynamic quantization to the edge model
             quantizer: ModelQuantizer instance (required if quantize=True)
+            static_quantize: Whether to apply static quantization to the edge model
+            static_quantizer: StaticQuantizer instance (required if static_quantize=True)
+            calibration_data: Calibration data (required if static_quantize=True)
             
         Returns:
-            Edge model (optionally quantized)
+            Edge model (optionally quantized). If static quantization is applied,
+            the model will auto-dequantize outputs via DeQuantStub.
         """
         if self.split_point == 0:
             return None
@@ -287,8 +299,20 @@ class ModelSplitter:
                 
         edge_model = EdgeModel(edge_layers, self.model, self.model_name)
         
-        # Apply quantization if requested
-        if quantize:
+        # Apply static quantization (takes precedence over dynamic)
+        if static_quantize:
+            if static_quantizer is None or calibration_data is None:
+                logger.warning("Static quantization requested but static_quantizer or calibration_data missing. Returning non-quantized edge model.")
+            else:
+                logger.info("Applying static quantization to edge model (outputs will auto-dequantize)")
+                edge_model = static_quantizer.quantize_model(
+                    edge_model, 
+                    calibration_data, 
+                    f"{self.model_name}_edge",
+                    backend="fbgemm"
+                )
+        # Apply dynamic quantization if requested and static not applied
+        elif quantize:
             if quantizer is None:
                 logger.warning("Quantization requested but no quantizer provided. Returning non-quantized edge model.")
             else:
@@ -296,7 +320,12 @@ class ModelSplitter:
         
         return edge_model
         
-    def get_cloud_model(self, quantize: bool = False, quantizer: Optional[ModelQuantizer] = None) -> Optional[nn.Module]:
+    def get_cloud_model(
+        self, 
+        quantize: bool = False, 
+        quantizer: Optional[ModelQuantizer] = None,
+        static_quantize: bool = False
+    ) -> Optional[nn.Module]:
         """Get the cloud part of the model using the original model's forward logic
         
         Args:
@@ -379,21 +408,33 @@ class ModelSplitter:
 class DNNSurgery:
     """Main class for distributed DNN inference with optimal splitting using NeuroSurgeon approach"""
     
-    def __init__(self, model: nn.Module, model_name: str = "unknown", enable_quantization: bool = False, quantize_transfer: bool = False):
+    def __init__(
+        self, 
+        model: nn.Module, 
+        model_name: str = "unknown", 
+        enable_quantization: bool = False, 
+        quantize_transfer: bool = False,
+        enable_static_quantization: bool = False,
+        calibration_data: Optional[torch.utils.data.DataLoader] = None
+    ):
         self.model = model.eval()  # Ensure model is in eval mode
         self.model_name = model_name
         self.splitter = ModelSplitter(model, model_name)
         self.network_profiler = NetworkProfiler()
         self.enable_quantization = enable_quantization
         self.quantize_transfer = quantize_transfer
+        self.enable_static_quantization = enable_static_quantization
+        self.calibration_data = calibration_data
         self.quantizer = ModelQuantizer() if enable_quantization else None
+        self.static_quantizer = StaticQuantizer() if enable_static_quantization else None
         
         quant_info = []
         if enable_quantization:
-            quant_info.append("edge model weights (INT8)")
-            quant_info.append("cloud model weights (INT8)")
+            quant_info.append("dynamic quantization: edge/cloud model weights (INT8)")
+        if enable_static_quantization:
+            quant_info.append("static quantization: edge model only (INT8)")
         if quantize_transfer:
-            quant_info.append("intermediate tensors (INT8)")
+            quant_info.append("transfer quantization: intermediate tensors (INT8)")
         
         if quant_info:
             logger.info(f"Initialized DNNSurgery for model: {model_name} with quantization enabled: {', '.join(quant_info)}")
@@ -446,19 +487,23 @@ class DNNSurgery:
             # Configure split point
             self.splitter.set_split_point(split_point)
             
-            # Get edge model
+            # Get edge model (with static or dynamic quantization)
             edge_model = self.splitter.get_edge_model(
                 quantize=self.enable_quantization,
-                quantizer=self.quantizer
+                quantizer=self.quantizer,
+                static_quantize=self.enable_static_quantization,
+                static_quantizer=self.static_quantizer,
+                calibration_data=self.calibration_data
             )
             
             # Create client with transfer quantization if enabled
             client = DNNInferenceClient(server_address, edge_model, quantize_transfer=self.quantize_transfer)
             
-            # Check if cloud processing is needed
+            # Check if cloud processing is needed (cloud never gets static quantization)
             requires_cloud = self.splitter.get_cloud_model(
                 quantize=self.enable_quantization,
-                quantizer=self.quantizer
+                quantizer=self.quantizer,
+                static_quantize=False  # Cloud model always FP32 for static quantization
             ) is not None
             
             # Configure server with this split point

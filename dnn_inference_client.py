@@ -331,17 +331,21 @@ def run_distributed_inference(
                 except Exception as plot_error:
                     logging.error("Failed to render predicted split chart: %s", plot_error)
 
-        # Set split point and get edge model (with quantization if enabled)
+        # Set split point and get edge model (with static or dynamic quantization if enabled)
         dnn_surgery.splitter.set_split_point(split_point)
         edge_model = dnn_surgery.splitter.get_edge_model(
             quantize=dnn_surgery.enable_quantization,
-            quantizer=dnn_surgery.quantizer
+            quantizer=dnn_surgery.quantizer,
+            static_quantize=dnn_surgery.enable_static_quantization,
+            static_quantizer=dnn_surgery.static_quantizer,
+            calibration_data=dnn_surgery.calibration_data
         )
         
-        # Check if cloud processing is needed (with quantization if enabled)
+        # Check if cloud processing is needed (cloud never gets static quantization)
         cloud_model = dnn_surgery.splitter.get_cloud_model(
             quantize=dnn_surgery.enable_quantization,
-            quantizer=dnn_surgery.quantizer
+            quantizer=dnn_surgery.quantizer,
+            static_quantize=False  # Cloud model always FP32 for static quantization
         )
         requires_cloud_processing = cloud_model is not None
         

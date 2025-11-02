@@ -150,7 +150,8 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
                     splitter.set_split_point(split_point)
                     model = splitter.get_cloud_model(
                         quantize=self.enable_quantization,
-                        quantizer=self.quantizer
+                        quantizer=self.quantizer,
+                        static_quantize=False  # Server never uses static quantization (edge only)
                     )
                     if model is None:
                         logging.warning(
@@ -420,10 +421,11 @@ class DNNInferenceServicer(dnn_inference_pb2_grpc.DNNInferenceServicer):
             # Create a DNN Surgery instance for this model and split point
             splitter = ModelSplitter(original_model, model_name)
             splitter.set_split_point(split_point)
-            # Apply quantization to cloud model if enabled
+            # Apply quantization to cloud model if enabled (never static quantization)
             cloud_model = splitter.get_cloud_model(
                 quantize=self.enable_quantization,
-                quantizer=self.quantizer
+                quantizer=self.quantizer,
+                static_quantize=False  # Server never uses static quantization (edge only)
             )
             
             # Store the client's split decision

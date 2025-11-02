@@ -769,13 +769,25 @@ def test_all_models_neurosurgeon(
         try:
             # Get model and create DNN Surgery instance
             model = get_model(model_name)
-            dnn_surgery = DNNSurgery(model, model_name, enable_quantization=enable_quantization, quantize_transfer=quantize_transfer)
             
-            # Initialize static quantizer if enabled
-            static_quantizer = None
+            # Prepare calibration data for static quantization if enabled
+            calibration_data = None
             if enable_static_quantization:
-                logger.info(f"Static quantization enabled for {model_name} (edge model only)")
-                static_quantizer = StaticQuantizer()
+                logger.info(f"Preparing calibration data for static quantization of {model_name} (edge model only)")
+                # Get train loader for calibration
+                from dataset.imagenet_loader import ImageNetMiniLoader
+                dataset_loader = ImageNetMiniLoader(batch_size=batch_size)
+                calibration_data, _ = dataset_loader.get_loader(train=True)
+            
+            # Create DNN Surgery instance with static quantization support
+            dnn_surgery = DNNSurgery(
+                model, 
+                model_name, 
+                enable_quantization=enable_quantization, 
+                quantize_transfer=quantize_transfer,
+                enable_static_quantization=enable_static_quantization,
+                calibration_data=calibration_data
+            )
             
             # Configure early exit if requested
             exit_config = None
@@ -835,47 +847,17 @@ def test_all_models_neurosurgeon(
                         plot_path=None,
                     )
                 
-                # Store optimal split from first batch and apply static quantization if enabled
+                # Store optimal split from first batch
                 if batch_idx == 0:
                     optimal_split = timings.get('split_point')
+                    logger.info(f"Optimal split point: {optimal_split}")
                     
-                    # Apply static quantization after finding optimal split
-                    if enable_static_quantization and static_quantizer is not None:
-                        logger.info(f"Applying static quantization to edge model at split {optimal_split}")
-                        
-                        # Get the edge model at optimal split point
-                        dnn_surgery.splitter.set_split_point(optimal_split)
-                        edge_model = dnn_surgery.splitter.get_edge_model()
-                        
-                        # Prepare calibration data from dataset
-                        from dataset.imagenet_loader import _get_dataset_loader
-                        train_loader = _get_dataset_loader()
-                        
-                        # Create calibration data for edge
-                        edge_calibration = []
-                        for calib_idx, (data, target) in enumerate(train_loader):
-                            if calib_idx >= 10:  # Use 10 batches for calibration
-                                break
-                            edge_calibration.append((data.cpu(), target))
-                        
-                        # Quantize edge model
-                        quantized_edge = static_quantizer.quantize_model(
-                            edge_model,
-                            edge_calibration,
-                            f"{model_name}_edge",
-                            backend="fbgemm"
-                        )
-                        
-                        # Update DNNSurgery to use quantized edge model
-                        # Note: Cloud model stays FP32 to avoid skip connection issues
-                        dnn_surgery.splitter.layers[:optimal_split] = list(quantized_edge.modules())[1:]  # Skip wrapper
-                        
-                        # Collect static quantization metrics
-                        static_metrics = static_quantizer.get_size_metrics()
+                    # Collect static quantization metrics if enabled
+                    if enable_static_quantization and dnn_surgery.static_quantizer is not None:
+                        static_metrics = dnn_surgery.static_quantizer.get_size_metrics()
                         if static_metrics:
                             all_static_quantization_metrics.update(static_metrics)
-                        
-                        logger.info(f"Static quantization applied successfully (edge only, cloud remains FP32)")
+                            logger.info(f"Static quantization metrics collected (edge only, cloud remains FP32)")
                 
                 # Collect timing metrics
                 edge_times.append(timings.get('edge_time', 0))
